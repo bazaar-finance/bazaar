@@ -22,6 +22,10 @@ jobs:
 
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
+        with:
+          # Pinned to the local dev toolchain — 'stable' drifts (1.7.1 broke fmt --check
+          # with formatter rules 1.4.3 disagrees with).
+          version: v1.4.3
 
       - name: Show Forge version
         run: |
@@ -32,9 +36,11 @@ jobs:
           forge fmt --check
         id: fmt
 
+      # EIP-170 size limits are enforced by test/unit/ContractSizeTest.t.sol (production
+      # contracts only) instead of --sizes, whose gate also covers test-only harnesses.
       - name: Run Forge build
         run: |
-          forge build --sizes
+          forge build
         id: build
 
       - name: Run Forge tests
