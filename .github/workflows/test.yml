@@ -20,6 +20,12 @@ jobs:
         with:
           submodules: recursive
 
+      # foundry.toml remaps @pythnetwork/pyth-sdk-solidity/ into node_modules/, which is
+      # gitignored — without this install the build fails on unresolved Pyth imports.
+      - name: Install npm dependencies
+        run: |
+          npm ci
+
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
