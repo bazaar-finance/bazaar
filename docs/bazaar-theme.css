@@ -1,0 +1,75 @@
+/* Bazaar black & yellow — restyles the default (Ayu) theme.
+   Loaded via additional-css; other themes in the picker stay stock. */
+
+html.ayu {
+    --bg: #0a0a0a;
+    --fg: #d8d8d8;
+
+    --sidebar-bg: #050505;
+    --sidebar-fg: #b8b8b8;
+    --sidebar-active: #f5c518;
+    --sidebar-non-existant: #3a3a3a;
+    --sidebar-spacer: #1c1c1c;
+
+    --scrollbar: #333333;
+
+    --icons: #7a7a7a;
+    --icons-hover: #f5c518;
+
+    --links: #f5c518;
+
+    --inline-code-color: #ffd964;
+
+    --theme-popup-bg: #141414;
+    --theme-popup-border: #2c2c2c;
+    --theme-hover: #1b1b1b;
+
+    --quote-bg: #141414;
+    --quote-border: #f5c518;
+
+    --table-border-color: #2a2a2a;
+    --table-header-bg: #181818;
+    --table-alternate-bg: #101010;
+
+    --searchbar-border-color: #2c2c2c;
+    --searchbar-bg: #141414;
+    --searchbar-fg: #dddddd;
+    --searchbar-shadow-color: #000000;
+    --searchresults-header-fg: #8a8a8a;
+    --searchresults-border-color: #2c2c2c;
+    --searchresults-li-bg: #101010;
+    --search-mark-bg: #f5c518;
+
+    --color-scheme: dark;
+}
+
+/* Brand accents */
+html.ayu .menu-title {
+    color: #f5c518;
+    letter-spacing: 0.02em;
+}
+
+html.ayu a:hover {
+    color: #ffd964;
+}
+
+html.ayu h2 {
+    border-bottom: 1px solid #1e1e1e;
+    padding-bottom: 0.2em;
+}
+
+/* Search highlights: yellow marks need dark text */
+html.ayu mark {
+    color: #000000;
+}
+
+/* Code blocks: match the near-black page instead of Ayu's blue-gray */
+html.ayu pre > .hljs {
+    background: #111111;
+}
+
+/* Part titles in the sidebar (Guide / Protocol / Reference) */
+html.ayu .part-title {
+    color: #f5c518;
+    opacity: 0.85;
+}

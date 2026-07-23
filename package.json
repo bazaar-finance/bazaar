@@ -1,0 +1,20 @@
+{
+  "name": "bazaar",
+  "version": "1.0.0",
+  "description": "Permissionless perpetual futures protocol on Arbitrum — on-chain CLOB, bonded sequencers with fraud proofs, UMA-governed listings.",
+  "main": "index.js",
+  "directories": {
+    "lib": "lib",
+    "test": "test"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "AGPL-3.0-only",
+  "dependencies": {
+    "@pythnetwork/pyth-sdk-solidity": "^4.2.0",
+    "solc": "^0.8.30"
+  }
+}

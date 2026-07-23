@@ -1,0 +1,12 @@
+[book]
+title = "Bazaar Protocol"
+description = "Permissionless perpetual futures on anything with a price feed"
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "ayu"
+preferred-dark-theme = "ayu"
+additional-css = ["bazaar-theme.css"]
+no-section-label = true
+fold = { enable = true, level = 1 }
