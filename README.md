@@ -10,15 +10,9 @@ The protocol is immutable: no owner, no pauser, no upgradeable proxies, no gover
 
 ## Documentation
 
-**Read the book at [bazaar-finance.github.io/bazaar](https://bazaar-finance.github.io/bazaar/).**
+**Read the book at [docs.bazaar.finance](https://docs.bazaar.finance/).**
 
 Everything protocol-level — architecture, matching, the risk engine, funding, fees, listing, termination, parameter tables, the contract reference, and role guides for traders, LPs, sequencers, and integrators — lives there, built from [`docs/`](docs) and redeployed on every push that touches it. The book is the single source of truth for how the protocol works; this README covers only the repository itself.
-
-To preview local edits:
-
-```bash
-mdbook serve docs    # browse at http://localhost:3000
-```
 
 ## Development
 
@@ -33,7 +27,7 @@ forge test
 
 The test suite is 844 tests across 74 suites. CI pins Foundry to v1.4.3 and runs `forge fmt --check`, build, and the full suite on every push; EIP-170 size limits are enforced as a test (`test/unit/ContractSizeTest.t.sol`) over production contracts.
 
-For the full local stack on Anvil — mocked Pyth/UMA/USDC, listing a pair, pushing prices, placing orders — see [Local Development](docs/src/guide/quick-start.md) in the book; `make help` lists every target. Deploying the protocol to a real network is covered in [Self-Deployment](docs/src/guide/deployment.md).
+For the full local stack on Anvil — mocked Pyth/UMA/USDC, listing a pair, pushing prices, placing orders — see [Local Development](https://docs.bazaar.finance/guide/quick-start.html) in the book; `make help` lists every target. Deploying the protocol to a real network is covered in [Self-Deployment](https://docs.bazaar.finance/guide/deployment.html).
 
 ## Repository layout
 
@@ -71,9 +65,9 @@ test/
 ## Security
 
 - **Unaudited and not deployed.** This codebase has not undergone a professional audit, and there is no official deployment on any network.
-- No admin keys: there is nothing to compromise, but also no one who can pause a bad deployment — the [termination paths](docs/src/protocol/termination.md) are the only brakes.
+- No admin keys: there is nothing to compromise, but also no one who can pause a bad deployment — the [termination paths](https://docs.bazaar.finance/protocol/termination.html) are the only brakes.
 - Until a formal bug-bounty program exists, report vulnerabilities by opening an issue in this repository.
-- Full posture: [Security & Status](docs/src/security.md) in the book.
+- Full posture: [Security & Status](https://docs.bazaar.finance/security.html) in the book.
 
 ## License
 
