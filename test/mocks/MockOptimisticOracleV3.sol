@@ -72,6 +72,46 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
         return currency;
     }
 
+    // ---- Identifier whitelist surface ----
+    // The mock doubles as its own Finder and IdentifierWhitelist so the factory's
+    // finder -> getImplementationAddress -> isIdentifierSupported chain resolves against it.
+    // Identifiers are SUPPORTED by default (inverted mapping) so existing tests need no setup;
+    // toggle with setIdentifierSupported to exercise de-whitelisting paths.
+
+    mapping(bytes32 => bool) private _unsupportedIdentifiers;
+
+    function setIdentifierSupported(bytes32 identifier, bool supported) external {
+        if (supported) delete _unsupportedIdentifiers[identifier];
+        else _unsupportedIdentifiers[identifier] = true;
+    }
+
+    function finder() external view override returns (address) {
+        return address(this);
+    }
+
+    function getImplementationAddress(bytes32) external view returns (address) {
+        return address(this);
+    }
+
+    function isIdentifierSupported(bytes32 identifier) external view returns (bool) {
+        return !_unsupportedIdentifiers[identifier];
+    }
+
+    // ---- Minimum-bond surface ----
+    // Zero by default (matching an OOv3 that has not cached the currency), so callers fall back to
+    // their own floors; raise it to exercise UMA outgrowing those floors.
+    uint256 private _minimumBond;
+
+    function setMinimumBond(uint256 amount) external {
+        _minimumBond = amount;
+    }
+
+    function getMinimumBond(address) external view override returns (uint256) {
+        return _minimumBond;
+    }
+
+    function syncUmaParams(bytes32 identifier, address currency_) external override {}
+
     /// @notice Claim bytes by assertion ID, stored so tests can assert on claim content.
     mapping(bytes32 => bytes) public claims;
 
@@ -87,6 +127,10 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
         bytes32 identifier,
         bytes32 /* domainId */
     ) external override returns (bytes32 assertionId) {
+        // Mirrors OOv3's own gate, so a caller that posts a bond below UMA's minimum fails here the
+        // way it would on mainnet.
+        require(bond >= _minimumBond, "Bond amount too low");
+
         // Pull bond from caller (the contract that approved, e.g. Factory or TerminatePair)
         _currency.transferFrom(msg.sender, address(this), bond);
 
@@ -220,7 +264,6 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
     function getAssertion(bytes32 assertionId)
         external
         view
-        override
         returns (
             address asserter,
             uint64 assertionTime,
@@ -294,5 +337,10 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
     /// @notice Check if an assertion's liveness has expired (convenience for testing).
     function isExpired(bytes32 assertionId) external view returns (bool) {
         return block.timestamp >= assertions[assertionId].expirationTime;
+    }
+
+    /// @notice The identifier an assertion was made under (convenience for testing routing).
+    function assertionIdentifier(bytes32 assertionId) external view returns (bytes32) {
+        return assertions[assertionId].identifier;
     }
 }

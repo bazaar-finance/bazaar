@@ -18,9 +18,9 @@ import {MockArbSys} from "../mocks/MockArbSys.sol";
 import {MockPyth} from "@pythnetwork/pyth-sdk-solidity/MockPyth.sol";
 
 /// @title MatchingEngineTest
-/// @notice End-to-end tests for BazaarPair.matchBatch covering all three matching passes.
-///         Phase 1: Pass B (markets × limits) and Pass C (limits × limits).
-///         Pass A (vault-liquidation × limits) and exhaustive edge cases land in follow-ups.
+/// @notice End-to-end tests for BazaarPair.matchBatch covering all three matching passes:
+///         Pass A (vault-liquidation × limits), Pass B (markets × limits), and Pass C
+///         (limits × limits), plus their cross-pass ordering and the stale-oracle variants.
 contract MatchingEngineTest is Test {
     using stdStorage for StdStorage;
     StdStorage internal _stdstore;
@@ -99,7 +99,7 @@ contract MatchingEngineTest is Test {
         bytes32 assertionId = factory.proposePairDeployment(BTC_USD_FEED_ID, true, PROPOSAL_TOTAL, "BTC/USD");
         vm.stopPrank();
 
-        // Also propose an AAPL pair (non-continuously-traded) used by Phase 5 stale-oracle tests.
+        // Also propose an AAPL pair (non-continuously-traded) used by the stale-oracle tests below.
         usdc.mint(deployer, PROPOSAL_TOTAL_USDC);
         vm.startPrank(deployer);
         usdc.approve(address(factory), PROPOSAL_TOTAL_USDC);
@@ -1147,8 +1147,8 @@ contract MatchingEngineTest is Test {
         // $5,000 ($0.25), net of the 1% bug-bounty tax → $0.2475. No integrator fees are
         // charged (orders carry no integrator). The taker insurance fee is 0 in BOTH
         // batches: opening is fully surplus-discounted (fund >> 2x target), and closing
-        // takes min(closingFee, riskAddingFee) = 0. Pre-fix, the closing batch charged
-        // the taker the flat 0.5 bp base fee and its delta exceeded the opening batch's.
+        // takes min(closingFee, riskAddingFee) = 0. Charging the closing taker the flat 0.5 bp
+        // base fee instead would push the closing batch's delta above the opening batch's.
         uint256 fillNotional = 5_000 * BAZAAR_SCALE;
         uint256 grossPerBatch = fillNotional * 50 / 1_000_000; // maker insurance fee
         uint256 expectedPerBatch = grossPerBatch * 9_900 / 10_000; // net of 1% bug-bounty tax
@@ -1681,9 +1681,9 @@ contract MatchingEngineTest is Test {
     }
 
     /// @notice Per-(batch, order) challenge key: a sequencer that censors the SAME order across two
-    ///         different batches is slashed for EACH batch. Previously the key was per-order, so the
-    ///         second omission reverted AlreadyChallenged and the order was censorable for free
-    ///         after one slash.
+    ///         different batches is slashed for EACH batch. A per-order key would make the second
+    ///         omission revert AlreadyChallenged, leaving the order censorable for free after one
+    ///         slash.
     function test_OmissionChallenge_SameOrderTwoBatches_SlashesTwice() public {
         // Batch 1: alice's aggressive long is omitted while carol/dave match (helper records it).
         (uint256 omittedLong, uint256 batchId1, BazaarTypes.BatchInfo memory info1,,) = _setupOmittedAliceLong();
@@ -1764,9 +1764,9 @@ contract MatchingEngineTest is Test {
     }
 
     /// @notice The omission window is time-based on matchTimestamp: past SEQUENCER_WINDOW the
-    ///         challenge reverts ChallengeWindowExpired. Pre-fix the gate compared L1 block.number
-    ///         against the L2 executionBlock (ArbSys.arbBlockNumber) — incomparable sequences, so
-    ///         the window never expired and batches stayed challengeable forever.
+    ///         challenge reverts ChallengeWindowExpired. A gate comparing L1 block.number against
+    ///         the L2 executionBlock (ArbSys.arbBlockNumber) would compare incomparable sequences,
+    ///         so the window would never expire and batches would stay challengeable forever.
     function test_OmissionChallenge_WindowExpires_TimeBased() public {
         (uint256 omittedLong, uint256 batchId, BazaarTypes.BatchInfo memory info,,) = _setupOmittedAliceLong();
 
@@ -1789,8 +1789,8 @@ contract MatchingEngineTest is Test {
     }
 
     /// @notice Stale-challenge ETH is refunded in full on a Step-1 reject (no stored batch hash),
-    ///         not stranded in the contract. Pre-fix the early `return` skipped the refund block and
-    ///         the entire msg.value was stuck. (Old code: balance would be down by the sent value.)
+    ///         not stranded in the contract. An early `return` on the reject would skip the refund
+    ///         block and strand the entire msg.value — the caller's balance down by the sent value.
     function test_StaleChallenge_RejectRefundsFullValue() public {
         vm.deal(address(this), 1 ether);
         BazaarTypes.BatchInfo memory info;
@@ -2230,7 +2230,7 @@ contract MatchingEngineTest is Test {
         uint256 shortId = _placeLimit(bob, false, size, 49_500 * BAZAAR_SCALE);
 
         vm.roll(block.number + 2);
-        // Bound gas so an infinite loop would visibly fail. The post-fix path completes well under 5M.
+        // Bound gas so an infinite loop would visibly fail. This path completes well under 5M.
         uint256 success = _match(_lists(_one(longId), _one(shortId), _empty(), _empty()), 10);
 
         assertEq(success, 1, "single partial fill at the rounding boundary");
@@ -2240,7 +2240,7 @@ contract MatchingEngineTest is Test {
     }
 
     // ╔══════════════════════════════════════════════════════════════╗
-    // ║       PHASE 5 — STALE-ORACLE PATHS (AAPL non-continuous)     ║
+    // ║          STALE-ORACLE PATHS (AAPL non-continuous)            ║
     // ╚══════════════════════════════════════════════════════════════╝
 
     /// @dev Build a Pyth price update for AAPL at the given USD price.
@@ -2418,8 +2418,9 @@ contract MatchingEngineTest is Test {
     }
 
     /// @notice Stale-band price rejection: if the limit's fillPrice deviates from the
-    ///         cached price by > MAX_STALE_DEVIATION_BP (10%), both heads are consumed
-    ///         without a fill (defensive — prevents stale-batch price gaming).
+    ///         cached price by > MAX_STALE_DEVIATION_BP (10%), the offending MAKER head is
+    ///         consumed without a fill (defensive — prevents stale-batch price gaming). Here
+    ///         the long is the maker and is retired; the short simply runs out of counterparties.
     function testStale_PriceBand_RejectsExtremeLimitPrice() public {
         _depositAapl(alice, 20_000 * BAZAAR_SCALE);
         _depositAapl(bob, 20_000 * BAZAAR_SCALE);
@@ -2445,7 +2446,7 @@ contract MatchingEngineTest is Test {
     /// @notice Confidence cap on the hot path: a FRESH Pyth cache whose confidence exceeds the 2%
     ///         cap must not be used for fills. With no user-supplied update to fall back on, the
     ///         batch hard-pauses (reverts) instead of matching against an over-confidence price.
-    ///         Pre-fix, step 1 used readUnsafePrice (no conf check) and the match would proceed.
+    ///         Were step 1 to read the cache without a confidence check, the match would proceed.
     function testConfCap_FreshHighConfCache_HardPausesFill() public {
         _deposit(alice, 20_000 * BAZAAR_SCALE);
         _deposit(bob, 20_000 * BAZAAR_SCALE);
@@ -2532,6 +2533,48 @@ contract MatchingEngineTest is Test {
         uint256[] memory skipped = _staleSkippedFromLogs();
         assertTrue(_arrContains(skipped, obLong), "band-voided long recorded in staleSkippedIds");
         assertTrue(_arrContains(skipped, obShort), "band-voided short recorded in staleSkippedIds");
+    }
+
+    /// @notice A stale-band breach must retire ONLY the offending leg. `fillPrice` is by
+    ///         construction the MAKER's price, so the counterparty is an innocent bystander —
+    ///         consuming it too costs it the entire batch AND its queue priority (being the head,
+    ///         it is the best-priced order on its side, so its worse-priced successor would fill in
+    ///         its place). Here the out-of-band long ($250) is the older order and therefore the
+    ///         maker against an in-band short ($198). Zeroing BOTH heads would consume the short and
+    ///         end the batch with ZERO fills — even though a perfectly good in-band long ($202) sits
+    ///         directly behind the offender. Retiring only the long lets the short match that next
+    ///         long on the following iteration.
+    function testStale_PriceBand_SkipsOnlyOffendingMaker_CounterpartyStillFills() public {
+        _depositAapl(alice, 20_000 * BAZAAR_SCALE);
+        _depositAapl(bob, 20_000 * BAZAAR_SCALE);
+        _depositAapl(carol, 20_000 * BAZAAR_SCALE);
+
+        uint256 size = 1 * BAZAAR_SCALE / 10;
+        // Creation order fixes maker precedence (older orderId = maker), so the out-of-band
+        // long is the maker in pairing #1 and the in-band short is the maker in pairing #2.
+        uint256 obLong = _placeLimitAapl(alice, true, size, 250 * BAZAAR_SCALE); // out of band, oldest
+        uint256 ibShort = _placeLimitAapl(bob, false, size, 198 * BAZAAR_SCALE); // in band
+        uint256 ibLong = _placeLimitAapl(carol, true, size, 202 * BAZAAR_SCALE); // in band, newest
+
+        vm.warp(block.timestamp + 30);
+        vm.roll(block.number + 2);
+
+        vm.recordLogs();
+        // Longs sorted DESC ($250, $202) against the single $198 short.
+        uint256 success = _matchAaplStale(_lists(_two(obLong, ibLong), _one(ibShort), _empty(), _empty()), 10);
+
+        assertEq(success, 1, "in-band counterparty still fills after the offending maker is skipped");
+        assertEq(_aaplOrderFilledSize(obLong), 0, "out-of-band maker not filled");
+        assertEq(_aaplOrderFilledSize(ibShort), size, "in-band short filled, not consumed by the breach");
+        assertEq(_aaplOrderFilledSize(ibLong), size, "in-band long filled behind the retired offender");
+
+        // Only the offending leg is recorded. The survivor never needs a stale-skip record: the
+        // walk never advances past it, so no worse-priced same-side order can match ahead of it
+        // and _isInRange can never see it as omitted. (Recording it anyway is unsafe — the buffer
+        // is preallocated to totalIds, and 2 pushes per 1 retirement can overrun it.)
+        uint256[] memory skipped = _staleSkippedFromLogs();
+        assertTrue(_arrContains(skipped, obLong), "out-of-band maker recorded as stale-skipped");
+        assertFalse(_arrContains(skipped, ibShort), "in-band counterparty not recorded: it stayed live");
     }
 
     /// @dev Decode staleSkippedIds from the BatchRecorded event in the recorded logs.
@@ -2637,9 +2680,10 @@ contract MatchingEngineTest is Test {
         assertEq(bondBefore - bondAfter, expectedPenalty, "penalty charged on full size despite later partial fill");
     }
 
-    /// @notice The laundering gap is closed: an order FULLY filled in a later batch still incurs
-    ///         the full-size omission penalty for the earlier batch that censored it (previously
-    ///         the current remainder was 0, so the sequencer escaped all liability).
+    /// @notice An order FULLY filled in a later batch still incurs the full-size omission penalty
+    ///         for the earlier batch that censored it. Pricing the penalty off the CURRENT
+    ///         remainder would read 0 here and let the sequencer launder away all liability by
+    ///         filling the order late.
     function test_OmissionPenalty_UsesFullSize_AfterFullFill() public {
         (
             uint256 omittedLong,
@@ -2745,7 +2789,7 @@ contract MatchingEngineTest is Test {
     }
 
     // ╔══════════════════════════════════════════════════════════════╗
-    // ║       PHASE 6 — CROSS-PASS / VAULT-PNL / INTERACTIONS        ║
+    // ║          CROSS-PASS / VAULT-PNL / INTERACTIONS               ║
     // ╚══════════════════════════════════════════════════════════════╝
 
     /// @notice Full A + B + C pipeline in one batch. Verifies the pass-ordering invariants:
@@ -2969,7 +3013,7 @@ contract MatchingEngineTest is Test {
 
     /// @notice A small position ($50 notional) pays the $0.10 floor, not the sub-floor 2bps.
     function testLiquidate_SmallPosition_PaysFloor() public {
-        _deposit(alice, BAZAAR_SCALE); // $1 collateral (deposit minimum)
+        _deposit(alice, 5 * BAZAAR_SCALE); // $5 collateral (deposit minimum)
         _writePosition(alice, true, BAZAAR_SCALE / 1000, 505 * BAZAAR_SCALE / 10); // 0.001 BTC, $50.50 entry
 
         uint256 bobUsdcBefore = usdc.balanceOf(bob);
@@ -3009,11 +3053,18 @@ contract MatchingEngineTest is Test {
         vm.prank(bob);
         pair.liquidate(users, liqPu);
 
-        assertTrue(
-            pair.isPairTerminatedEmergency() || pair.isPairTerminatedNormal(), "Check-0 deficit terminated the pair"
-        );
-        assertFalse(pair.isAdlPending(), "termination cleared the ADL-pending flag");
-        assertEq(pair.adlPendingSince(), 0, "termination cleared the ADL clock");
+        // Two-stage insolvency: Check-0 deficit FIXES the settlement price and opens the window
+        // (freezing withdrawals immediately) rather than terminating mid-liquidation. ADL stays
+        // pending through the window and is cleared by finalize — the withdraw freeze that
+        // matters is already in force via settlementPriceFixedTs, so nothing races.
+        assertGt(pair.settlementPriceFixedTs(), 0, "deficit opened the settlement window");
+        assertFalse(pair.isPairTerminatedNormal(), "not terminated until finalize");
+
+        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
+        pair.finalizeTermination();
+        assertTrue(pair.isPairTerminatedNormal(), "finalize settled the pair via the equity path");
+        assertFalse(pair.isAdlPending(), "finalize cleared the ADL-pending flag");
+        assertEq(pair.adlPendingSince(), 0, "finalize cleared the ADL clock");
     }
 
     /// @notice A liquidation refreshes IMR/MMR and records a lag sample, so the margin curve is
@@ -3169,9 +3220,9 @@ contract MatchingEngineTest is Test {
     // ╚══════════════════════════════════════════════════════════════╝
 
     /// @notice A full close whose owner holds less collateral than the flat sequencer fee ($0.03) is
-    ///         auto-canceled and skipped, not filled. Previously the fee floored to the available
-    ///         collateral while the ledger (D) was decremented by — and the fee paid out at — the full
-    ///         nominal amount, draining the shared pool and eventually bricking the last withdrawer.
+    ///         auto-canceled and skipped, not filled. Flooring the fee to the available collateral
+    ///         while decrementing the ledger (D) by — and paying the fee out at — the full nominal
+    ///         amount would drain the shared pool and eventually brick the last withdrawer.
     function testFeeCoverage_SubFeeClose_AutoCanceledNotFilled() public {
         uint256 size = 1 * BAZAAR_SCALE / 10; // 0.1 BTC
 

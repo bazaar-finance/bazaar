@@ -147,10 +147,11 @@ contract SequencerBondSafetyTest is IntegrationBase {
         assertEq(sequencer.sequencerBonds(seq2), 0, "still zero, no underflow");
         assertEq(usdc.balanceOf(challenger2), 0, "nothing left to pay the second challenger");
 
-        // --- Fix 3: the zero-value slash above must NOT have consumed the (batch, omitted2) key. ---
+        // --- The zero-value slash above must NOT have consumed the (batch, omitted2) key. ---
         // The slash collected 0 purely because the bond was empty (cap room still remained), so the
         // proven omission stays chargeable. Re-bond seq2 and re-challenge omitted2: it must still slash.
-        // A pre-fix build burned the key on the zero-slash, making this revert AlreadyChallenged.
+        // Burning the key on a zero-slash would make this revert AlreadyChallenged, letting a
+        // sequencer discharge a proven omission for free by challenging itself while broke.
         usdc.mint(seq2, 1_000 * USDC_SCALE);
         vm.startPrank(seq2);
         usdc.approve(address(sequencer), 1_000 * USDC_SCALE);

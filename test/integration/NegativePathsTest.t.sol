@@ -125,7 +125,7 @@ contract SequencerNegativeTest is IntegrationBase {
         address uma = pair.umaContract();
         vm.prank(uma);
         pair.fixSettlementPrice(50_000 * BAZAAR_SCALE);
-        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
         pair.finalizeTermination();
 
         bytes[] memory pu = _freshPrice();
@@ -182,7 +182,7 @@ contract SequencerNegativeTest is IntegrationBase {
         bytes[] memory pu = _freshPrice();
         uint64 obs = uint64(vm.getBlockNumber() - 1);
         vm.prank(seq);
-        vm.expectRevert(abi.encodeWithSelector(BazaarPair.BazaarPair__PairScheduledForTermination.selector, cutoff));
+        vm.expectRevert(BazaarPair.BazaarPair__PairScheduledForTermination.selector);
         pair.matchBatch(_lists(_one(aL), _one(bS), _empty(), _empty()), 10, pu, obs);
     }
 
@@ -315,7 +315,7 @@ contract GovernanceNegativeTest is IntegrationBase {
         // Execute (succeeds: threshold met, inside window), then execute again -> no active proposal.
         bytes[] memory pu = _freshPrice();
         terminator.executeInsurerTermination(address(pair), pu);
-        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
         pair.finalizeTermination();
         assertTrue(pair.isPairTerminatedNormal(), "consensus executed");
         vm.expectRevert(BazaarPairTerminator.BazaarPairTerminator__InsurerNoActiveProposal.selector);
@@ -341,7 +341,7 @@ contract GovernanceNegativeTest is IntegrationBase {
         bytes[] memory pu = _freshPrice();
         terminator.executeInsurerTermination(address(pair), pu);
         vm.clearMockedCalls();
-        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
         pair.finalizeTermination();
 
         assertTrue(pair.isPairTerminatedNormal(), "termination not blockable by a failed refund");
@@ -355,7 +355,7 @@ contract GovernanceNegativeTest is IntegrationBase {
         address uma = pair.umaContract();
         vm.prank(uma);
         pair.fixSettlementPrice(50_000 * BAZAAR_SCALE);
-        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
         pair.finalizeTermination();
         assertTrue(pair.isPairTerminatedNormal(), "old pair dead");
 

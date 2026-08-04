@@ -45,7 +45,7 @@ contract BazaarOracle {
     int32 public constant BAZAAR_EXPONENT = BazaarTypes.BAZAAR_EXPONENT;
     uint256 public constant BAZAAR_SCALE = BazaarTypes.BAZAAR_SCALE;
     uint256 public constant BP_SCALE = BazaarTypes.BP_SCALE;
-    uint256 public constant MAX_CONFIDENCE_BP = 200; // 2% — matches Drift Protocol's threshold
+    uint256 public constant MAX_CONFIDENCE_BP = 200; // max Pyth confidence/price ratio: 2%
 
     // -------------------- Immutables --------------------
     IPyth public immutable pyth;
@@ -266,8 +266,6 @@ contract BazaarOracle {
         }
     }
 
-    /// @dev True iff a Pyth leg's confidence ratio is within MAX_CONFIDENCE_BP and its price is
-    ///      positive. conf and price share the same exponent, so the ratio needs no conversion.
     /// @dev True iff the COMPOSED bracket is within MAX_CONFIDENCE_BP of the composed spot on
     ///      both sides. Per-leg checks are necessary but not sufficient for composites: relative
     ///      widths ADD under multiply/divide, so two legs at the cap compound to ~2× it. This
@@ -278,6 +276,8 @@ contract BazaarOracle {
         return (highPrice - spotPrice) * BP_SCALE <= cap && (spotPrice - lowPrice) * BP_SCALE <= cap;
     }
 
+    /// @dev True iff a Pyth leg's confidence ratio is within MAX_CONFIDENCE_BP and its price is
+    ///      positive. conf and price share the same exponent, so the ratio needs no conversion.
     function _legConfOk(PythStructs.Price memory p) internal pure returns (bool) {
         if (p.price <= 0) return false;
         return uint256(int256(p.price)) * MAX_CONFIDENCE_BP >= uint256(p.conf) * BP_SCALE;

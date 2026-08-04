@@ -4,36 +4,39 @@ out = "out"
 libs = ["lib"]
 via_ir = true
 optimizer = true
-optimizer_runs = 220
+optimizer_runs = 150
 solc_version = "0.8.34"
 evm_version = "cancun"
 remappings = [
     "@pythnetwork/pyth-sdk-solidity/=node_modules/@pythnetwork/pyth-sdk-solidity",
     "@openzeppelin/=lib/openzeppelin-contracts/",
 ]
+# DeployLibraries.s.sol records each chain's library addresses under deployments/<chainid>/.
+fs_permissions = [{ access = "read-write", path = "./deployments" }]
 
-# MatchingEngineLib overflows EIP-170 by 30B at the global 220 runs (24,606 > 24,576).
-# Compile it at 200 runs instead → 24,472B (+104 margin). NOTE: this is not surgical to
-# the library — because BazaarPair imports it (external-library call) and BazaarFactory
-# imports BazaarPair, solc compiles the whole chain in one unit, so all three land at 200
-# runs. At 200 the cost is negligible: BazaarFactory is byte-identical to its 220 build and
-# BazaarPair moves 43B with gas essentially unchanged (200 vs 220 is the flat top of the
-# size/gas curve). Drop to 150 to also de-fragilize BazaarPair's margin (24,330, +246) at a
-# modestly broader gas cost. Every other deployed contract stays at 220.
-[[profile.default.additional_compiler_profiles]]
-name = "me-small"
-via_ir = true
-optimizer = true
-optimizer_runs = 200
-
-[[profile.default.compilation_restrictions]]
-paths = "src/libraries/MatchingEngineLib.sol"
-optimizer_runs = 200
+# optimizer_runs is 150 for every contract. MatchingEngineLib and BazaarPair sit at the EIP-170
+# ceiling and only fit at this setting, and a single global value keeps the artifact that the test
+# suite and the size gate measure identical to the artifact that ships — a per-path restriction
+# would compile those two differently from everything else, so a green size gate would say nothing
+# about the bytecode actually deployed. The runtime cost is modest: the hot paths (matchBatch,
+# liquidation, settlement) are storage-dominated, where optimizer_runs matters least.
 
 [invariant]
 runs = 64
 depth = 64
 fail_on_revert = false
+
+# `unsafe-typecast` fires on every explicit numeric conversion with no dataflow analysis, and src/
+# converts constantly (signed PnL <-> unsigned balances, USDC <-> BAZAAR exponents, uint64 clocks).
+# The convention here is that every signed->unsigned cast sits behind an explicit sign guard; the
+# lint cannot see those guards, so it produces hundreds of hits and buries the rules that do find
+# real defects. Silenced so a genuine warning is visible in the build output.
+#
+# test/ and script/ are excluded entirely: `erc20-unchecked-transfer` on a mock or a test helper
+# describes no production risk, since a silently-failing transfer surfaces as a failing assertion.
+[lint]
+exclude_lints = ["unsafe-typecast"]
+ignore = ["test/**", "script/**"]
 
 # Network configurations
 [rpc_endpoints]
@@ -46,17 +49,10 @@ arbitrum_mainnet = { key = "${ARBISCAN_API_KEY}", url = "https://api.arbiscan.io
 arbitrum_sepolia = { key = "${ARBISCAN_API_KEY}", url = "https://api-sepolia.arbiscan.io/api" }
 base_sepolia = { key = "${BASESCAN_API_KEY}", url = "https://api-sepolia.basescan.org/api" }
 
-# External library linking (populated after running DeployLibraries.s.sol)
-# Uncomment and fill in addresses after deploying libraries:
-# libraries = [
-#     "src/libraries/InsuranceVaultLib.sol:InsuranceVaultLib:0x...",
-#     "src/libraries/LiquidationLib.sol:LiquidationLib:0x...",
-#     "src/libraries/OrderManagementLib.sol:OrderManagementLib:0x...",
-#     "src/libraries/AdlLib.sol:AdlLib:0x...",
-#     "src/libraries/MatchingEngineLib.sol:MatchingEngineLib:0x...",
-#     "src/libraries/CollateralLib.sol:CollateralLib:0x...",
-#     "src/libraries/RiskParamsLib.sol:RiskParamsLib:0x...",
-#     "src/libraries/FundingLib.sol:FundingLib:0x...",
-# ]
+# External library linking is NOT configured here. `libraries` is a single global key with no
+# per-network scoping, so one pasted list would be reused by every deploy target — linking, say, a
+# rehearsal network's addresses into a production build, where they hold no code. Instead
+# DeployLibraries.s.sol writes `deployments/<chainid>/libraries.args` and the deploy targets pass
+# that chain's flags on the command line. See the Makefile and docs/src/guide/deployment.md.
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

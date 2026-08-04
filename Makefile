@@ -9,8 +9,10 @@ help:
 	@echo "  make anvil                    - Start Anvil with tracing enabled"
 	@echo "  make deploy-anvil             - Deploy Bazaar to local Anvil"
 	@echo "  make deploy-pair-anvil        - Deploy a pair (FEED_ID=0x... CONTINUOUS=true|false DESC=...)"
-	@echo "  make deploy-arb-sepolia       - Deploy Bazaar to Arbitrum Sepolia"
-	@echo "  make deploy-arb-mainnet       - Deploy Bazaar to Arbitrum Mainnet"
+	@echo "  make deploy-libs-arb-sepolia  - Step 1/2: deploy libraries to Arbitrum Sepolia"
+	@echo "  make deploy-arb-sepolia       - Step 2/2: deploy Bazaar to Arbitrum Sepolia"
+	@echo "  make deploy-libs-arb-mainnet  - Step 1/2: deploy libraries to Arbitrum Mainnet"
+	@echo "  make deploy-arb-mainnet       - Step 2/2: deploy Bazaar to Arbitrum Mainnet"
 	@echo "  make set-price-anvil          - Set mock price (FEED_ID=0x... PRICE=2000)"
 	@echo "  make create-order-anvil       - Create limit order (PAIR=0x... LIMIT_PRICE=2000 SIZE=0.01 IS_LONG=true)"
 	@echo "  make warp-anvil SECONDS=N     - Warp Anvil forward N seconds"
@@ -221,27 +223,80 @@ deploy-pair-anvil:
 	echo "  Assertion ID: $$ASSERTION_ID" && \
 	echo "  Pair Address: $$PAIR_ADDR"
 
+# ---------- Two-step deployment ----------
+# BazaarPair links ten external libraries by address, so every network needs its own library
+# deployment before the Bazaar deploy can be linked. DeployLibraries writes that chain's
+# `--libraries` flags to deployments/<chainid>/libraries.args; the deploy targets below splat the
+# file for their own chain, so one network's addresses can never be linked into another's build.
+#
+# That guarantee holds only as long as the RPC alias actually serves the chain the target names --
+# the args path is chosen here, not read off the network. Every target therefore passes
+# EXPECTED_CHAIN_ID, and both scripts abort before broadcasting if block.chainid disagrees. The
+# chain id is written once per network below and feeds both the args path and the assertion, so
+# the two cannot drift apart.
+
+ARB_SEPOLIA_CHAIN_ID := 421614
+ARB_MAINNET_CHAIN_ID := 42161
+
+ARB_SEPOLIA_LIB_ARGS := deployments/$(ARB_SEPOLIA_CHAIN_ID)/libraries.args
+ARB_MAINNET_LIB_ARGS := deployments/$(ARB_MAINNET_CHAIN_ID)/libraries.args
+
 # ---------- Arbitrum Sepolia ----------
 
-.PHONY: deploy-arb-sepolia
-deploy-arb-sepolia:
-	@echo "Deploying Bazaar to Arbitrum Sepolia..."
-	forge script script/DeployBazaar.s.sol \
+.PHONY: deploy-libs-arb-sepolia
+deploy-libs-arb-sepolia:
+	@echo "Step 1/2: deploying external libraries to Arbitrum Sepolia..."
+	EXPECTED_CHAIN_ID=$(ARB_SEPOLIA_CHAIN_ID) \
+	forge script script/DeployLibraries.s.sol \
 		--rpc-url arbitrum_sepolia \
 		--account $(ACCOUNT) \
 		--sender $(SENDER) \
 		--broadcast \
 		--verify
 
+.PHONY: deploy-arb-sepolia
+deploy-arb-sepolia:
+	@test -f $(ARB_SEPOLIA_LIB_ARGS) || { \
+		echo "ERROR: $(ARB_SEPOLIA_LIB_ARGS) not found."; \
+		echo "Run 'make deploy-libs-arb-sepolia' first (step 1 of 2)."; \
+		exit 1; }
+	@echo "Step 2/2: deploying Bazaar to Arbitrum Sepolia..."
+	EXPECTED_CHAIN_ID=$(ARB_SEPOLIA_CHAIN_ID) \
+	forge script script/DeployBazaar.s.sol \
+		--rpc-url arbitrum_sepolia \
+		--account $(ACCOUNT) \
+		--sender $(SENDER) \
+		--broadcast \
+		--verify \
+		$$(cat $(ARB_SEPOLIA_LIB_ARGS))
+
 # ---------- Arbitrum Mainnet ----------
 
-.PHONY: deploy-arb-mainnet
-deploy-arb-mainnet:
-	@echo "Deploying to Arbitrum Mainnet..."
-	@read -p "Are you sure you want to deploy to mainnet? (y/N): " confirm && [ "$$confirm" = "y" ]
-	forge script script/DeployBazaar.s.sol \
+.PHONY: deploy-libs-arb-mainnet
+deploy-libs-arb-mainnet:
+	@echo "Step 1/2: deploying external libraries to Arbitrum MAINNET..."
+	@read -p "Deploy libraries to mainnet? (y/N): " confirm && [ "$$confirm" = "y" ]
+	EXPECTED_CHAIN_ID=$(ARB_MAINNET_CHAIN_ID) \
+	forge script script/DeployLibraries.s.sol \
 		--rpc-url arbitrum_mainnet \
 		--account $(ACCOUNT) \
 		--sender $(SENDER) \
 		--broadcast \
 		--verify
+
+.PHONY: deploy-arb-mainnet
+deploy-arb-mainnet:
+	@test -f $(ARB_MAINNET_LIB_ARGS) || { \
+		echo "ERROR: $(ARB_MAINNET_LIB_ARGS) not found."; \
+		echo "Run 'make deploy-libs-arb-mainnet' first (step 1 of 2)."; \
+		exit 1; }
+	@echo "Step 2/2: deploying Bazaar to Arbitrum MAINNET..."
+	@read -p "Are you sure you want to deploy to mainnet? (y/N): " confirm && [ "$$confirm" = "y" ]
+	EXPECTED_CHAIN_ID=$(ARB_MAINNET_CHAIN_ID) \
+	forge script script/DeployBazaar.s.sol \
+		--rpc-url arbitrum_mainnet \
+		--account $(ACCOUNT) \
+		--sender $(SENDER) \
+		--broadcast \
+		--verify \
+		$$(cat $(ARB_MAINNET_LIB_ARGS))

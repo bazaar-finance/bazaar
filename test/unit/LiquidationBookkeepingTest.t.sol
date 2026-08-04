@@ -121,8 +121,9 @@ contract BookkeepingHarness {
 }
 
 /// @notice Read-back tests for LiquidationLib's aggregate bookkeeping — the values every downstream
-///         consumer (ADL settlement price, Check-1 exposure, Pass-A close PnL) depends on but which
-///         were previously only ever seeded, never asserted after a real processLiquidations call.
+///         consumer (ADL settlement price, Check-1 exposure, Pass-A close PnL) depends on. Seeding
+///         these values directly proves nothing about the merge arithmetic that produces them, so
+///         each one is asserted after a real processLiquidations call.
 contract LiquidationBookkeepingTest is Test {
     uint256 constant SCALE = 1e18;
     uint256 constant PRICE = 50_000e18;
@@ -222,7 +223,7 @@ contract LiquidationBookkeepingTest is Test {
     // ---------------- bankruptcy price read-back ----------------
 
     /// @notice Long bankruptcy notional = entryValue - collateral - fundingPnl, read back after a
-    ///         real liquidation (previously only ever seeded by tests).
+    ///         real liquidation, so the subtraction is under test rather than a seeded value.
     function test_bankruptcy_long_entryMinusCollateral() public {
         // entry $50,500, collateral $600: equity 100 < minRequired (1.5% of 50k = 750) -> insolvent.
         h.setBucket(victim, true, 1 * SCALE, 50_500e18, 600e18, 0);

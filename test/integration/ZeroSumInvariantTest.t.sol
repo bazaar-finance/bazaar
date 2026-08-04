@@ -351,7 +351,7 @@ contract ZeroSumInvariantTest is Test {
     ///         above oracle (mark > index → longs pay), time passes, the next batch accrues the
     ///         index, then positions close. Funding must transfer between the sides — settled
     ///         into collateral on close — without minting or dropping a cent.
-    ///         Pre-fix (funding dropped on match-close) this test fails at "after closes".
+    ///         Dropping the funding leg on a match-driven close breaks the sum at "after closes".
     function test_zeroSum_withFundingAccrual() public {
         _deposit(alice, 15_000 * BAZAAR_SCALE);
         _deposit(bob, 15_000 * BAZAAR_SCALE);
@@ -426,11 +426,11 @@ contract ZeroSumInvariantTest is Test {
         _withdrawAll(bob); // withdraws deposits + realized profit
         _assertZeroSum(41_000, "after bob withdrew");
 
-        // Carol — last to withdraw — must get her fully-backed collateral out. Pre-fix this
-        // underflowed the deposits ledger: the vault's Pass-A loss (backing for bob's realized
-        // profit) was debited from insurance without the matching I → D transfer, so bob's
-        // profit-inclusive withdrawal drained a ledger that had never been credited. With the
-        // transfer booked in _finalize, the ledger covers every withdrawer in any order.
+        // Carol — last to withdraw — must get her fully-backed collateral out. Without the I → D
+        // transfer booked in _finalize, the vault's Pass-A loss (backing for bob's realized profit)
+        // would be debited from insurance alone, bob's profit-inclusive withdrawal would drain a
+        // deposits ledger that had never been credited, and carol's withdrawal would underflow it.
+        // With the transfer booked, the ledger covers every withdrawer in any order.
         _withdrawAll(carol);
         _assertZeroSum(41_000, "after withdrawals");
     }

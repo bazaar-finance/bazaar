@@ -18,6 +18,7 @@ All trading fees are charged per fill, on notional, deducted from each side's co
 | Action | Reward | Paid from |
 |---|---|---|
 | Liquidation (per position) | max($0.10, 2 bp of notional) | insurance fund |
+| Terminal settlement (per position) | max($0.10, 2 bp of notional) | the settled position's own remaining collateral; insurance only when its own loss wiped it out |
 | ADL execution | 0.1% of averted bad debt | insurance fund |
 | Omission challenge | 1% of min(batch, order) notional | sequencer bond |
 | Stale-flag challenge | ½ × 1% of batch notional | sequencer bond |

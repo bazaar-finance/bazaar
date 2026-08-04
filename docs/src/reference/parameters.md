@@ -43,7 +43,8 @@ All constants live in `src/libraries/BazaarTypes.sol`, `src/libraries/RiskParams
 | MMR grace | 24 h lag, 25 hourly samples |
 | `STALE_MARGIN_MULTIPLIER` | 2× on new fills under stale oracle |
 | `MAX_STALE_DEVIATION_BP` | 1000 (±10% stale-fill band) |
-| `MIN_COLLATERAL_AMOUNT` | $1 minimum collateral deposit |
+| `MIN_COLLATERAL_AMOUNT` | $5 minimum collateral deposit |
+| Retained-collateral floor | a position-holding account must keep `max(0.5% of notional, $5)` in collateral (`MIN_RETAINED_COLLATERAL_BP` = 50). Proportional because fees are: it guarantees the fee that closes the position is always payable |
 
 ## Funding
 
@@ -63,7 +64,7 @@ All constants live in `src/libraries/BazaarTypes.sol`, `src/libraries/RiskParams
 | Liquidation keeper reward | max($0.10, 2 bp of notional) |
 | ADL trigger / cancel | expected loss > 80% / < 60% of fund |
 | ADL auction | 25× score → ~0, quadratic, 10 min; ≤ 25 winners per call |
-| ADL timeout | 24 h → termination |
+| ADL timeout | 24 h → settlement window opens at the live price |
 | ADL executor reward | 0.1% of averted bad debt |
 | Insurance target | 2% … 10% of OI (vol-scaled, ≥ 3× gap EMA) |
 | Insurance LP | min $5 deposit; 20-day cooldown + 3-day window; rate limits 0.5% OI / 6 h (below target), max(1% OI, 10% fund) (above) |
@@ -89,11 +90,16 @@ All constants live in `src/libraries/BazaarTypes.sol`, `src/libraries/RiskParams
 
 | Parameter | Value |
 |---|---|
-| Listing | ≥ $4,000 = $1,000 UMA bond + ≥ $3,000 seed; 48 h liveness |
-| UMA oracle upgrade | $5,000 bond, 14-day liveness, then a 14-day activation timelock (`ORACLE_UPGRADE_TIMELOCK`) after approval |
+| Listing | ≥ $4,000 = $1,000 UMA bond + ≥ $3,000 seed (`MIN_INSURANCE_SEED`); 48 h liveness |
+| UMA identifier upgrade | $5,000 bond, 2-day liveness, then a 14-day activation timelock (`IDENTIFIER_UPGRADE_TIMELOCK`) after approval |
+| `DVM_DISPUTE_GRACE` | 14 days on top of liveness before a **disputed** proposal may be discarded as unsettleable; shared by the deployment and identifier tracks (it bounds the DVM, not the claim) |
+| Bond constants | floors, not fixed amounts — `requiredDeploymentBond()` / `requiredIdentifierUpgradeBond()` / `requiredTerminationBond()` each return `max(constant, UMA's live minimum)` |
+| Proposer free text | listing `description` ≤ 200 bytes; termination `reason` ≤ 1,000 and `pairDescription` ≤ 100 (`MAX_REASON_LENGTH`, `MAX_PAIR_DESCRIPTION_LENGTH`); restricted ASCII, no square brackets |
 | Scheduled termination | $1,000 bond, 12 h liveness, `lastTradingTs` ≥ 12 h out; 3 h precise-tick grace |
-| Post-cessation termination | $1,000 bond, 72 h liveness |
+| Post-cessation termination | $1,000 bond, 72 h liveness; cessation timestamp ≤ 7 days old (`MAX_CESSATION_LOOKBACK`) |
 | Stale-oracle termination | 21 days |
+| Terminal settlement window | 48 h between `fixSettlementPrice` and `finalizeTermination` (deposits + all withdrawals frozen) |
+| Terminal settlement bounty | `max($0.10, 2 bp of notional)` per position, debited from that position's own remaining collateral (insurance only when a position is wiped out by its own loss) |
 | Insurer vote | $500 bond; 60% of shares; 7-day vote + 7-day execution window; 14-day cooldown; 7-day share maturity |
 | Balance-check tolerance | 0.1% (`USDC_BALANCE_TOLERANCE_BP`) |
 | UMA proposer reward | 0.1% of fund, cap $100, once per pair |

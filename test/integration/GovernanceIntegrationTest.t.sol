@@ -23,7 +23,7 @@ contract GovernanceIntegrationTest is IntegrationBase {
 
     /// @dev Refresh the pair's stored price at the current timestamp, paying the Pyth fee.
     function _warmPrice(BazaarPair p, bytes[] memory pu) internal {
-        uint256 fee = p.getPythFee(pu);
+        uint256 fee = oracle.getUpdateFee(pu);
         vm.deal(address(this), fee);
         p.refreshPrice{value: fee}(pu);
     }
@@ -74,7 +74,7 @@ contract GovernanceIntegrationTest is IntegrationBase {
         vm.warp(lastTradingTs + 3 hours + 1);
         terminator.terminateScheduledPair(address(pair), new bytes[](0));
         assertFalse(pair.isPairTerminatedNormal(), "price fixed, sweep window still open");
-        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
         pair.finalizeTermination();
         assertTrue(pair.isPairTerminatedNormal(), "pair terminated after the trading window");
     }
@@ -109,10 +109,10 @@ contract GovernanceIntegrationTest is IntegrationBase {
         // Anyone finalizes with the archived Pyth update from the cessation moment; the price is
         // verified on-chain against that payload, not read from the proposal.
         bytes[] memory tick = _priceUpdate(50_000, cessationTs);
-        uint256 fee = pair.getPythFee(tick);
+        uint256 fee = oracle.getUpdateFee(tick);
         vm.deal(address(this), fee);
         terminator.terminateScheduledPair{value: fee}(address(pair), tick);
-        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
         pair.finalizeTermination();
 
         assertTrue(pair.isPairTerminatedNormal(), "pair terminated at the verified tick");
@@ -134,41 +134,62 @@ contract GovernanceIntegrationTest is IntegrationBase {
         assertEq(usdc.balanceOf(bob), bobBal + 10_000 * USDC_SCALE, "bob withdrew settled collateral");
     }
 
-    // ============================ oracle upgrade ============================
+    // ============================ identifier upgrade ============================
 
-    /// @notice Oracle-upgrade governance: propose a new UMA oracle + identifier, wait out the 14-day
-    ///         liveness, settle (queues the swap), wait out the 14-day activation timelock — the
-    ///         users' exit window — then anyone activates and the factory points at the new oracle.
-    function test_e2e_OracleUpgrade_SwapsGovernanceOracle() public {
-        MockOptimisticOracleV3 newOo = new MockOptimisticOracleV3(address(usdc), 7200);
-        bytes32 newIdentifier = "ASSERT_TRUTH3";
+    /// @notice Identifier-upgrade governance: propose a new UMA identifier (whitelist-validated),
+    ///         wait out the liveness window, settle (queues the swap), wait out the 14-day
+    ///         activation timelock — the users' exit window — then anyone activates and the
+    ///         protocol asserts under the new identifier. The oracle address never moves — it is
+    ///         immutable; the identifier is the axis UMA actually changes.
+    function test_e2e_IdentifierUpgrade_SwapsGovernanceIdentifier() public {
         address oldOo = address(factory.oo());
         bytes32 oldIdentifier = factory.umaIdentifier();
 
-        usdc.mint(alice, factory.ORACLE_UPGRADE_BOND_USDC());
+        usdc.mint(alice, factory.IDENTIFIER_UPGRADE_BOND_USDC());
         vm.startPrank(alice);
-        usdc.approve(address(factory), factory.ORACLE_UPGRADE_BOND_USDC());
-        bytes32 aid = factory.proposeUmaOracleUpgrade(address(newOo), newIdentifier);
+        usdc.approve(address(factory), factory.IDENTIFIER_UPGRADE_BOND_USDC());
+        bytes32 aid = factory.proposeUmaIdentifierUpgrade("ASSERT_TRUTH5");
         vm.stopPrank();
 
-        vm.warp(vm.getBlockTimestamp() + factory.ORACLE_UPGRADE_LIVENESS() + 1);
-        factory.settleOracleUpgradeProposal(aid);
+        vm.warp(vm.getBlockTimestamp() + factory.IDENTIFIER_UPGRADE_LIVENESS() + 1);
+        factory.settleIdentifierUpgradeProposal(aid);
 
-        // Approval queues; the incoming oracle has no authority during the exit window.
-        assertEq(address(factory.oo()), oldOo, "swap deferred by the activation timelock");
-        assertEq(factory.umaIdentifier(), oldIdentifier, "identifier deferred too");
-        assertEq(factory.pendingOracleUpgradeAssertionId(), bytes32(0), "no pending upgrade");
-        (,,,, bool resolved, bool settlementResolution) = factory.oracleUpgradeProposals(aid);
+        // Approval queues; the incoming identifier governs nothing during the exit window.
+        assertEq(factory.umaIdentifier(), oldIdentifier, "swap deferred by the activation timelock");
+        assertEq(factory.pendingIdentifierUpgradeAssertionId(), bytes32(0), "no pending upgrade");
+        (,,, bool resolved, bool settlementResolution,) = factory.identifierUpgradeProposals(aid);
         assertTrue(resolved, "proposal resolved");
         assertTrue(settlementResolution, "proposal accepted");
 
         // After the timelock, anyone finalizes the swap.
-        vm.warp(vm.getBlockTimestamp() + factory.ORACLE_UPGRADE_TIMELOCK() + 1);
+        vm.warp(vm.getBlockTimestamp() + factory.IDENTIFIER_UPGRADE_TIMELOCK() + 1);
         vm.prank(bob);
-        factory.activateOracleUpgrade();
+        factory.activateIdentifierUpgrade();
 
-        assertEq(address(factory.oo()), address(newOo), "governance oracle swapped");
-        assertEq(factory.umaIdentifier(), newIdentifier, "identifier swapped");
+        assertEq(factory.umaIdentifier(), bytes32("ASSERT_TRUTH5"), "governance identifier swapped");
+        assertEq(address(factory.oo()), oldOo, "oracle address immutable");
+    }
+
+    /// @notice Fail closed: while the protocol's identifier is off UMA's live whitelist, both
+    ///         termination proposal paths revert — an assertion made in that state would be
+    ///         undisputable and termination assertions pin settlement semantics. The non-UMA
+    ///         termination paths (insurer vote, stale price, insolvency) are unaffected.
+    function test_e2e_TerminationProposals_FailClosedWhileIdentifierDewhitelisted() public {
+        mockOO.setIdentifierSupported(factory.umaIdentifier(), false);
+
+        _bondProposer(alice);
+        vm.prank(alice);
+        vm.expectRevert(BazaarPairTerminator.BazaarPairTerminator__UmaIdentifierNotLive.selector);
+        terminator.proposeTermination(
+            address(pair), "BTC/USD", vm.getBlockTimestamp() + 7 days, "Reverse split announced."
+        );
+
+        uint64 cessationTs = uint64(vm.getBlockTimestamp());
+        vm.warp(vm.getBlockTimestamp() + 2 days);
+        _bondProposer(bob);
+        vm.prank(bob);
+        vm.expectRevert(BazaarPairTerminator.BazaarPairTerminator__UmaIdentifierNotLive.selector);
+        terminator.proposePostCessationTermination(address(pair), "BTC/USD", cessationTs, "Feed decommissioned.");
     }
 
     // ============================ disputed termination ============================
@@ -230,7 +251,7 @@ contract GovernanceIntegrationTest is IntegrationBase {
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
         bytes[] memory pu = _freshPrice();
         terminator.executeInsurerTermination(address(pair), pu);
-        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
         pair.finalizeTermination();
 
         assertTrue(pair.isPairTerminatedNormal(), "pair terminated by insurer consensus");

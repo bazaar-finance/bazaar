@@ -4,6 +4,7 @@ pragma solidity 0.8.34;
 import {IntegrationBase} from "./IntegrationBase.sol";
 import {StdStorage, stdStorage} from "forge-std/Test.sol";
 import {BazaarPairTerminator} from "../../src/BazaarPairTerminator.sol";
+import {CollateralLib} from "../../src/libraries/CollateralLib.sol";
 
 /// @title CrisisBackstopIntegrationTest
 /// @notice The protocol's last-resort insolvency backstops, end-to-end: a recorded deficit
@@ -31,15 +32,33 @@ contract CrisisBackstopIntegrationTest is IntegrationBase {
         vm.prank(bob);
         pair.liquidate(_arr1(alice), _freshPrice());
 
-        assertTrue(pair.isPairTerminatedNormal(), "deficit terminated the pair via the equity path");
-        assertFalse(pair.isPairTerminatedEmergency(), "live price -> normal (equity) termination");
+        // Two-stage insolvency: the deficit check FIXES the settlement price and opens the 48h
+        // window (freezing withdrawals immediately — the point of Check 0) rather than
+        // terminating mid-transaction. Finalize completes it, charging the deficit to insurance.
+        assertGt(pair.settlementPriceFixedTs(), 0, "deficit opened the settlement window");
+        assertFalse(pair.isPairTerminatedNormal(), "not terminated until finalize");
 
-        // The pair is halted: no further deposits.
+        // The pair is halted: no further deposits — INCLUDING at the stamping timestamp itself.
+        // scheduledTerminationTs is stamped at `now` and the limbo guards compare with >=, so
+        // there is no same-second window in which the settlement price is already known but
+        // deposits/orders/matching still pass. A strict > would open exactly that window, and it
+        // is reachable atomically (both terminator entry points are permissionless) rather than
+        // only via Arbitrum's shared block timestamps — so the same-second leg below is the one
+        // that matters.
         vm.startPrank(carol);
-        usdc.approve(address(pair), 1 * USDC_SCALE);
-        vm.expectRevert();
+        usdc.approve(address(pair), 2 * USDC_SCALE);
+        vm.expectRevert(CollateralLib.CollateralLib__PairScheduledForTermination.selector);
+        pair.depositCollateral(1 * BAZAAR_SCALE, 0, 0, 0, "", "");
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.expectRevert(CollateralLib.CollateralLib__PairScheduledForTermination.selector);
         pair.depositCollateral(1 * BAZAAR_SCALE, 0, 0, 0, "", "");
         vm.stopPrank();
+
+        // After the window, anyone finalizes → normal (equity) termination.
+        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
+        pair.finalizeTermination();
+        assertTrue(pair.isPairTerminatedNormal(), "deficit settled the pair via the equity path");
+        assertFalse(pair.isPairTerminatedEmergency(), "live price -> normal, not emergency");
     }
 
     /// @notice ADL timeout: an ADL that stays pending past ADL_TIMEOUT_DURATION (24h) is treated as
@@ -83,6 +102,13 @@ contract CrisisBackstopIntegrationTest is IntegrationBase {
         vm.prank(carol);
         assertEq(pair.liquidate(_arr1(eve), _freshPrice()), 1, "eve liquidated after the timeout");
 
+        // Two-stage: the timed-out ADL is treated as price-driven insolvency → fix the price and
+        // open the settlement window, then finalize to settle via the equity path.
+        assertGt(pair.settlementPriceFixedTs(), 0, "adl timeout opened the settlement window");
+        assertFalse(pair.isPairTerminatedNormal(), "not terminated until finalize");
+
+        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
+        pair.finalizeTermination();
         assertTrue(pair.isPairTerminatedNormal(), "timed-out ADL settled the pair via the equity path");
         assertFalse(pair.isPairTerminatedEmergency(), "live price -> normal termination, not emergency");
     }

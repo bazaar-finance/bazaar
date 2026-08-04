@@ -5,7 +5,6 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {BazaarTypes} from "./libraries/BazaarTypes.sol";
 import {BucketLib} from "./libraries/BucketLib.sol";
 import {MetaTxLib} from "./libraries/MetaTxLib.sol";
-import {OrderManagementLib} from "./libraries/OrderManagementLib.sol";
 import {CollateralLib} from "./libraries/CollateralLib.sol";
 import {InsuranceVaultLib} from "./libraries/InsuranceVaultLib.sol";
 import {VaultHealthLib} from "./libraries/VaultHealthLib.sol";
@@ -57,6 +56,12 @@ interface IBazaarPairLens {
         );
     function isAdlPending() external view returns (bool);
     function adlPendingSince() external view returns (uint256);
+    function adlScoreDeposit(address user) external view returns (uint256);
+    function terminalProfitClaim(address user) external view returns (uint256);
+    function fixedSettlementPrice() external view returns (uint256);
+    function settlementPriceFixedTs() external view returns (uint256);
+    function isPairTerminatedEmergency() external view returns (bool);
+    function outstandingOrderExposure(address user) external view returns (uint256 longExposure, uint256 shortExposure);
     function auxState() external view returns (BazaarTypes.AuxState memory);
 }
 
@@ -142,6 +147,192 @@ contract BazaarPairLens {
         uint256 pendingSince = IBazaarPairLens(pair).adlPendingSince();
         if (!adlPending || pendingSince == 0) return type(uint256).max;
         return AdlLib._getAdlScoreThreshold(pendingSince);
+    }
+
+    /// @notice ADL auction score for `user`, computed with the same inputs the on-chain ranking
+    ///         uses: PnL at the frozen snapshot (price + funding index) over the window-deposit-
+    ///         adjusted collateral (AdlLib._scoreCollateral). Keepers sort executeAdl candidates
+    ///         by this score DESCENDING — a submission that disagrees with it reverts on-chain
+    ///         (AdlLib__NotDescendingAdlScoreOrder).
+    /// @param pair The BazaarPair to read
+    /// @param user The candidate winner
+    /// @return adlScore The ranking score; 0 when the user cannot be a candidate at all (no ADL
+    ///         pending, flat, wrong side, or non-positive snapshot PnL)
+    /// @return eligible True when the user would pass the eligibility scan right now:
+    ///         adlScore > 0 and at or above the current (decaying) auction threshold
+    function getAdlScore(address pair, address user) external view returns (uint256 adlScore, bool eligible) {
+        if (!IBazaarPairLens(pair).isAdlPending()) return (0, false);
+        BazaarTypes.AuxState memory aux = IBazaarPairLens(pair).auxState();
+
+        BazaarTypes.PositionBucket memory bucket;
+        (
+            bucket.isLong,
+            bucket.size,
+            bucket.entryValue,
+            bucket.collateral,
+            bucket.entryFundingIndex,
+            bucket.takeProfitOrderId,
+            bucket.stopLossOrderId,
+            bucket.entryMmrBp,
+            bucket.activeMarketOrderId,
+            bucket.mmrUpdateTs
+        ) = IBazaarPairLens(pair).positionBuckets(user);
+        if (bucket.size == 0 || bucket.isLong != aux.adlLongs) return (0, false);
+
+        BazaarTypes.MarginRequirements memory marginReqs;
+        (marginReqs.imrBp, marginReqs.mmrBp, marginReqs.lastUpdateTs,) = IBazaarPairLens(pair).marginRequirements();
+        marginReqs.laggedMmrBp = IBazaarPairLens(pair).getLaggedMmrBp();
+
+        // Rank at the frozen snapshot, exactly like AdlLib's scan pass — the live price and
+        // funding index play no part in queue position.
+        BazaarTypes.BucketState memory state =
+            BucketLib.calculateState(bucket, aux.adlSnapshotPrice, aux.adlSnapshotFundingIndex, marginReqs);
+        if (state.totalPnl <= 0) return (0, false);
+
+        adlScore = Math.mulDiv(
+            uint256(state.totalPnl),
+            BAZAAR_SCALE,
+            AdlLib._scoreCollateral(state.effectiveCollateral, IBazaarPairLens(pair).adlScoreDeposit(user))
+        );
+        eligible = adlScore >= AdlLib._getAdlScoreThreshold(IBazaarPairLens(pair).adlPendingSince());
+    }
+
+    /// @notice A user's terminal-settlement entitlement components after a normal termination:
+    ///         what a withdrawal would pay out, decomposed. Total ≈ collateral + claimPayout.
+    /// @dev claimPayout uses the frozen ratio from auxState, which is 0 until finalizeTermination
+    ///      runs — during the 48h window the claim is registered but its payout is not yet fixed
+    ///      (profitRatioBp == 0 here means "not frozen yet", not "worthless"). An unsettled
+    ///      position's PnL is NOT included: it becomes a claim (window) or a surplus-clipped
+    ///      junior credit (post-finalize) only when the position is settled. In the deep-
+    ///      insolvency black-swan case a pro-rata principal haircut can additionally reduce
+    ///      collateral at first withdrawal.
+    /// @param pair The BazaarPair to read
+    /// @param user The account to query
+    /// @return collateral The user's current bucket collateral (principal, reserved at all times)
+    /// @return registeredClaim The user's registered profit claim (winner PnL settled during the
+    ///         window, plus any settlement bounties received as claim transfers)
+    /// @return profitRatioBp The frozen pro-rata payout ratio (0 before finalize)
+    /// @return claimPayout registeredClaim x profitRatioBp — the cash the claim redeems for
+    function getTerminalEntitlement(address pair, address user)
+        external
+        view
+        returns (uint256 collateral, uint256 registeredClaim, uint256 profitRatioBp, uint256 claimPayout)
+    {
+        (,,, collateral,,,,,,) = IBazaarPairLens(pair).positionBuckets(user);
+        registeredClaim = IBazaarPairLens(pair).terminalProfitClaim(user);
+        profitRatioBp = IBazaarPairLens(pair).auxState().normalTerminalWinnersPayoutRatioBp;
+        claimPayout = Math.mulDiv(registeredClaim, profitRatioBp, BazaarTypes.BP_SCALE);
+    }
+
+    /// @notice The bounty a keeper earns for settling `user` through liquidate() while the pair
+    ///         is in terminal-settlement mode, computed with the on-chain formula
+    ///         (CollateralLib._bountyFor at the fixed settlement price).
+    /// @dev How the bounty is funded follows the position's post-settlement state: cash from its
+    ///      remaining collateral first, then a claim transfer out of a winner's registered
+    ///      profit, then insurance-if-covered for positions with neither.
+    /// @param pair The BazaarPair to read
+    /// @param user The candidate position
+    /// @return bounty The reward in BAZAAR (1e18) precision; 0 when there is nothing to settle
+    /// @return settleable True when settlement mode is active (price fixed) and the user has an
+    ///         open position
+    function getTerminalSettlementBounty(address pair, address user)
+        external
+        view
+        returns (uint256 bounty, bool settleable)
+    {
+        if (IBazaarPairLens(pair).settlementPriceFixedTs() == 0) return (0, false);
+        (, uint256 size,,,,,,,,) = IBazaarPairLens(pair).positionBuckets(user);
+        if (size == 0) return (0, false);
+        return (CollateralLib._bountyFor(size, IBazaarPairLens(pair).fixedSettlementPrice()), true);
+    }
+
+    /// @notice The largest collateral withdrawal that would succeed for `user` right now, under
+    ///         the same checks the normal-operation withdrawal path enforces.
+    /// @dev Normal operation only: returns 0 while withdrawals are frozen or rerouted — terminal
+    ///      settlement mode (price fixed; post-termination entitlements are the
+    ///      getTerminalEntitlement / emergency-ratio domain), emergency termination, ADL pending
+    ///      for a position holder, or an insolvent position. For a position holder the bound is
+    ///      the tightest of: raw collateral, the retained-collateral floor
+    ///      (max(MIN_RETAINED_COLLATERAL_BP of notional, MIN_COLLATERAL_AMOUNT)), and the equity
+    ///      the IMR leaves free, where worst-case notional folds in resting-order exposure
+    ///      (CollateralLib._worstCaseNotional) and `oracleStale` doubles the IMR — each exactly
+    ///      as the on-chain check applies it. A flat user is bounded by collateral less the
+    ///      order-IMR reserve on their larger resting side. Evaluated at the pair's stored
+    ///      funding index.
+    /// @param pair The BazaarPair to read
+    /// @param user The account to query
+    /// @param currentPrice The price to evaluate at (BAZAAR 1e18). Pass the CONSERVATIVE bracket
+    ///        the withdrawal path itself applies: spot − confidence for a long, spot + confidence
+    ///        for a short (a flat user's order check uses spot, and this parameter is ignored).
+    ///        Passing plain spot for a position holder overstates the bound by the confidence
+    ///        band and the on-chain check will reject the difference.
+    /// @param oracleStale Whether the pair would treat its oracle as stale right now
+    ///        (STALE_MARGIN_MULTIPLIER x IMR)
+    /// @return maxAmount The largest amount `withdrawCollateral` would accept, in BAZAAR (1e18)
+    function getMaxWithdrawable(address pair, address user, uint256 currentPrice, bool oracleStale)
+        external
+        view
+        returns (uint256 maxAmount)
+    {
+        if (IBazaarPairLens(pair).settlementPriceFixedTs() != 0 || IBazaarPairLens(pair).isPairTerminatedEmergency()) return 0;
+
+        BazaarTypes.PositionBucket memory bucket;
+        (
+            bucket.isLong,
+            bucket.size,
+            bucket.entryValue,
+            bucket.collateral,
+            bucket.entryFundingIndex,
+            bucket.takeProfitOrderId,
+            bucket.stopLossOrderId,
+            bucket.entryMmrBp,
+            bucket.activeMarketOrderId,
+            bucket.mmrUpdateTs
+        ) = IBazaarPairLens(pair).positionBuckets(user);
+
+        (uint256 longExposure, uint256 shortExposure) = IBazaarPairLens(pair).outstandingOrderExposure(user);
+
+        BazaarTypes.MarginRequirements memory marginReqs;
+        (marginReqs.imrBp, marginReqs.mmrBp, marginReqs.lastUpdateTs,) = IBazaarPairLens(pair).marginRequirements();
+        marginReqs.laggedMmrBp = IBazaarPairLens(pair).getLaggedMmrBp();
+        uint256 effectiveImrBp = marginReqs.imrBp;
+        if (oracleStale) effectiveImrBp *= BazaarTypes.STALE_MARGIN_MULTIPLIER;
+
+        if (bucket.size == 0) {
+            // Flat: collateral less the order-IMR reserve on the larger resting side
+            // (zero position notional reduces _worstCaseNotional to exactly that max).
+            uint256 orderImrReq = Math.mulDiv(
+                effectiveImrBp,
+                CollateralLib._worstCaseNotional(true, 0, longExposure, shortExposure),
+                BazaarTypes.BP_SCALE
+            );
+            return bucket.collateral > orderImrReq ? bucket.collateral - orderImrReq : 0;
+        }
+
+        if (IBazaarPairLens(pair).isAdlPending()) return 0; // position holders frozen during ADL
+
+        BazaarTypes.BucketState memory state =
+            BucketLib.calculateState(bucket, currentPrice, IBazaarPairLens(pair).currentFundingIndex(), marginReqs);
+        if (!state.isSolvent) return 0;
+
+        // Ceiling 1: raw collateral.
+        maxAmount = state.effectiveCollateral;
+
+        // Ceiling 2: the retained-collateral floor.
+        uint256 minRetained =
+            Math.mulDiv(CollateralLib.MIN_RETAINED_COLLATERAL_BP, state.currentNotional, BazaarTypes.BP_SCALE);
+        if (minRetained < CollateralLib.MIN_COLLATERAL_AMOUNT) minRetained = CollateralLib.MIN_COLLATERAL_AMOUNT;
+        uint256 aboveFloor = state.effectiveCollateral > minRetained ? state.effectiveCollateral - minRetained : 0;
+        if (aboveFloor < maxAmount) maxAmount = aboveFloor;
+
+        // Ceiling 3: the equity the IMR leaves free.
+        uint256 imrRequirement = Math.mulDiv(
+            effectiveImrBp,
+            CollateralLib._worstCaseNotional(bucket.isLong, state.currentNotional, longExposure, shortExposure),
+            BazaarTypes.BP_SCALE
+        );
+        uint256 imrSlack = state.availableEquity > imrRequirement ? state.availableEquity - imrRequirement : 0;
+        if (imrSlack < maxAmount) maxAmount = imrSlack;
     }
 
     /// @notice Returns pending liquidation exposure (single-direction aggregate)
@@ -271,6 +462,16 @@ contract BazaarPairLens {
     /// @notice Returns the flat sequencer fee per side
     function getSequencerFlatFeePerSide() external pure returns (uint256) {
         return BazaarTypes.SEQUENCER_FLAT_FEE_PER_SIDE;
+    }
+
+    /// @notice Returns the keeper reward constants shared by live liquidation and terminal
+    ///         settlement: reward = max(minReward, notional * feeEbp / ebpScale).
+    function getLiquidationRewardConstants()
+        external
+        pure
+        returns (uint256 minReward, uint256 feeEbp, uint256 ebpScale)
+    {
+        return (BazaarTypes.MIN_LIQUIDATOR_REWARD, BazaarTypes.LIQUIDATION_FEE_EBP, BazaarTypes.EBP_SCALE);
     }
 
     // ---- Auxiliary BazaarPair state forwarders ----

@@ -322,13 +322,15 @@ contract BazaarPairTest is Test {
     }
 
     function testDepositCollateral_RevertsBelowMinimum() public {
-        uint256 tooSmall = BAZAAR_SCALE / 2; // 0.5 USDC — below 1 USDC minimum
+        uint256 tooSmall = BAZAAR_SCALE / 2; // 0.5 USDC — below the 5 USDC minimum
 
         vm.startPrank(user1);
         usdc.approve(address(btcPair), USDC_SCALE);
 
         vm.expectRevert(
-            abi.encodeWithSelector(CollateralLib.CollateralLib__InvalidDepositAmount.selector, tooSmall, BAZAAR_SCALE)
+            abi.encodeWithSelector(
+                CollateralLib.CollateralLib__InvalidDepositAmount.selector, tooSmall, 5 * BAZAAR_SCALE
+            )
         );
         btcPair.depositCollateral(tooSmall, 0, 0, 0, "", "");
         vm.stopPrank();
@@ -409,11 +411,7 @@ contract BazaarPairTest is Test {
         bytes memory sig = _signDepositCollateral(btcPair, USER1_PK, depositAmount, nonce, deadline, relayerFeeAmount);
 
         vm.prank(relayer);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                BazaarPair.BazaarPair__RelayerFeeExceedsDeposit.selector, relayerFeeAmount, depositAmount
-            )
-        );
+        vm.expectRevert(BazaarPair.BazaarPair__RelayerFeeExceedsDeposit.selector);
         btcPair.depositCollateral(depositAmount, nonce, deadline, relayerFeeAmount, sig, "");
     }
 
@@ -982,8 +980,8 @@ contract BazaarPairTest is Test {
     // `marginRequirements` storage struct (declared before these vars) by one slot.
     uint256 constant SLOT_NORMAL_TERMINATION_PRICE = 64;
     uint256 constant SLOT_EMERGENCY_HAIRCUT_BP = 65;
-    uint256 constant SLOT_WINNERS_PAYOUT_BP = 66;
-    uint256 constant SLOT_NORMAL_COLLATERAL_RATIO = 67; // normalTerminalCollateralRatioBp (rung-4)
+    // (the winners-payout slot was deleted pre-deployment; profit ratio lives in terminalState)
+    uint256 constant SLOT_NORMAL_COLLATERAL_RATIO = 66; // normalTerminalCollateralRatioBp (black-swan backstop)
 
     /// @dev Set isPairTerminatedEmergency = true in the packed slot 29 and write haircut bp.
     function _simulateEmergencyTermination(BazaarPair pair, uint256 haircutBp) internal {
@@ -997,18 +995,21 @@ contract BazaarPairTest is Test {
 
     // ==================== Helper: Simulate Normal Termination ====================
 
-    /// @dev Set isPairTerminatedNormal = true in the packed slot 29 and write terminal price/payout ratio.
+    /// @dev Set isPairTerminatedNormal = true in the packed slot 29 and write the terminal price.
+    ///      The winnersPayoutBp param is retained for call-site compatibility but unused: the
+    ///      frozen-ratio design pays profits from registered claims x terminalState.profitRatioBp,
+    ///      not a pair-level scalar (see TerminalSweepTest for the real-flow coverage).
     function _simulateNormalTermination(BazaarPair pair, uint256 termPrice, uint256 winnersPayoutBp) internal {
+        winnersPayoutBp; // silence unused-param
         // Read current slot 29 value to preserve other packed fields
         bytes32 current = vm.load(address(pair), bytes32(SLOT_TERMINATION_FLAGS));
         // Set byte 2 (isPairTerminatedNormal) to 1
         bytes32 updated = current | bytes32(uint256(1) << 16);
         vm.store(address(pair), bytes32(SLOT_TERMINATION_FLAGS), updated);
         vm.store(address(pair), bytes32(SLOT_NORMAL_TERMINATION_PRICE), bytes32(termPrice));
-        vm.store(address(pair), bytes32(SLOT_WINNERS_PAYOUT_BP), bytes32(winnersPayoutBp));
-        // Production's _terminatePair atomically co-sets the rung-4 collateral ratio whenever it
-        // sets isPairTerminatedNormal (BP_SCALE = no haircut). Mirror that so the default 0 — which
-        // CollateralLib now treats as a real full haircut — never appears with a normal-terminated pair.
+        // Production's _terminatePair atomically co-sets the black-swan collateral ratio whenever
+        // it sets isPairTerminatedNormal (BP_SCALE = no haircut). Mirror that so the default 0 —
+        // which CollateralLib treats as a real full haircut — never appears with a normal-terminated pair.
         vm.store(address(pair), bytes32(SLOT_NORMAL_COLLATERAL_RATIO), bytes32(uint256(10_000)));
     }
 
@@ -1139,30 +1140,23 @@ contract BazaarPairTest is Test {
         assertEq(totalCollateral, 0);
     }
 
+    /// @notice New frozen-ratio model: a winner's PRINCIPAL is always withdrawable at termination.
+    ///         Their PROFIT is paid separately from registered claims × the frozen ratio — covered
+    ///         end-to-end (with a real gap, settlement, and pro-rata payout) in TerminalSweepTest.
+    ///         Here the simulate-shortcut registers no claim, so withdraw returns principal and
+    ///         closes the position (self-settled at the terminal price; no counterparty surplus).
     function testWithdrawCollateral_NormalTermination_LongWithProfit() public {
-        // Deposit $15,000, open 1 BTC long at $50,000 entry
         _depositCollateral(btcPair, user1, 15_000 * BAZAAR_SCALE);
         _simulateOpenPosition(user1);
-
-        // Normal termination at $60,000 — user profits $10,000
-        // With 100% winners payout ratio, collateral becomes 15000 + 10000 = 25000
         _simulateNormalTermination(btcPair, 60_000 * BAZAAR_SCALE, 10_000);
-
-        // Simulate counterparty: bump vault accounting and mint USDC to pair to cover profit payout
-        uint256 slotTotalCollateral = 10; // pairVault.totalCollateralDeposited (slot 6 + 4)
-        vm.store(address(btcPair), bytes32(slotTotalCollateral), bytes32(25_000 * BAZAAR_SCALE));
-        usdc.mint(address(btcPair), 10_000 * USDC_SCALE); // extra USDC for the $10k profit
 
         bytes[] memory emptyPriceUpdate = new bytes[](0);
         vm.prank(user1);
-        btcPair.withdrawCollateral(25_000 * BAZAAR_SCALE, emptyPriceUpdate, 0, 0, 0, "");
+        btcPair.withdrawCollateral(15_000 * BAZAAR_SCALE, emptyPriceUpdate, 0, 0, 0, "");
 
-        (,,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
-        assertEq(collateral, 0);
-
-        // Position should be closed
-        (, uint256 size,,,,,,,,) = btcPair.positionBuckets(user1);
-        assertEq(size, 0);
+        (, uint256 size,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
+        assertEq(collateral, 0, "principal fully withdrawn");
+        assertEq(size, 0, "position closed by terminal self-settlement");
     }
 
     function testWithdrawCollateral_NormalTermination_LongWithLoss() public {
@@ -1178,16 +1172,15 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         btcPair.withdrawCollateral(5_000 * BAZAAR_SCALE, emptyPriceUpdate, 0, 0, 0, "");
 
-        (,,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
+        (, uint256 size,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, 0);
-
-        // Position should be closed
-        (, uint256 size,,,,,,,,) = btcPair.positionBuckets(user1);
         assertEq(size, 0);
 
-        // Vault totalCollateralDeposited reduced by withdrawal amount
+        // New model: the $10k loss is RELEASED from the principal ledger at settlement (feeding
+        // the surplus that backs winners), then the $5k withdrawal reduces it further:
+        // 15000 - 10000 (loss release) - 5000 (withdraw) = 0.
         (,,,, uint256 totalCollateral,,,,,,,) = btcPair.pairVault();
-        assertEq(totalCollateral, 15_000 * BAZAAR_SCALE - 5_000 * BAZAAR_SCALE);
+        assertEq(totalCollateral, 0, "loss release + withdrawal drain the principal ledger");
     }
 
     function testWithdrawCollateral_NormalTermination_LongWithLoss_RevertsExceedsAvailable() public {
@@ -1203,27 +1196,23 @@ contract BazaarPairTest is Test {
         btcPair.withdrawCollateral(6_000 * BAZAAR_SCALE, emptyPriceUpdate, 0, 0, 0, "");
     }
 
+    /// @notice The pro-rata winner haircut (profit × frozen ratio) is exercised end-to-end in
+    ///         TerminalSweepTest (real gap → settlement → sub-100% ratio → payout) and at the unit
+    ///         level in TerminationTest's frozen-ratio suite. Here the simulate-shortcut registers
+    ///         no claim, so this asserts the invariant that always holds regardless of ratio:
+    ///         the winner's principal is withdrawable and the position closes.
     function testWithdrawCollateral_NormalTermination_WinnersPayoutHaircut() public {
-        // Deposit $15,000, open 1 BTC long at $50,000 entry
         _depositCollateral(btcPair, user1, 15_000 * BAZAAR_SCALE);
         _simulateOpenPosition(user1);
-
-        // Normal termination at $60,000 — profit = $10,000
-        // But winners payout ratio = 80% (8000 bp) — adjusted profit = $8,000
-        // Final collateral = 15000 + 8000 = 23000
         _simulateNormalTermination(btcPair, 60_000 * BAZAAR_SCALE, 8_000);
-
-        // Simulate counterparty: bump vault accounting and mint USDC to pair to cover profit payout
-        uint256 slotTotalCollateral = 10;
-        vm.store(address(btcPair), bytes32(slotTotalCollateral), bytes32(23_000 * BAZAAR_SCALE));
-        usdc.mint(address(btcPair), 8_000 * USDC_SCALE); // extra USDC for the $8k adjusted profit
 
         bytes[] memory emptyPriceUpdate = new bytes[](0);
         vm.prank(user1);
-        btcPair.withdrawCollateral(23_000 * BAZAAR_SCALE, emptyPriceUpdate, 0, 0, 0, "");
+        btcPair.withdrawCollateral(15_000 * BAZAAR_SCALE, emptyPriceUpdate, 0, 0, 0, "");
 
-        (,,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
-        assertEq(collateral, 0);
+        (, uint256 size,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
+        assertEq(collateral, 0, "principal fully withdrawn");
+        assertEq(size, 0, "position closed");
     }
 
     // ==================== withdrawCollateral: Scheduled Termination Tests ====================
@@ -2222,9 +2211,7 @@ contract BazaarPairTest is Test {
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
 
         vm.prank(user1);
-        vm.expectRevert(
-            abi.encodeWithSelector(BazaarPair.BazaarPair__PairScheduledForTermination.selector, block.timestamp - 1)
-        );
+        vm.expectRevert(BazaarPair.BazaarPair__PairScheduledForTermination.selector);
         btcPair.createOrder(
             BazaarTypes.OrderType.Limit,
             0,
@@ -2765,7 +2752,7 @@ contract BazaarPairTest is Test {
 
     function testCreateOrder_ViaRelayer_RevertsInsufficientCollateralForFee() public {
         // Deposit 2 USDC — less than relayer fee
-        _depositCollateral(btcPair, user1, 2 * BAZAAR_SCALE);
+        _depositCollateral(btcPair, user1, 5 * BAZAAR_SCALE); // at the deposit minimum; stdstore below sets the real balance
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
 
         uint256 nonce = 0;
@@ -2798,11 +2785,7 @@ contract BazaarPairTest is Test {
         );
 
         vm.prank(relayer);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                BazaarPair.BazaarPair__InsufficientCollateralForRelayerFee.selector, 5e17, relayerFeeAmount
-            )
-        );
+        vm.expectRevert(BazaarPair.BazaarPair__InsufficientCollateralForRelayerFee.selector);
         btcPair.createOrder(
             BazaarTypes.OrderType.Limit,
             0,
@@ -3022,9 +3005,7 @@ contract BazaarPairTest is Test {
 
         // user2 tries to cancel user1's order
         vm.prank(user2);
-        vm.expectRevert(
-            abi.encodeWithSelector(BazaarPair.BazaarPair__RequestorIsNotOrderOwner.selector, orderId, user2)
-        );
+        vm.expectRevert(BazaarPair.BazaarPair__RequestorIsNotOrderOwner.selector);
         btcPair.cancelOrders(ids, 0, 0, 0, "");
     }
 
@@ -3053,7 +3034,7 @@ contract BazaarPairTest is Test {
 
         // orders[999].creator == address(0) != user1, so ownership check fails first
         vm.prank(user1);
-        vm.expectRevert(abi.encodeWithSelector(BazaarPair.BazaarPair__RequestorIsNotOrderOwner.selector, 999, user1));
+        vm.expectRevert(BazaarPair.BazaarPair__RequestorIsNotOrderOwner.selector);
         btcPair.cancelOrders(ids, 0, 0, 0, "");
     }
 
@@ -3124,11 +3105,16 @@ contract BazaarPairTest is Test {
         btcPair.cancelOrders(ids, nonce, deadline, relayerFee, sig);
     }
 
-    function testCancelOrders_EmptyArray() public {
+    /// @notice An empty id list is rejected, not treated as a no-op. With no order consumed, a
+    ///         relayed cancelOrders([], …, relayerFee, sig) would be a pure collateral-extraction
+    ///         primitive: self-relay it, repeat with fresh nonces, and every dollar of margin
+    ///         backing an open position leaves the bucket with no health check. Requiring a live,
+    ///         cancelable order per call bounds it.
+    function testCancelOrders_EmptyArray_Reverts() public {
         uint256[] memory ids = new uint256[](0);
 
-        // Empty array should succeed (no-op)
         vm.prank(user1);
+        vm.expectRevert(BazaarPair.BazaarPair__ExceedsMaxCancelsPerCall.selector);
         btcPair.cancelOrders(ids, 0, 0, 0, "");
     }
 
@@ -3251,7 +3237,7 @@ contract BazaarPairTest is Test {
             ids[i] = i + 1; // dummy ids, revert fires before ownership check
         }
 
-        vm.expectRevert(abi.encodeWithSelector(BazaarPair.BazaarPair__ExceedsMaxCancelsPerCall.selector, 201, 200));
+        vm.expectRevert(BazaarPair.BazaarPair__ExceedsMaxCancelsPerCall.selector);
         vm.prank(user1);
         btcPair.cancelOrders(ids, 0, 0, 0, "");
     }

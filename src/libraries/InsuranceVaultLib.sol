@@ -42,13 +42,13 @@ library InsuranceVaultLib {
     error InsuranceVaultLib__ZeroShares();
     error InsuranceVaultLib__ExceedsShares();
     error InsuranceVaultLib__NoWithdrawalRequest();
+    error InsuranceVaultLib__WithdrawalRequestStaleEpoch();
     error InsuranceVaultLib__AdlBlocking();
     error InsuranceVaultLib__CooldownNotElapsed();
     error InsuranceVaultLib__WithdrawalWindowExpired();
     error InsuranceVaultLib__RateLimitExceeded();
     error InsuranceVaultLib__SharesLockedForVoting();
     error InsuranceVaultLib__TooManyRecentInsuranceDeposits(uint256 windowCount, uint16 cap);
-    error InsuranceVaultLib__LotSharesOverflow(uint256 sharesGained);
 
     // -------------------- Structs --------------------
 
@@ -67,9 +67,10 @@ library InsuranceVaultLib {
     // below $1 while shares exist, the next deposit bumps the epoch: pre-drain stakes truly
     // went to zero, so their balances are lazily invalidated (a mapping cannot be iterated
     // to zero them eagerly) and the supply restarts from the rescuer's own contribution —
-    // a one-transaction rescue with no holder enumeration. This removes the multiplicative
-    // share inflation that compounded per wipe+rescue cycle under pro-rata dust pricing and
-    // eventually overflowed the uint192 deposit-lot guard.
+    // a one-transaction rescue with no holder enumeration, and no multiplicative share inflation
+    // compounding per wipe+rescue cycle. The reset only fires BELOW $1, though: drains that stop
+    // just above the floor still inflate the supply, which is why the deposit lot stores `shares`
+    // full-width rather than behind a narrow overflow guard that inflation could eventually trip.
 
     /// @dev Roll `user`'s raw balance into `epoch`: a stale balance is a wiped stake, so it
     ///      resets to 0 before the epoch stamp is updated. Must be called before ANY write
@@ -158,7 +159,7 @@ library InsuranceVaultLib {
             revert InsuranceVaultLib__DepositBelowMinimum(amount, MIN_INSURANCE_DEPOSIT);
         }
         if (isPairTerminatedEmergency || isPairTerminatedNormal) revert InsuranceVaultLib__PairTerminated();
-        if (scheduledTerminationTs != 0 && block.timestamp > scheduledTerminationTs) {
+        if (scheduledTerminationTs != 0 && block.timestamp >= scheduledTerminationTs) {
             revert InsuranceVaultLib__PairScheduledForTermination(scheduledTerminationTs);
         }
 
@@ -211,9 +212,9 @@ library InsuranceVaultLib {
         _recordDepositLot(insuranceDepositLots, insuranceLotsHead, insuranceDepositsPerDay, caller, shares);
     }
 
-    /// @dev Deposit-lot bookkeeping for the vote-maturity (anti-snipe) system — moved from
-    ///      BazaarPair for EIP-170 headroom. Prunes lots aged past INSURER_LOT_RETENTION_PERIOD
-    ///      (see the constant doc for why pruned lots are guaranteed mature), enforces the
+    /// @dev Deposit-lot bookkeeping for the vote-maturity (anti-snipe) system. Prunes lots aged
+    ///      past INSURER_LOT_RETENTION_PERIOD (see the constant doc for why pruned lots are
+    ///      guaranteed mature to every still-active proposal), enforces the
     ///      per-user deposit rate limit across the rolling maturity window, then appends this
     ///      deposit's lot. Pruned lots' share counts remain in insuranceShares, so the pair's
     ///      `mature = total - sum(active immature lots)` stays correct.
@@ -254,9 +255,10 @@ library InsuranceVaultLib {
             insuranceDepositsPerDay[caller][today] += 1;
         }
 
-        // Append the lot (uint192 guard keeps the packed slot exact).
-        if (shares > type(uint192).max) revert InsuranceVaultLib__LotSharesOverflow(shares);
-        insuranceDepositLots[caller].push(BazaarTypes.DepositLot(uint64(block.timestamp), uint192(shares)));
+        // Append the lot. `shares` is stored full-width, so no value a legitimate deposit can
+        // mint is rejectable here — a narrower field would brick deposits outright once the
+        // supply inflated past it, a far worse failure than a wide slot.
+        insuranceDepositLots[caller].push(BazaarTypes.DepositLot(uint64(block.timestamp), shares));
     }
 
     // ================================================================
@@ -267,7 +269,8 @@ library InsuranceVaultLib {
     /// @param insuranceShares Storage mapping of per-user RAW share balances
     /// @param shareEpochOf Storage mapping of the epoch each user's raw balance belongs to
     /// @param epoch Current share epoch
-    /// @param withdrawalRequestTs Storage mapping of per-user request timestamps
+    /// @param withdrawalRequestTs Storage mapping of per-user epoch-stamped request slots
+    ///        (`epoch << 64 | timestamp`)
     /// @param withdrawalRequestShareAmount Storage mapping of per-user requested share amounts
     /// @param shareAmount Number of shares to withdraw
     /// @param caller The requesting user
@@ -285,7 +288,10 @@ library InsuranceVaultLib {
         uint256 held = shareEpochOf[caller] == epoch ? insuranceShares[caller] : 0;
         if (held < shareAmount) revert InsuranceVaultLib__ExceedsShares();
 
-        withdrawalRequestTs[caller] = block.timestamp;
+        // Epoch-stamped (high 192 bits epoch, low 64 timestamp): a share-epoch bump voids the
+        // request. The stake it committed was wiped, so its cooldown must not carry over to
+        // fresh post-recap shares (executeInsuranceWithdrawal enforces the stamp match).
+        withdrawalRequestTs[caller] = (epoch << 64) | block.timestamp;
         withdrawalRequestShareAmount[caller] = shareAmount;
     }
 
@@ -301,7 +307,8 @@ library InsuranceVaultLib {
     /// @param epoch Current share epoch
     /// @param totalInsuranceShares Current total shares issued (current epoch)
     /// @param vault Storage reference to the pair vault
-    /// @param withdrawalRequestTs Storage mapping of per-user request timestamps
+    /// @param withdrawalRequestTs Storage mapping of per-user epoch-stamped request slots
+    ///        (`epoch << 64 | timestamp`)
     /// @param withdrawalRequestShareAmount Storage mapping of per-user requested share amounts
     /// @param rateLimitState Storage reference to withdrawal rate-limit state
     /// @param params Withdrawal parameters (pair state flags, price data)
@@ -320,11 +327,16 @@ library InsuranceVaultLib {
         BazaarTypes.InsuranceWithdrawParams memory params,
         address caller
     ) external returns (uint256 withdrawAmount, uint256 newTotalShares) {
-        uint256 requestTs = withdrawalRequestTs[caller];
+        uint256 packedRequest = withdrawalRequestTs[caller];
+        uint256 requestTs = uint256(uint64(packedRequest));
         if (requestTs == 0) revert InsuranceVaultLib__NoWithdrawalRequest();
+        // A request stamped in an earlier share epoch committed a stake that a recap has since
+        // wiped. Honoring its already-elapsed cooldown would let a re-depositor exit fresh
+        // shares instantly — precisely while the fund is recovering from the wipe. Void it;
+        // a new request serves the full cooldown against the new stake.
+        if (packedRequest >> 64 != epoch) revert InsuranceVaultLib__WithdrawalRequestStaleEpoch();
         // Settle the caller into the current epoch before any balance check or write: a
-        // request made before an epoch bump refers to a wiped stake and must not burn
-        // current-epoch supply.
+        // wiped balance must read as 0, never burn current-epoch supply.
         _settle(insuranceShares, shareEpochOf, epoch, caller);
         // Active-pair gates: block during the "scheduled but not yet executed" limbo
         // and during ADL, enforce cooldown + window. Terminated pairs bypass all of these
@@ -332,7 +344,7 @@ library InsuranceVaultLib {
         // would otherwise revert forever after a successful normal termination because the
         // field is never cleared).
         if (!params.isPairTerminatedEmergency && !params.isPairTerminatedNormal) {
-            if (params.scheduledTerminationTs != 0 && block.timestamp > params.scheduledTerminationTs) {
+            if (params.scheduledTerminationTs != 0 && block.timestamp >= params.scheduledTerminationTs) {
                 revert InsuranceVaultLib__PairScheduledForTermination(params.scheduledTerminationTs);
             }
             if (params.adlPendingSince != 0) revert InsuranceVaultLib__AdlBlocking();
@@ -354,7 +366,7 @@ library InsuranceVaultLib {
 
         // Calculate USDC value of shares at current share price. mulDiv's 512-bit
         // intermediate keeps shareAmount x fund from overflowing at recap-inflated
-        // share magnitudes (legitimate supplies near the uint192 deposit-lot cap).
+        // share magnitudes (supplies inflated by repeated drain-and-recap cycles).
         withdrawAmount = Math.mulDiv(shareAmount, vault.insuranceFundBalance, totalInsuranceShares);
 
         // Rate-limit withdrawals when pair is active

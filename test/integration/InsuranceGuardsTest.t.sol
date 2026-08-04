@@ -9,16 +9,16 @@ import {CollateralLib} from "../../src/libraries/CollateralLib.sol";
 import {InsuranceVaultLib} from "../../src/libraries/InsuranceVaultLib.sol";
 
 /// @title InsuranceGuardsTest
-/// @notice The insurance fund's drain-guards under a LIVE book (all previously dead in the suite):
-///         OI-based withdrawal rate limits, the vote-lock, the ADL block, plus the insolvent-
-///         withdrawal gate, the rung-4 principal haircut, and blocked-state deposit arms.
+/// @notice The insurance fund's drain-guards under a LIVE book — each one needs real open interest
+///         to reach at all: OI-based withdrawal rate limits, the vote-lock, the ADL block, plus the
+///         insolvent-withdrawal gate, the rung-4 principal haircut, and blocked-state deposit arms.
 contract InsuranceGuardsTest is IntegrationBase {
     using stdStorage for StdStorage;
 
     uint256 constant SLOT_TERMINATION_FLAGS = 29;
     uint256 constant SLOT_NORMAL_TERMINATION_PRICE = 64;
-    uint256 constant SLOT_WINNERS_PAYOUT_BP = 66;
-    uint256 constant SLOT_NORMAL_COLLATERAL_RATIO = 67;
+    // (the winners-payout slot was deleted pre-deployment; profit ratio lives in terminalState)
+    uint256 constant SLOT_NORMAL_COLLATERAL_RATIO = 66;
 
     /// @dev Open a 1v1 BTC position (alice long / bob short at $50k) so the pair has live OI.
     function _openOI() internal {
@@ -76,11 +76,11 @@ contract InsuranceGuardsTest is IntegrationBase {
         assertGt(usdc.balanceOf(carol), usdcBefore, "compliant withdrawal paid out");
     }
 
-    /// @notice REGRESSION: above target the period budget accrues across withdrawals — including
-    ///         across separate (Sybil) accounts. Previously the above-target branch checked only a
-    ///         per-withdrawal cap and never touched withdrawnThisPeriod, so two accounts could each
-    ///         withdraw under the cap and collectively blow past the intended rate. Now the second
-    ///         withdrawal that pushes the cumulative total over 1% of OI in the same period reverts.
+    /// @notice Above target the period budget accrues across withdrawals — including across
+    ///         separate (Sybil) accounts. An above-target branch checking only a per-withdrawal cap,
+    ///         never touching withdrawnThisPeriod, would let two accounts each withdraw under the
+    ///         cap and collectively blow past the intended rate. The second withdrawal that pushes
+    ///         the cumulative total over 1% of OI in the same period reverts.
     function test_rateLimit_aboveTarget_periodBudgetAccruesAcrossAccounts() public {
         _openOI(); // OI notional $100k
         _depositInsurance(carol, 30_000 * BAZAAR_SCALE);
@@ -223,7 +223,6 @@ contract InsuranceGuardsTest is IntegrationBase {
         bytes32 current = vm.load(address(pair), bytes32(SLOT_TERMINATION_FLAGS));
         vm.store(address(pair), bytes32(SLOT_TERMINATION_FLAGS), current | bytes32(uint256(1) << 16));
         vm.store(address(pair), bytes32(SLOT_NORMAL_TERMINATION_PRICE), bytes32(uint256(50_000 * BAZAAR_SCALE)));
-        vm.store(address(pair), bytes32(SLOT_WINNERS_PAYOUT_BP), bytes32(uint256(10_000)));
         vm.store(address(pair), bytes32(SLOT_NORMAL_COLLATERAL_RATIO), bytes32(uint256(7_500)));
 
         // First withdrawal: haircut fires (10,000 -> 7,500), then pays the requested 1,000.
@@ -251,7 +250,7 @@ contract InsuranceGuardsTest is IntegrationBase {
         address uma = pair.umaContract();
         vm.prank(uma);
         pair.fixSettlementPrice(50_000 * BAZAAR_SCALE);
-        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
         pair.finalizeTermination();
 
         vm.startPrank(carol);
@@ -322,19 +321,19 @@ contract InsuranceGuardsTest is IntegrationBase {
         assertEq(fund, orphan, "orphan stays in the fund as buffer");
     }
 
-    /// @notice REGRESSION (mulDiv hardening): at a recap-inflated share supply, a fair deposit
-    ///         and the lens valuation must not panic on their uint256 intermediates
-    ///         (amount x supply and shares x fund respectively). Pre-fix both computations
-    ///         reverted with an arithmetic panic even though the fair results fit comfortably.
+    /// @notice mulDiv hardening: at a recap-inflated share supply, a fair deposit and the lens
+    ///         valuation must not panic on their uint256 intermediates (amount x supply and
+    ///         shares x fund respectively). Written as raw products both overflow and revert with
+    ///         an arithmetic panic even though the fair results fit comfortably.
     function test_mulDiv_hugeShareSupply_depositAndLensSurvive() public {
         // A supply reachable only through repeated wipe+rescue cycles (1e58 shares) backed by
-        // a healthy $10k fund. amount x supply = 1e78 > uint256 max -> raw math panicked.
+        // a healthy $10k fund. amount x supply = 1e78 > uint256 max -> raw math panics.
         _stdstore.target(address(pair)).sig("totalInsuranceShares()").checked_write(uint256(1e58));
         _stdstore.target(address(pair)).sig("pairVault()").depth(5).checked_write(10_000 * BAZAAR_SCALE);
 
         _depositInsurance(carol, 100 * BAZAAR_SCALE);
 
-        // shares = 1e20 x 1e58 / 1e22 = 1e56 — fair, and far under the uint192 lot cap.
+        // shares = 1e20 x 1e58 / 1e22 = 1e56 — fair, and storable now that lots are full-width.
         assertEq(pair.insuranceShares(carol), 1e56, "fair share count minted");
         // Lens valuation (raw shares x fund = 1e78) must survive too, pricing exactly $100.
         assertEq(
@@ -342,6 +341,32 @@ contract InsuranceGuardsTest is IntegrationBase {
             100 * BAZAAR_SCALE,
             "lens values the deposit at its contribution"
         );
+    }
+
+    /// @notice A share supply already inflated by repeated drain-and-recap cycles must not brick
+    ///         further deposits. Were `DepositLot.shares` a uint192, once the supply passed
+    ///         ~6.3e57 even a MINIMUM $5 deposit would mint more shares than the lot could hold and
+    ///         revert `LotSharesOverflow` — recapitalization permanently dead. Critically the epoch
+    ///         reset does NOT save that case: it fires only below $1, and the fund here sits at
+    ///         exactly $1, so pro-rata pricing applies. Lots are full-width, and the vote-maturity
+    ///         read must see the untruncated count.
+    function test_R7_inflatedSupply_minimumDepositStillRecordsFullWidthLot() public {
+        _stdstore.target(address(pair)).sig("totalInsuranceShares()").checked_write(uint256(1e58));
+        _stdstore.target(address(pair)).sig("pairVault()").depth(5).checked_write(BAZAAR_SCALE); // exactly $1
+
+        // $5 x 1e58 / $1 = 5e58 shares — ~8x a uint192 ceiling (~6.28e57).
+        _depositInsurance(carol, 5 * BAZAAR_SCALE);
+
+        assertEq(pair.insuranceShares(carol), 5e58, "minted at the inflated share price");
+        assertEq(pair.totalInsuranceShares(), 6e58, "supply updated, no brick");
+        assertEq(lens.getInsuranceDepositValue(address(pair), carol), 5 * BAZAAR_SCALE, "worth her $5");
+
+        // Vote maturity reads the lot: immature against a cutoff before the deposit (this is the
+        // branch that actually sums lot.shares), fully mature against one at/after it. A uint192
+        // truncation would have made the immature leg understate and hand her early vote power.
+        uint64 nowTs = uint64(vm.getBlockTimestamp());
+        assertEq(pair.getSharesAsOf(carol, nowTs - 1), 0, "brand-new lot is immature at full width");
+        assertEq(pair.getSharesAsOf(carol, nowTs), 5e58, "lot counted at full width once mature");
     }
 
     // ============================ share-epoch reset ============================
@@ -374,8 +399,8 @@ contract InsuranceGuardsTest is IntegrationBase {
         assertEq(lens.getInsuranceDepositValue(address(pair), carol), 0, "lens: wiped value is zero");
     }
 
-    /// @notice A withdrawal request made before an epoch bump refers to a wiped stake: executing
-    ///         it must revert (ExceedsShares) rather than burn the new generation's supply, and
+    /// @notice A withdrawal request made before an epoch bump refers to a wiped stake: the
+    ///         epoch stamp voids it outright (no burning the new generation's supply), and
     ///         the wiped holder has no insurer-vote power in the new epoch.
     function test_shareEpoch_StaleRequestCannotBurnNewSupply() public {
         _drainAndRescue(carol, 10_000 * BAZAAR_SCALE);
@@ -384,9 +409,35 @@ contract InsuranceGuardsTest is IntegrationBase {
         _drainAndRescue(dave, 10_000 * BAZAAR_SCALE); // bump: carol's stake is wiped
 
         vm.warp(vm.getBlockTimestamp() + 20 days + 1);
-        _executeExpect(carol, InsuranceVaultLib.InsuranceVaultLib__ExceedsShares.selector);
+        _executeExpect(carol, InsuranceVaultLib.InsuranceVaultLib__WithdrawalRequestStaleEpoch.selector);
         assertEq(pair.totalInsuranceShares(), 10_000 * BAZAAR_SCALE, "new-epoch supply untouched");
         assertEq(pair.getSharesAsOf(carol, uint64(vm.getBlockTimestamp())), 0, "no stale voting power");
+    }
+
+    /// @notice A ripe pre-recap withdrawal request must not lend its elapsed cooldown to fresh
+    ///         post-recap shares. Without the epoch stamp, a wiped LP re-depositing after the
+    ///         epoch bump could execute their old request instantly — a zero-cooldown exit at
+    ///         the exact moment the fund is recovering (and absorbing crisis seizures). The
+    ///         stamp voids the stale request; a fresh one serves the full cooldown.
+    function test_shareEpoch_RipeRequestVoidedByBump_NoCooldownSkipOnRedeposit() public {
+        _drainAndRescue(carol, 10_000 * BAZAAR_SCALE);
+        _requestAll(carol);
+        vm.warp(vm.getBlockTimestamp() + 20 days + 1); // request ripens: window open
+
+        _drainAndRescue(dave, 10_000 * BAZAAR_SCALE); // wipe + bump: carol's stake -> 0
+
+        // Carol re-enters with fresh capital, so her new-epoch balance covers the old request —
+        // absent the epoch check this executes instantly against shares deposited seconds ago.
+        _depositInsurance(carol, 10_000 * BAZAAR_SCALE);
+        _executeExpect(carol, InsuranceVaultLib.InsuranceVaultLib__WithdrawalRequestStaleEpoch.selector);
+
+        // The legitimate path: re-request in the current epoch and serve the full cooldown.
+        _requestAll(carol);
+        _executeExpect(carol, InsuranceVaultLib.InsuranceVaultLib__CooldownNotElapsed.selector);
+        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        uint256 usdcBefore = usdc.balanceOf(carol);
+        _execute(carol);
+        assertGt(usdc.balanceOf(carol), usdcBefore, "fresh-epoch request pays out after its own cooldown");
     }
 
     /// @notice A fund drained to sub-$1 dust (not exactly 0) also triggers the epoch reset; the

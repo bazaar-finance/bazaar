@@ -55,11 +55,11 @@ library LiquidationLib {
                 continue; // Skip users with no position
             }
 
-            // Use plain oracle price for solvency. Confidence-band polarity has no clean answer
-            // for liquidation (user-favorable lets noise carry, protocol-eager risks false
-            // liquidations). The 2% confidence-ratio cap at the oracle layer already pauses
-            // pricing when uncertainty is too high; that's where conservatism belongs.
-            // Matches Drift's pattern (plain oracle for maintenance margin / liquidation).
+            // Use the plain oracle price (not a bracket bound) for solvency. Confidence-band
+            // polarity has no clean answer for liquidation: user-favorable lets noise carry,
+            // protocol-eager risks false liquidations. The 2% confidence-ratio cap at the oracle
+            // layer already pauses pricing when uncertainty is too high; that is where
+            // conservatism belongs.
             BazaarTypes.BucketState memory state =
                 BucketLib.calculateState(bucket, params.currentPrice, params.currentFundingIndex, params.marginReqs);
 

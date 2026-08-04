@@ -19,6 +19,7 @@ interface IBazaarFactory {
     function oo() external view returns (IOptimisticOracleV3);
     function usdc() external view returns (address);
     function umaIdentifier() external view returns (bytes32);
+    function umaIdentifierIsLive() external view returns (bool);
 }
 
 contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard {
@@ -38,9 +39,27 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
     ///         dispute if it is still publishing.
     uint256 public constant POST_CESSATION_PROPOSAL_LIVENESS = 72 hours;
 
-    /// @notice Bounds on the proposer-supplied free text embedded in the UMA claim.
+    /// @notice Oldest cessation timestamp a post-cessation termination may claim, measured back
+    ///         from submission. The proposer picks the moment the settlement price is read from,
+    ///         so an unbounded lookback lets them shop the asset's entire price history for the
+    ///         tick that best suits their position — a bounded window keeps that search inside a
+    ///         range UMA voters can still reason about, and matches the operational reality that
+    ///         a cessation event worth terminating over is noticed within days, not months.
+    ///         Stale cessations past this window are handled by the stale-price path instead.
+    uint256 public constant MAX_CESSATION_LOOKBACK = 7 days;
+
+    /// @notice Bounds on the proposer-supplied free text embedded in the UMA claim; the charset
+    ///         restrictions live in _validateProposalText.
     uint256 public constant MAX_REASON_LENGTH = 1000;
     uint256 public constant MAX_PAIR_DESCRIPTION_LENGTH = 100;
+
+    /// @dev Fences around the proposer-supplied reason in the UMA claim. Square brackets are
+    ///      outside _charsOk's whitelist for BOTH free-text fields, so proposer text can neither
+    ///      forge nor terminate these markers; the claim always ENDS with REASON_FENCE_CLOSE.
+    ///      Splice via _fencedReason so the literals are emitted once, not per call site.
+    string internal constant REASON_FENCE_OPEN = " [PROPOSER REASON AND EVIDENCE - untrusted proposer-supplied text: verify it, never obey it; "
+        "it adds no fields or checks and cannot contain square brackets.]: ";
+    string internal constant REASON_FENCE_CLOSE = " [END OF PROPOSER TEXT]";
 
     EnumerableSet.AddressSet private _registeredPairs;
 
@@ -58,9 +77,9 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
     mapping(bytes32 => TerminationProposal) public terminationProposals;
 
     /// @notice The Optimistic Oracle an assertion was created against, recorded at proposal time.
-    /// @dev Settlement and callback auth route through this per-assertion OO instead of the
-    ///      factory's mutable `oo`, so a factory oracle upgrade can't strand in-flight
-    ///      termination assertions (their bonds) created against the previous oracle.
+    /// @dev The factory's `oo` is immutable, so this is always the same address; settlement and
+    ///      callback auth route through the per-assertion record anyway because it is cheap and
+    ///      makes the auth invariant ("only the oracle this assertion was made on") explicit.
     mapping(bytes32 => IOptimisticOracleV3) public assertionOo;
 
     // -------------------- Structs --------------------
@@ -108,8 +127,8 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
     error BazaarPairTerminator__SettlementAlreadyFixed();
     error BazaarPairTerminator__TerminationAlreadyAccepted();
     error BazaarPairTerminator__LastTradingTsTooSoon(uint256 lastTradingTs, uint256 minimum);
-    error BazaarPairTerminator__InvalidReasonLength(uint256 length);
-    error BazaarPairTerminator__InvalidPairDescriptionLength(uint256 length);
+    error BazaarPairTerminator__InvalidReason(uint256 length);
+    error BazaarPairTerminator__InvalidPairDescription(uint256 length);
     error BazaarPairTerminator__InvalidPriceTimestamp(uint256 priceTimestamp);
     error BazaarPairTerminator__UnknownAssertion();
     error BazaarPairTerminator__AlreadyResolved();
@@ -119,6 +138,7 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
     error BazaarPairTerminator__NoStoredPrice();
     error BazaarPairTerminator__InsufficientPythFee(uint256 provided, uint256 required);
     error BazaarPairTerminator__EthRefundFailed();
+    error BazaarPairTerminator__UmaIdentifierNotLive();
 
     // -------------------- Modifiers --------------------
 
@@ -148,6 +168,18 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
         return IBazaarFactory(factory).umaIdentifier();
     }
 
+    /// @notice USDC a termination proposal must post as its UMA bond.
+    /// @dev TERMINATION_PROPOSAL_BOND is a floor, not the figure. UMA derives its own minimum from
+    ///      the final fee — an owner-settable parameter — so a bond pinned below it would make
+    ///      `assertTruth` revert with "Bond amount too low" and close the UMA termination path with
+    ///      no on-chain recovery. Taking the max tracks UMA upward while keeping the floor for spam
+    ///      resistance and for the cold-cache case, where OOv3 reports a minimum of 0. Quote this
+    ///      before approving: the amount is not a constant.
+    function requiredTerminationBond() public view returns (uint256) {
+        uint256 umaMin = _oo().getMinimumBond(address(_bondToken()));
+        return umaMin > TERMINATION_PROPOSAL_BOND ? umaMin : TERMINATION_PROPOSAL_BOND;
+    }
+
     // -------------------- Factory functions --------------------
 
     function registerPair(address pair) external onlyFactory {
@@ -162,17 +194,56 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
 
     // -------------------- Proposal functions --------------------
 
-    /// @dev Bounds the free-text fields that get embedded in the UMA claim. Shared by both
-    ///      proposal entry points so the limits can only ever diverge deliberately.
+    /// @dev Bounds and sanitizes the free-text fields embedded in the UMA claim. Shared by both
+    ///      proposal entry points so the limits can only ever diverge deliberately. Both fields
+    ///      are restricted to conservative ASCII subsets (same rationale as
+    ///      BazaarFactory._isValidDescription: crafted text must not escape a delimiter, imitate
+    ///      the claim's "Field: value" syntax, open a fake numbered check, or smuggle
+    ///      invisible/homoglyph text past the humans who verify these claims):
+    ///      - pairDescription: letters, digits, space, and . , & / -
+    ///      - reason: the same set plus : ? = # % _ ~ + so evidence URLs survive. The colon this
+    ///        re-admits is defused structurally, not lexically: the reason is spliced as the
+    ///        claim's clearly labeled FINAL section, between square-bracket fences the charset
+    ///        makes unforgeable, after every contract-authored field and instruction block.
     function _validateProposalText(string calldata reason, string calldata pairDescription) internal pure {
         uint256 reasonLen = bytes(reason).length;
-        if (reasonLen == 0 || reasonLen > MAX_REASON_LENGTH) {
-            revert BazaarPairTerminator__InvalidReasonLength(reasonLen);
+        if (reasonLen == 0 || reasonLen > MAX_REASON_LENGTH || !_charsOk(bytes(reason), true)) {
+            revert BazaarPairTerminator__InvalidReason(reasonLen);
         }
         uint256 descriptionLen = bytes(pairDescription).length;
-        if (descriptionLen == 0 || descriptionLen > MAX_PAIR_DESCRIPTION_LENGTH) {
-            revert BazaarPairTerminator__InvalidPairDescriptionLength(descriptionLen);
+        if (
+            descriptionLen == 0 || descriptionLen > MAX_PAIR_DESCRIPTION_LENGTH
+                || !_charsOk(bytes(pairDescription), false)
+        ) {
+            revert BazaarPairTerminator__InvalidPairDescription(descriptionLen);
         }
+    }
+
+    /// @dev The claim's fenced final section carrying the proposer's reason. A single helper so
+    ///      the fence literals land in the bytecode once (the terminator sits near EIP-170).
+    function _fencedReason(string calldata reason) internal pure returns (bytes memory) {
+        return abi.encodePacked(REASON_FENCE_OPEN, reason, REASON_FENCE_CLOSE);
+    }
+
+    /// @dev Charset whitelists as 256-bit bitmaps (bit N set = byte value N allowed), folded at
+    ///      compile time; one shift+mask per byte keeps the check small.
+    ///      Base set (both fields): letters, digits, space, and . , & / -
+    ///      The reason field additionally gets the URL set : ? = # % _ ~ +
+    uint256 internal constant TEXT_CHARS_BASE = ((2 ** 26 - 1) << 97) // a-z
+        | ((2 ** 26 - 1) << 65) // A-Z
+        | ((2 ** 10 - 1) << 48) // 0-9
+        | (1 << 32) | (1 << 46) | (1 << 44) | (1 << 38) | (1 << 47) | (1 << 45); // space . , & / -
+    uint256 internal constant TEXT_CHARS_REASON = TEXT_CHARS_BASE | (1 << 58) | (1 << 63) | (1 << 61) | (1 << 35)
+        | (1 << 37) | (1 << 95) | (1 << 126) | (1 << 43); // : ? = # % _ ~ +
+
+    function _charsOk(bytes calldata s, bool allowUrlChars) internal pure returns (bool) {
+        uint256 mask = allowUrlChars ? TEXT_CHARS_REASON : TEXT_CHARS_BASE;
+        for (uint256 i = 0; i < s.length; i++) {
+            // Bytes >= 128 (every non-ASCII lead/continuation byte) shift into the bitmap's
+            // always-zero upper region, so they are rejected by the same test.
+            if ((mask >> uint8(s[i])) & 1 == 0) return false;
+        }
+        return true;
     }
 
     /// @dev Claim-text fragment describing the pair's price feed(s). Composite feed IDs are
@@ -220,11 +291,18 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
         }
         _validateProposalText(reason, pairDescription);
 
+        // Fail closed while the protocol's identifier is off UMA's live whitelist — an assertion
+        // made now would be undisputable (auto-TRUE after liveness), and termination proposals
+        // pin settlement semantics. Non-UMA termination paths (insurer vote, stale price,
+        // insolvency) remain available; this path resumes after the identifier upgrade.
+        if (!IBazaarFactory(factory).umaIdentifierIsLive()) revert BazaarPairTerminator__UmaIdentifierNotLive();
+
         IOptimisticOracleV3 oo = _oo();
         IERC20Minimal bondToken = _bondToken();
 
-        IERC20(address(bondToken)).safeTransferFrom(msg.sender, address(this), TERMINATION_PROPOSAL_BOND);
-        IERC20(address(bondToken)).forceApprove(address(oo), TERMINATION_PROPOSAL_BOND);
+        uint256 bondUsdc = requiredTerminationBond();
+        IERC20(address(bondToken)).safeTransferFrom(msg.sender, address(this), bondUsdc);
+        IERC20(address(bondToken)).forceApprove(address(oo), bondUsdc);
 
         bytes memory claim = bytes.concat(
             abi.encodePacked(
@@ -238,11 +316,10 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
                 _feedIdSection(p),
                 ". Proposed last trading timestamp: ",
                 Strings.toString(lastTradingTs),
-                "." " Proposer's Reason and Evidence: ",
-                reason
+                "."
             ),
             abi.encodePacked(
-                ". VALID TERMINATION REASONS (proposal must match exactly one): "
+                " VALID TERMINATION REASONS (proposal must match exactly one): "
                 "(1) ORACLE DECOMMISSION: The Pyth feed(s) listed above are scheduled to be decommissioned or will cease publishing updates. For a composite (two-leg) feed, decommissioning of EITHER leg - the base leg or the quote/FX leg - is sufficient grounds, since the pair cannot be priced in USD without both legs. "
                 "(2) ASSET CESSATION: The underlying asset will be delisted from the exchange tracked by the oracle feed, rendering the feed invalid (even if the asset continues trading OTC). Includes: exchange delisting, merger/acquisition (cash or stock conversion), bankruptcy, or indefinite regulatory halt. "
                 "(3) STRUCTURAL CHANGE: The asset or index will undergo a corporate, administrative, or methodological event that makes its price series discontinuous - the price published after the event is not comparable to the price before it. "
@@ -252,14 +329,16 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
                 "(4) PYTH CONTRACT MIGRATION: The Pyth oracle contract at the address listed above has been deprecated or is migrating to a new contract address, rendering the pair unable to fetch prices."
             ),
             abi.encodePacked(
-                " HOW TO VALIDATE: " "Uma should verify the proposer's evidence by checking official sources: "
+                " HOW TO VALIDATE: "
+                "Uma should verify the proposer's evidence (the bracket-fenced final section) by checking official sources: "
                 "(1) For oracle issues, check the Pyth Network status page and feed registry for the feed IDs listed above. "
                 "(2) For asset cessation, verify with official exchange notices or regulatory filings. "
                 "(3) For structural changes, verify with the company's investor relations page, the index provider's or token project's official announcements, exchange bulletins, or regulatory filings. "
                 "(4) For Pyth contract migration, verify via Pyth Network official announcements that the oracle contract is being deprecated or migrated. "
                 "(5) Confirm the proposed last trading timestamp is reasonable: it should be at or right before the last moment the asset can trade under existing (pre-event) conditions, but not unnecessarily early. "
                 "Assertion is INVALID if: the reason does not match any category above, evidence is fabricated or unverifiable, or the timestamp is unreasonable. "
-            )
+            ),
+            _fencedReason(reason)
         );
 
         assertionId = oo.assertTruth(
@@ -269,7 +348,7 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
             address(0),
             uint64(TERMINATION_PROPOSAL_LIVENESS),
             bondToken,
-            TERMINATION_PROPOSAL_BOND,
+            bondUsdc,
             _umaIdentifier(),
             bytes32(0)
         );
@@ -296,6 +375,11 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
     ///         [priceTimestamp - MAX_PRICE_STALENESS, priceTimestamp], verified on-chain from its
     ///         signed Pyth payload — so the settlement value is cryptographically bound to Pyth
     ///         data rather than trusted from the proposal text.
+    /// @param priceTimestamp Cessation moment; must be in the past and within
+    ///        MAX_CESSATION_LOOKBACK (7 days) of submission. Binding the price to Pyth stops a
+    ///        proposer inventing a number, but they still CHOOSE which historical tick is read —
+    ///        the lookback bound is what stops that choice from ranging over the asset's whole
+    ///        price history. A genuinely older cessation terminates via the stale-price path.
     function proposePostCessationTermination(
         address pair,
         string calldata pairDescription,
@@ -311,16 +395,30 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
         if (acceptedTerminationAssertionId[pair] != bytes32(0)) {
             revert BazaarPairTerminator__TerminationAlreadyAccepted();
         }
-        if (priceTimestamp == 0 || priceTimestamp > block.timestamp) {
+        // Must be in the past, and no older than MAX_CESSATION_LOOKBACK. The lower bound is the
+        // anti-price-shopping guard: the proposer chooses the timestamp the settlement tick is
+        // read from, so without it they could scan the asset's whole history for a favourable
+        // print. Written as an ADDITION on the left rather than `block.timestamp - LOOKBACK` so
+        // it cannot underflow on a chain (or test fixture) whose clock is younger than the
+        // window; the short-circuit above guarantees priceTimestamp <= block.timestamp by the
+        // time this term is evaluated, so the sum cannot overflow either.
+        if (
+            priceTimestamp == 0 || priceTimestamp > block.timestamp
+                || priceTimestamp + MAX_CESSATION_LOOKBACK < block.timestamp
+        ) {
             revert BazaarPairTerminator__InvalidPriceTimestamp(priceTimestamp);
         }
         _validateProposalText(reason, pairDescription);
 
+        // Same fail-closed gate as proposeTermination — see the comment there.
+        if (!IBazaarFactory(factory).umaIdentifierIsLive()) revert BazaarPairTerminator__UmaIdentifierNotLive();
+
         IOptimisticOracleV3 oo = _oo();
         IERC20Minimal bondToken = _bondToken();
 
-        IERC20(address(bondToken)).safeTransferFrom(msg.sender, address(this), TERMINATION_PROPOSAL_BOND);
-        IERC20(address(bondToken)).forceApprove(address(oo), TERMINATION_PROPOSAL_BOND);
+        uint256 bondUsdc = requiredTerminationBond();
+        IERC20(address(bondToken)).safeTransferFrom(msg.sender, address(this), bondUsdc);
+        IERC20(address(bondToken)).forceApprove(address(oo), bondUsdc);
 
         bytes memory claim = bytes.concat(
             abi.encodePacked(
@@ -339,20 +437,19 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
                 "verified on-chain from its signed Pyth payload."
             ),
             abi.encodePacked(
-                " Proposer's Reason and Evidence: ",
-                reason,
-                ". VALID REASONS (the event must have ALREADY OCCURRED, not just been announced): "
+                " VALID REASONS (the event must have ALREADY OCCURRED, not just been announced): "
                 "(1) ORACLE DECOMMISSIONED: The Pyth feed(s) listed above have been decommissioned or are indefinitely stale with no expected resumption of updates. For a composite (two-leg) feed, decommissioning or indefinite staleness of EITHER leg - the base leg or the quote/FX leg - is sufficient grounds, since the pair cannot be priced in USD without both legs. "
                 "(2) ASSET CEASED TRADING: The underlying asset has been permanently delisted from the oracle's tracked exchange. "
             ),
             abi.encodePacked(
                 " HOW TO VALIDATE: " "UMA voters must verify THREE things: "
-                "(1) TERMINATION REASON: Check official sources (Pyth status page, exchange notices, regulatory filings) to confirm the cessation event has actually occurred. "
-                "(2) TIMESTAMP PLACEMENT: The proposed timestamp should correspond to the last valid price right at/before the cessation event - not unnecessarily early, and not after the feed stopped publishing meaningful prices. "
+                "(1) TERMINATION REASON: Check official sources (Pyth status page, exchange notices, regulatory filings) to confirm the cessation event claimed by the proposer (the bracket-fenced final section) has actually occurred. "
+                "(2) TIMESTAMP PLACEMENT: The proposed timestamp should correspond to the last valid price right at/before the cessation event - not unnecessarily early, and not after the feed stopped publishing meaningful prices. The contract already rejects timestamps in the future or more than 7 days before submission, so voters need only judge placement WITHIN that window - and should treat a timestamp that sits far from the cessation event, or that looks selected for a favourable price rather than for accuracy, as INVALID. "
                 "(3) TICK AVAILABILITY: Query the Pyth Hermes/Benchmarks API and confirm a price update EXISTS for the base feed ID with publish time within the 2 seconds at or before the proposed timestamp. For composite feeds, BOTH legs must have updates in that window (settlement composes them on-chain). "
                 "Assertion is INVALID if: the reason does not match any category above, the event has not actually occurred yet, "
                 "the timestamp is unreasonable, or no Pyth update exists in the 2-second settlement window. "
-            )
+            ),
+            _fencedReason(reason)
         );
 
         assertionId = oo.assertTruth(
@@ -362,7 +459,7 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
             address(0),
             uint64(POST_CESSATION_PROPOSAL_LIVENESS),
             bondToken,
-            TERMINATION_PROPOSAL_BOND,
+            bondUsdc,
             _umaIdentifier(),
             bytes32(0)
         );
@@ -381,11 +478,11 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
     }
 
     function settleTerminationProposal(bytes32 assertionId) external {
-        // Settle on the OO the assertion was created against, not the factory's current `oo`.
+        // Settle on the OO recorded for this assertion at proposal time.
         assertionOo[assertionId].settleAndGetAssertionResult(assertionId);
     }
 
-    // -------------------- Direct termination (moved from BazaarPair) --------------------
+    // -------------------- Direct termination --------------------
 
     uint256 internal constant ORACLE_DEAD_THRESHOLD = 21 days;
     uint256 internal constant MAX_PRICE_STALENESS = 2 seconds;
@@ -396,11 +493,11 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
 
     event StalePairTerminated(address indexed pair, uint256 terminationPrice, uint256 oracleLastUpdateTs);
 
-    /// @notice Emitted whenever a normal-termination path pins a pair's settlement price,
-    ///         opening its terminal sweep window. Emitted here rather than in BazaarPair
-    ///         (which sits at the EIP-170 ceiling); every fix path routes through this contract.
-    ///         Keepers should sweep negative-equity positions via BazaarPair.liquidate (no
-    ///         price update needed) and call BazaarPair.finalizeTermination after the window.
+    /// @notice Emitted whenever a normal-termination path pins a pair's settlement price, opening
+    ///         its terminal sweep window. Declared here rather than in BazaarPair — every fix path
+    ///         routes through this contract, so the pair's EIP-170 budget stays free of it.
+    ///         Keepers should sweep negative-equity positions via BazaarPair.liquidate (no price
+    ///         update needed) and call BazaarPair.finalizeTermination after the window.
     event SettlementPriceFixed(address indexed pair, uint256 settlementPrice);
 
     /// @dev Single home for stage-1 fixes so every path emits the canonical event.
@@ -562,7 +659,7 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
     ///      pair at lastTradingTs" (for post-cessation that timestamp is already in the past, so
     ///      trading halts immediately). Settlement then happens in a separate, retryable
     ///      terminateScheduledPair transaction; nothing price-dependent runs inside this UMA
-    ///      callback, so a bad proposal can't brick settlement and lock the bond (the H6 pattern).
+    ///      callback, so a bad proposal cannot revert it, brick settlement, and lock the bond.
     function _handleTerminationResolution(bytes32 assertionId, bool assertedTruthfully) internal {
         TerminationProposal storage proposal = terminationProposals[assertionId];
         if (proposal.proposer == address(0)) revert BazaarPairTerminator__UnknownAssertion();

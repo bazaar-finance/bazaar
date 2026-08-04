@@ -7,19 +7,14 @@ Deployment is **two-step** because the heavy logic lives in externally deployed 
 ## Step 1 — deploy the external libraries
 
 ```bash
-forge script script/DeployLibraries.s.sol --rpc-url <network> --broadcast
+make deploy-libs-arb-sepolia    # or: deploy-libs-arb-mainnet (asks for confirmation)
 ```
 
-This deploys the 8 DELEGATECALL libraries (`InsuranceVaultLib`, `LiquidationLib`, `OrderManagementLib`, `AdlLib`, `MatchingEngineLib`, `CollateralLib`, `RiskParamsLib`, `FundingLib`) and prints a ready-to-paste block:
+`BazaarPair` carries a link reference for **ten** DELEGATECALL libraries — `InsuranceVaultLib`, `LiquidationLib`, `OrderManagementLib`, `AdlLib`, `MatchingEngineLib`, `CollateralLib`, `RiskParamsLib`, `FundingLib`, `TerminationLib`, `MetaTxLib` — and every one of them must be deployed and linked before the pair implementation can go out.
 
-```toml
-libraries = [
-    "src/libraries/InsuranceVaultLib.sol:InsuranceVaultLib:0x...",
-    ...
-]
-```
+The script deploys all ten and records their `--libraries` flags in `deployments/<chainid>/libraries.args`. Nothing is pasted by hand, and nothing is written to `foundry.toml`: `libraries` there is a single global key with no per-network scoping, so one shared list would let a rehearsal network's addresses be linked into a production build — where they hold no code, and every `DELEGATECALL` from the pair would land on an empty account. Keying the record by chain id makes that unrepresentable.
 
-Paste it into `foundry.toml` under `[profile.default]` (the commented template is already there).
+The library list lives in one place, `_libNames()` in the script; the artifact id, the link path and the emitted flag are all derived from it, so a library cannot be deployed but left out of the link flags. Real networks' records are committed as deployment provenance; the local Anvil chain's (`deployments/31337/`) is gitignored as throwaway.
 
 ## Step 2 — deploy the core
 
@@ -27,9 +22,17 @@ Paste it into `foundry.toml` under `[profile.default]` (the commented template i
 make deploy-arb-sepolia    # or: deploy-arb-mainnet (asks for confirmation)
 ```
 
+The target passes that chain's recorded flags to `forge` and refuses to run if the file for its chain is missing, so step 2 cannot silently produce an unlinked or cross-linked deployment.
+
+The per-chain file only helps if the RPC alias actually serves the chain the target names — the args path is chosen by the make target, not read off the network. Both scripts therefore assert `block.chainid` against the `EXPECTED_CHAIN_ID` the target passes and abort before broadcasting on a mismatch. The failure this closes is silent: `DELEGATECALL` into an address with no code *succeeds* with empty returndata, so a wrongly-linked deployment would pass its own wiring checks and then do nothing on every library call. (The guard is skipped on Anvil and in dry runs, where the variable is unset.)
+
 `script/DeployBazaar.s.sol` deploys, in order: `BazaarOracle` → `BazaarPairLens` → the `BazaarPair` implementation → `BazaarSequencer` and `BazaarPairTerminator` (constructed against the factory address *predicted* via `vm.computeCreateAddress`) → `BazaarFactory`, then asserts the prediction held. The factory constructor independently re-checks the wiring (`Factory__WiringMismatch`), so a bad prediction cannot deploy a half-wired system.
 
 The sequencer and terminator are pre-deployed against the predicted address because inlining their deployment in the factory constructor would push its initcode past the EIP-3860 limit.
+
+## The genesis UMA identifier
+
+`DeployBazaar.s.sol` passes the factory a `UMA_IDENTIFIER` constant, currently **`ASSERT_TRUTH2`**, and the constructor validates it against UMA's *live* `IdentifierWhitelist` before storing it. A value that is not whitelisted, or is not named `ASSERT_TRUTH…`, reverts the deployment — which is the only acceptable place to discover it, since every `assertTruth` the protocol ever makes would otherwise revert. Note that OOv3's own `defaultIdentifier` constant is `ASSERT_TRUTH`, which UMA has de-whitelisted in favour of the successor on the same oracle, so deriving the value from the oracle is exactly wrong. After deployment the identifier moves only through the [governance track](../protocol/listing.md#the-only-governance-swapping-the-uma-identifier). Mock networks accept any identifier, because the mock whitelist reports everything as supported.
 
 ## Environment
 

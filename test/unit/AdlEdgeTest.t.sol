@@ -251,7 +251,9 @@ contract AdlEdgeTest is Test {
 
         // Credit = (100 − 88) − 3 = $9 on top of $5 collateral.
         assertEq(h.bucketCollateral(winner), 14 * SCALE, "winner nets collateral - window funding via the two channels");
-        assertEq(h.insurance(), 1_000e18 - 9e18, "single insurance entry; pre-fix code booked an extra +3 here");
+        assertEq(
+            h.insurance(), 1_000e18 - 9e18, "single insurance entry; window funding is inside the 9, not booked again"
+        );
         assertEq(h.vaultCollateral(), 1_000e18 + 9e18, "deposits ledger mirrors the single transfer");
         assertEq(h.pendingSize(), 0, "vault exposure cleared");
     }
@@ -287,8 +289,8 @@ contract AdlEdgeTest is Test {
     /// @notice The withdraw-to-zero dodge is dead: a winner who pulled ALL collateral out
     ///         (equity gate passes on unrealized PnL alone) floors to 1-wei score collateral —
     ///         effectively infinite score — and is closable from the FIRST minute of the
-    ///         auction, at the near-max threshold. Pre-fix the zero-collateral skip made
-    ///         exactly these pure-profit accounts ADL-immune.
+    ///         auction, at the near-max threshold. Skipping zero-collateral buckets instead of
+    ///         flooring them would make exactly these pure-profit accounts ADL-immune.
     function test_withdrawToZero_cannotDodgeAdlQueue() public {
         h.setPendingLiq(1 * SCALE, 100 * SCALE, true);
         h.setOI(0, 1 * SCALE, 0, 150 * SCALE);
@@ -378,12 +380,18 @@ contract AdlEdgeTest is Test {
     function test_ranking_frozenFundingIndex_descendingByFrozenSucceeds() public {
         (address a, address b) = _twoWinnersDivergentFunding();
 
+        // Sized so the vault stays unhealthy through BOTH closes (the mid-batch health check runs
+        // before every close after the first): at currentPrice $50 the exposure left before B is
+        // 6 units × ($100 bk − $50) = $300, above the 60% cancel threshold on $400 insurance
+        // ($240). Insurance still covers both credits ($150) in full.
+        h.setVaultInsurance(400e18);
+
         BazaarTypes.AdlParams memory params = BazaarTypes.AdlParams({
             adlLongs: false,
             adlSnapshotPrice: 100 * SCALE,
             adlSnapshotFundingIndex: 0, // frozen at auction trigger
             adlPendingSince: block.timestamp - 15 minutes, // threshold collapsed to 1
-            currentPrice: 100 * SCALE,
+            currentPrice: 50 * SCALE, // below the $100 bankruptcy price: the vault is in real loss
             currentFundingIndex: int256(10 * SCALE), // live index moved since the trigger
             marginRequirements: BazaarTypes.MarginRequirements({
                 imrBp: 2_000, mmrBp: 1_000, lastUpdateTs: 0, laggedMmrBp: 0
@@ -405,7 +413,7 @@ contract AdlEdgeTest is Test {
         // Settlement uses the LIVE index (+10): A credit = 50 price + 10 funding = 60; B = 30 + 60 = 90.
         assertEq(h.bucketCollateral(a), (10 + 60) * SCALE, "A settled at live funding");
         assertEq(h.bucketCollateral(b), (10 + 90) * SCALE, "B settled at live funding");
-        assertEq(h.insurance(), 1_000e18 - 150e18, "insurance funded both credits");
+        assertEq(h.insurance(), 400e18 - 150e18, "insurance funded both credits");
         assertEq(h.pendingSize(), 0, "vault exposure cleared");
     }
 

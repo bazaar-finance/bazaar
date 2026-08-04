@@ -5,7 +5,6 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import {BazaarTypes} from "./BazaarTypes.sol";
 import {BucketLib} from "./BucketLib.sol";
-import {BazaarMathLib} from "./BazaarMathLib.sol";
 
 /// @title OrderManagementLib
 /// @notice External library for order creation and cancellation logic.
@@ -357,8 +356,7 @@ library OrderManagementLib {
 
     /// @notice Sweeps a user's active-limit-order set: drops expired/canceled/filled entries
     ///         (cancel-emitting expired ones) and totals the remaining directional exposure.
-    /// @dev Moved from BazaarPair (EIP-170 extraction); called via the pair's
-    ///      _cleanupExpiredLimitOrders wrapper.
+    /// @dev Called via BazaarPair's _cleanupExpiredLimitOrders wrapper.
     function cleanupExpiredLimitOrders(
         EnumerableSet.UintSet storage orderSet,
         mapping(uint256 => BazaarTypes.Order) storage orders,
@@ -412,6 +410,34 @@ library OrderManagementLib {
                     shortExposure += notional;
                 }
                 i++;
+            }
+        }
+    }
+
+    /// @notice Read-only twin of cleanupExpiredLimitOrders: totals the remaining directional
+    ///         exposure of a user's active-limit-order set, SKIPPING expired/canceled/filled
+    ///         entries instead of pruning them. The liveness test and the summed notional are
+    ///         identical, so both functions always report the same totals — the pruning is
+    ///         purely lazy hygiene, not semantics.
+    /// @dev Reached via BazaarPair.outstandingOrderExposure so off-chain withdrawal previews
+    ///      (BazaarPairLens.getMaxWithdrawable) can margin-check against live order exposure
+    ///      from an eth_call.
+    function outstandingOrderExposure(
+        EnumerableSet.UintSet storage orderSet,
+        mapping(uint256 => BazaarTypes.Order) storage orders,
+        uint64 currentBlock
+    ) external view returns (uint256 longExposure, uint256 shortExposure) {
+        uint256 len = orderSet.length();
+        for (uint256 i = 0; i < len; i++) {
+            BazaarTypes.Order storage order = orders[orderSet.at(i)];
+            if (currentBlock > order.expiryBlock || order.canceledBlock != 0 || order.filledBlock != 0) {
+                continue;
+            }
+            uint256 notional = Math.mulDiv(order.size - order.filledSize, order.limitPrice, BazaarTypes.BAZAAR_SCALE);
+            if (order.isLong) {
+                longExposure += notional;
+            } else {
+                shortExposure += notional;
             }
         }
     }

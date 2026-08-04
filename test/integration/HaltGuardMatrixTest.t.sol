@@ -7,9 +7,9 @@ import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 import {StdStorage, stdStorage} from "forge-std/Test.sol";
 
 /// @notice Triggers the halt-state guards and custom errors on liquidate / executeAdl / matchBatch /
-///         fixSettlementPrice / setScheduledTermination that no existing test asserted. Each guard
-///         either protects funds (halted-pair mutation) or is a keeper-facing precondition; a
-///         regression that dropped one would previously have passed the whole suite.
+///         fixSettlementPrice / setScheduledTermination. Each guard either protects funds
+///         (halted-pair mutation) or is a keeper-facing precondition, and none of them is reachable
+///         from the happy paths — without this matrix, dropping any one leaves the suite green.
 contract HaltGuardMatrixTest is IntegrationBase {
     using stdStorage for StdStorage;
 
@@ -90,7 +90,7 @@ contract HaltGuardMatrixTest is IntegrationBase {
     function test_matchBatch_observationInFuture_boundary() public {
         uint64 cb = uint64(vm.getBlockNumber()); // MockArbSys mirrors block.number
         vm.prank(seq);
-        vm.expectRevert(abi.encodeWithSelector(BazaarPair.BazaarPair__ObservationBlockInFuture.selector, cb, cb));
+        vm.expectRevert(BazaarPair.BazaarPair__ObservationBlockInFuture.selector);
         pair.matchBatch(_emptyLists(), 1, emptyPu, cb);
     }
 
@@ -100,7 +100,7 @@ contract HaltGuardMatrixTest is IntegrationBase {
         uint64 cb = uint64(vm.getBlockNumber());
         uint64 obs = cb - 13; // age 13 > 12
         vm.prank(seq);
-        vm.expectRevert(abi.encodeWithSelector(BazaarPair.BazaarPair__ObservationBlockTooOld.selector, obs, cb));
+        vm.expectRevert(BazaarPair.BazaarPair__ObservationBlockTooOld.selector);
         pair.matchBatch(_emptyLists(), 1, emptyPu, obs);
     }
 

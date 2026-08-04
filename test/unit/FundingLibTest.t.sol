@@ -37,7 +37,8 @@ contract FundingLibTest is Test {
     }
 
     /// @notice A dust fill against deep rolling volume gets ~0 weight (no MIN_ALPHA floor): the mark
-    ///         does not move, so a tiny wash trade can't nudge it. (Was 200.05 with the old floor.)
+    ///         does not move, so a tiny wash trade can't nudge it. A floor would hand the dust fill a
+    ///         minimum weight regardless of size and let it drag the mark to 200.05.
     function test_mark_dustFill_noFloorLeavesMarkUnmoved() public view {
         FundingLib.MarkState memory s = FundingLib.updateMarkPrice(
             _state(200 * SCALE, block.timestamp, 1_000_000 * SCALE), 210 * SCALE, 1 * SCALE, 200 * SCALE

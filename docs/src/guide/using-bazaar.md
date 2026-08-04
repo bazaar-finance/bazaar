@@ -1,8 +1,8 @@
 # Using Bazaar
 
-Bazaar is a deployed protocol, not software you need to run. Everything in this guide works against the **official deployment** — canonical addresses live in [Deployments](../reference/networks.md), and only those addresses (plus pairs discoverable from the listed factory) are the real Bazaar.
+Bazaar is designed to be used as a deployed protocol, not software you need to run. Everything in this guide is written against the **official deployment** — once it is live, canonical addresses will be listed in [Deployments](../reference/networks.md), and only those addresses (plus pairs discoverable from the listed factory) will be the real Bazaar.
 
-> The protocol is not yet live on Arbitrum One. Addresses will appear in [Deployments](../reference/networks.md) at launch; until then, everything can be exercised on a testnet or [local stack](quick-start.md).
+> **The protocol is not yet deployed.** Addresses will appear in [Deployments](../reference/networks.md) at launch; until then, everything can be exercised on a testnet or [local stack](quick-start.md).
 
 ## Pick your path
 

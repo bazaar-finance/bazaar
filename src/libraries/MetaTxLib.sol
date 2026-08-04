@@ -5,8 +5,15 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
 /// @title MetaTxLib
-/// @notice Internal library for EIP-712 meta-transaction verification.
-///         Inlined at compile time — no separate deployment needed.
+/// @notice External library for EIP-712 meta-transaction verification.
+/// @dev    `verifyAndConsume` is `external`, so it is DEPLOYED SEPARATELY and linked (see
+///         script/DeployLibraries.s.sol and the `libraries` block in foundry.toml) — BazaarPair
+///         reaches it via DELEGATECALL, so `nonces` stays in the pair's storage and msg.sender is
+///         preserved. Keeping it external rather than inlined also keeps ECDSA.recover,
+///         MessageHashUtils and the domain-separator keccak out of BazaarPair's runtime code,
+///         which matters for its EIP-170 budget given the single call site (_resolveUser). The
+///         typehash/constant members below stay compile-time and are read directly by BazaarPair
+///         and BazaarPairLens without any external call.
 library MetaTxLib {
     // -------------------- Constants --------------------
 
@@ -79,7 +86,7 @@ library MetaTxLib {
         uint256 deadline,
         uint256 relayerFee,
         mapping(address => uint256) storage nonces
-    ) internal returns (address signer) {
+    ) external returns (address signer) {
         if (block.timestamp > deadline) {
             revert MetaTx__ExpiredDeadline(deadline, block.timestamp);
         }

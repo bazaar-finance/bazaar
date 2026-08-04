@@ -25,7 +25,20 @@ External dependencies on Arbitrum One:
 | USDC (native) | `0xaf88d065e77c8cC2239327C5EDb3A432268e5831` |
 | UMA Optimistic Oracle V3 | `0xa6147867264374F324524E30C02C331cF28aa879` |
 
-## Arbitrum Sepolia (421614)
+## Arbitrum Sepolia (421614) — testnet
+
+**Official Bazaar testnet deployment: not yet live.** Addresses will be published here when it goes up:
+
+| Contract | Address |
+|---|---|
+| `BazaarFactory` | *TBD* |
+| `BazaarSequencer` | *TBD* |
+| `BazaarPairTerminator` | *TBD* |
+| `BazaarOracle` | *TBD* |
+| `BazaarPairLens` | *TBD* |
+| `BazaarPair` implementation | *TBD* |
+
+External dependencies on Arbitrum Sepolia:
 
 | Contract | Address |
 |---|---|

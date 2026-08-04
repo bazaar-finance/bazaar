@@ -9,7 +9,7 @@ After every batch, liquidation, withdrawal, and ADL step, the pair computes the 
 - All trading and order creation freeze; position-holders' withdrawals freeze (flat users may still exit — their cash can't affect scores or margin).
 - The trigger price and funding index are snapshotted — the whole auction ranks against this frozen book, so a keeper's off-chain sort and on-chain execution agree; the target side is the *opposite* of the vault's inventory (the winners).
 - Hysteresis: pending state only clears below **60%**, so the boundary can't flap.
-- A hard deadline: pending for **24 hours** without resolution → the pair [terminates](termination.md) at a live price. ADL cannot become a limbo.
+- A hard deadline: pending for **24 hours** without resolution → the pair [winds down](termination.md) at the live price (the settlement price is fixed on the spot and the 48-hour settlement window opens; anyone finalizes after it). ADL cannot become a limbo.
 - If opposing liquidations flip the vault's inventory to the other side mid-auction, the target side is re-pointed and the price/funding snapshot re-taken — but the 24-hour clock is deliberately *not* reset, so repeated flips can never stall termination.
 
 ## The auction
@@ -31,6 +31,6 @@ Winners close at the **average bankruptcy price of the dead estates** — the pr
 - Winners whose PnL at that price would be *negative* are skipped (never worse than break-even).
 - Oversized winners are partially closed pro-rata.
 - The winner's PnL credit is paid from the insurance fund, **capped at what the fund holds** — in the deep-insolvency tail, later (lower-scored) winners are haircut. Positions still close; the pair stays solvent by construction.
-- Funding settles implicitly — the estates' accrued funding is embedded in the bankruptcy-derived price, and the winner's own funding tab rides inside their PnL. (A prior design double-counted this; a regression test pins the fix.)
+- Funding settles implicitly — the estates' accrued funding is embedded in the bankruptcy-derived price, and the winner's own funding tab rides inside their PnL. Charging a funding leg on top would bill both sides twice for the same accrual.
 
 The executor earns **0.1% of averted bad debt**. Every few closes the trigger condition is re-checked and the auction ends early once the fund is safe.

@@ -84,7 +84,7 @@ contract MarginLiquidationIntegrationTest is IntegrationBase {
 
         // Permissionless poke from a non-sequencer outsider.
         bytes[] memory pu = _priceAt(50_000);
-        uint256 fee = pair.getPythFee(pu);
+        uint256 fee = oracle.getUpdateFee(pu);
         vm.deal(bob, 1 ether);
         vm.prank(bob);
         pair.refreshPrice{value: fee}(pu);

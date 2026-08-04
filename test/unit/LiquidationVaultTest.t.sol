@@ -15,7 +15,7 @@ import {HelperConfig} from "../../script/HelperConfig.s.sol";
 import {MockArbSys} from "../mocks/MockArbSys.sol";
 import {MockUSDC} from "../mocks/MockUSDC.sol";
 
-// ==================== from LiquidatorRewardTest.t.sol ====================
+// ==================== liquidator reward ====================
 
 /// @notice Harness owning its own vault/bucket state and forwarding into LiquidationLib,
 ///         so the per-position reward math can be unit-tested without a full BazaarPair.
@@ -162,7 +162,7 @@ contract LiquidatorRewardTest is Test {
     }
 }
 
-// ==================== from VaultFundingNettingTest.t.sol ====================
+// ==================== vault funding netting ====================
 
 /// @notice Harness that pre-seeds the vault's pending-liquidation aggregate so the
 ///         opposing-liquidation NETTING path can be exercised in isolation. The funding
@@ -365,7 +365,7 @@ contract VaultFundingNettingTest is Test {
     }
 }
 
-// ==================== from Phase3AdlGuardTest.t.sol ====================
+// ==================== ADL execution guards ====================
 
 /// @notice Harness that owns its own ADL state and forwards into AdlLib.executeAdlCore.
 ///         Lets us construct edge-case bucket states (size > 0, collateral = 0) without
@@ -439,12 +439,12 @@ contract AdlHarness {
     }
 }
 
-/// @notice Zero-collateral winners in ADL. Historically: first a Panic(0x12) div-by-zero,
-///         then a `continue` skip — which made a winner who withdrew ALL collateral
-///         (allowed: the equity gate passes on unrealized PnL alone) ADL-IMMUNE, the exact
-///         opposite of intent. Current semantics: score collateral floors at 1 wei, so a
-///         pure-profit account ranks effectively infinite and is closed FIRST, with its
-///         credit computed on its real (zero) collateral.
+/// @notice Zero-collateral winners in ADL. Score collateral floors at 1 wei: dividing by the raw
+///         zero would Panic(0x12), and skipping the bucket instead would make a winner who
+///         withdrew ALL collateral (allowed: the equity gate passes on unrealized PnL alone)
+///         ADL-IMMUNE — the exact opposite of intent. With the floor a pure-profit account ranks
+///         effectively infinite and is closed FIRST, with its credit computed on its real (zero)
+///         collateral.
 contract Phase3AdlGuardTest is Test {
     AdlHarness harness;
     uint256 constant SCALE = 1e18;
@@ -511,7 +511,12 @@ contract Phase3AdlGuardTest is Test {
         harness.setOI({
             totalLongOI: 0, totalShortOI: 2 * SCALE, longWeightedEntrySum: 0, shortWeightedEntrySum: 300 * SCALE
         });
-        harness.setVaultInsurance(1_000 * SCALE);
+        // Sized so the vault stays unhealthy through BOTH closes (the mid-batch health check runs
+        // before every close after the first): at currentPrice $20 the per-unit exposure is
+        // $100 bk − $20 = $80, and the 60% cancel threshold on $120 insurance is $72 < $80, so
+        // the check before winner 2 still reads unhealthy. Insurance still covers both $50
+        // credits in full.
+        harness.setVaultInsurance(120 * SCALE);
         harness.setVaultCollateral(1_000 * SCALE);
 
         // Pure-profit winner (short): size > 0, collateral = 0 → floored score (max).
@@ -526,17 +531,21 @@ contract Phase3AdlGuardTest is Test {
         winners[0] = BAD_USER;
         winners[1] = validUser;
 
-        BazaarTypes.AdlResult memory r = harness.execAdl(winners, _params());
+        BazaarTypes.AdlParams memory p = _params();
+        p.currentPrice = 20 * SCALE; // below the $100 bankruptcy price: the vault is in real loss
+
+        BazaarTypes.AdlResult memory r = harness.execAdl(winners, p);
         assertEq(r.eligibleCount, 2, "both winners eligible");
         assertEq(r.totalLiqSize, 2 * SCALE, "both closed");
         assertEq(harness.bucketCollateral(BAD_USER), 50 * SCALE, "pure-profit credit = pnl");
         assertEq(harness.bucketCollateral(validUser), 60 * SCALE, "normal credit = collateral + pnl");
     }
 
-    /// @notice 5.3 (R2-5): mid-batch health check is now functional. When closing a subset of
-    ///         winners restores vault health, the early-break fires and remaining winners
-    ///         are spared. Setup: 6 winners, all with positive PnL. Insurance fund is sized
-    ///         so that closing 3 brings exposure below the 60% cancel threshold.
+    /// @notice The mid-batch health check must actually break the loop: when closing a subset of
+    ///         winners restores vault health, the early-break fires and the remaining winners are
+    ///         spared rather than deleveraged for nothing. Setup: 6 winners, all with positive PnL.
+    ///         The insurance fund is sized so that closing 3 brings exposure below the 60% cancel
+    ///         threshold.
     function test_EarlyBreak_SparesRemainingWinnersWhenHealthRestored() public {
         // Long-side liq: vault inherited longs at bankruptcy $200; current price = $150 →
         // per-unit exposure = $50. Six total units of pending liq. Winners are shorts.
@@ -576,12 +585,13 @@ contract Phase3AdlGuardTest is Test {
         BazaarTypes.AdlResult memory r = harness.execAdl(winners, p);
 
         // Six winners eligible, but only 3 should have actually closed via the early-break.
-        // (The check fires at closedCount % 3 == 0 → after winner 3.)
+        // (The health check runs before every close after the first; exposure only drops below
+        // the cancel threshold once 3 units are closed, so the break fires before winner 4.)
         // r.eligibleSize reflects Pass 1's read of all six.
         // r.totalLiqSize reflects the actual loop closed amount, which must be < 6 if early-break fired.
         assertEq(r.eligibleSize, 6 * SCALE, "all six pre-qualified");
         assertLt(r.totalLiqSize, 6 * SCALE, "early break spared some winners");
-        assertGe(r.totalLiqSize, 3 * SCALE, "at least 3 closed (the iteration before the check)");
+        assertEq(r.totalLiqSize, 3 * SCALE, "exactly 3 closed: the break fires as soon as health is restored");
     }
 
     // ╔══════════════════════════════════════════════════════════════╗
@@ -681,7 +691,7 @@ contract Phase3AdlGuardTest is Test {
     }
 }
 
-// ==================== from Phase3VaultHealthTest.t.sol ====================
+// ==================== vault health / ADL trigger ====================
 
 /// @notice Harness exposing VaultHealthLib.checkLiqExposure for direct testing.
 contract VaultHealthHarness {
@@ -753,8 +763,8 @@ contract Phase3VaultHealthTest is Test {
     }
 
     /// @notice Vault long position in PROFIT (current > bankruptcy) → no loss, ADL not triggered.
-    ///         Previously the 3% floor would have inflated expectedLoss to 3% × bankruptcyNotional
-    ///         even though the vault is up money. Post-fix, expected loss is exactly 0.
+    ///         A floor under expectedLoss would inflate it to 3% × bankruptcyNotional even though
+    ///         the vault is up money; computed from the real gap it is exactly 0.
     function test_LongLiq_AboveBankruptcy_NoExposure() public {
         // bankruptcy $100, current $150 — vault is in profit
         h.setVault({
@@ -763,22 +773,22 @@ contract Phase3VaultHealthTest is Test {
             pendingLiqBankruptcyNotional: 1_000 * SCALE, // 10 × $100
             pendingLiqIsLong: true
         });
-        // Pre-fix would have computed: 3% floor × bankruptcyNotional × currentNotional/bankruptcyNotional
+        // A 3% floor would compute: 3% × bankruptcyNotional × currentNotional/bankruptcyNotional
         //   = currentNotional × 3% = $1500 × 3% = $45 → exceeds 80% × $1 = $0.80 → ADL!
-        // Post-fix: expectedLoss = 0 since current > bankruptcy → healthy.
+        // From the real gap: expectedLoss = 0 since current > bankruptcy → healthy.
         VaultHealthLib.LiqExposureResult memory r = h.check(150 * SCALE, false, 0, 0, false);
         assertTrue(r.healthy, "vault in profit, no exposure");
         assertFalse(r.newIsAdlPending, "ADL must not trigger");
     }
 
-    /// @notice Compares against the old buggy math: pre-fix would have UNDER-reported loss
-    ///         when current is far below bankruptcy. Verify the new math reports the FULL loss
-    ///         so ADL triggers correctly in stressed markets.
+    /// @notice The loss must be the FULL bankruptcy-to-current gap so ADL triggers in stressed
+    ///         markets. Scaling that gap by currentNotional instead UNDER-reports it precisely
+    ///         when current is far below bankruptcy — the case that matters most.
     function test_LongLiq_DeepUnderwater_TriggersAdl() public {
         // bankruptcy $200, current $50 — vault deeply underwater
         // Real loss: 1 × ($200 - $50) = $150.
-        // Pre-fix bug: currentNotional × gap / BP = $50 × 75% = $37.50 (off by P/B = 50/200 = 0.25)
-        // Post-fix: $200 - $50 = $150
+        // Scaled by currentNotional: $50 × 75% = $37.50 (off by P/B = 50/200 = 0.25)
+        // Full gap: $200 - $50 = $150
         h.setVault({
             insuranceFundBalance: 100 * SCALE, // small fund
             pendingLiqSize: 1 * SCALE,
@@ -786,18 +796,18 @@ contract Phase3VaultHealthTest is Test {
             pendingLiqIsLong: true
         });
         // ADL trigger = 80% × $100 = $80.
-        // Pre-fix loss ($37.50) < $80 → ADL would NOT trigger (false negative — bug).
-        // Post-fix loss ($150) > $80 → ADL DOES trigger.
+        // A scaled loss ($37.50) < $80 → ADL would NOT trigger: a false negative.
+        // The full-gap loss ($150) > $80 → ADL DOES trigger.
         VaultHealthLib.LiqExposureResult memory r = h.check(50 * SCALE, false, 0, 0, false);
         assertFalse(r.healthy, "deep underwater must trigger ADL");
         assertTrue(r.newIsAdlPending);
         assertFalse(r.newAdlLongs); // vault inherited longs → deleverage the winning shorts
     }
 
-    /// @notice Regression: the ADL deleverage side must be OPPOSITE the liquidated side.
-    ///         Pre-fix, newAdlLongs copied pendingLiqIsLong, so the winner scan filtered to
-    ///         the losing side and executeAdl always reverted "No eligible winners" —
-    ///         every ADL event timed out into emergency termination.
+    /// @notice The ADL deleverage side must be OPPOSITE the liquidated side. Copying
+    ///         pendingLiqIsLong straight into newAdlLongs would filter the winner scan to the
+    ///         LOSING side, so executeAdl would always revert "No eligible winners" and every
+    ///         ADL event would time out into emergency termination.
     function test_AdlTrigger_DeleverageSideOppositeLiquidatedSide() public {
         // Shorts liquidated (price spiked): bankruptcy $100, current $200, loss = $100
         // vs trigger threshold 80% × $50 = $40 → ADL triggers.
@@ -812,9 +822,9 @@ contract Phase3VaultHealthTest is Test {
         assertTrue(r.newAdlLongs, "shorts liquidated -> deleverage the winning longs");
     }
 
-    /// @notice With the floor removed: a vault that's at break-even (current ≈ bankruptcy) and
-    ///         a tiny insurance fund must NOT trigger ADL. Pre-fix, the 3% floor would have
-    ///         tripped it; post-fix, expectedLoss = 0 → healthy.
+    /// @notice A vault at break-even (current ≈ bankruptcy) with a tiny insurance fund must NOT
+    ///         trigger ADL. A 3% floor under expectedLoss would trip it on the fund's size alone;
+    ///         the real gap is 0 → healthy.
     function test_NoFloor_BreakEven_NoFalseAdl() public {
         // bankruptcy = $100, current = $100 — exactly break-even
         h.setVault({
@@ -898,12 +908,11 @@ contract Phase3VaultHealthTest is Test {
     }
 }
 
-// ==================== from Phase1TransferSafetyTest.t.sol ====================
+// ==================== ERC20 transfer safety ====================
 
-/// @notice Regression tests for Phase 1 (R1-1): unsafe ERC20 return-value handling.
-///         Uses vm.mockCall to make USDC.transfer / transferFrom return `false` silently
-///         (instead of reverting). Before the SafeERC20 migration, the bare-`.call` pattern
-///         would treat this as success. After: the call must revert.
+/// @notice ERC20 return-value handling. Uses vm.mockCall to make USDC.transfer / transferFrom
+///         return `false` silently instead of reverting — the non-standard-token case a bare
+///         `.call` would read as success. Every such transfer must revert instead.
 contract Phase1TransferSafetyTest is Test {
     bytes32 constant BTC_USD_FEED_ID = 0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43;
     uint256 constant USDC_SCALE = 1e6;
@@ -943,8 +952,9 @@ contract Phase1TransferSafetyTest is Test {
         usdc.mint(user, 1_000 * USDC_SCALE);
     }
 
-    /// @notice Pre-fix behavior would have silently succeeded; post-fix the deposit must revert
-    ///         because SafeERC20 detects the `false` return value from transferFrom.
+    /// @notice The deposit must revert because SafeERC20 detects the `false` return value from
+    ///         transferFrom. An unchecked low-level call would read it as success and credit
+    ///         collateral that never arrived.
     function test_depositCollateral_SilentFailingTransferFrom_Reverts() public {
         uint256 amount = 100 * BAZAAR_SCALE;
 

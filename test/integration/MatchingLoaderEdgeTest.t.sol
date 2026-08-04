@@ -4,16 +4,16 @@ pragma solidity 0.8.34;
 import {IntegrationBase} from "./IntegrationBase.sol";
 
 /// @title MatchingLoaderEdgeTest
-/// @notice Pins the subtle head-loader guards in MatchingEngineLib that mutation probes showed
-///         were previously untested: the untriggered-StopLimit race-skip (a sequencer must not
-///         be able to arm a stop before its trigger is reached) and the same-price/same-id
-///         sort tolerance (a duplicate list entry for an already-filled order is race-skipped,
-///         not a batch-reverting SortViolation).
+/// @notice Pins the subtle head-loader guards in MatchingEngineLib that no broader test reaches —
+///         deleting either one leaves the rest of the suite green: the untriggered-StopLimit
+///         race-skip (a sequencer must not be able to arm a stop before its trigger is reached)
+///         and the same-price/same-id sort tolerance (a duplicate list entry for an already-filled
+///         order is race-skipped, not a batch-reverting SortViolation).
 contract MatchingLoaderEdgeTest is IntegrationBase {
     /// @notice An untriggered SHORT StopLimit in the shortLimits list must be skipped, not
     ///         filled. Short stops trigger when oracle <= triggerPrice; at a $50k oracle a
     ///         $40k trigger is unarmed, even though its $39k limit price would cross the
-    ///         resting $50k long. (Mutation probe: deleting the guard passed the full suite.)
+    ///         resting $50k long. (Deleting this guard leaves every other test in the suite green.)
     function test_loader_untriggeredShortStopLimit_isSkippedNotFilled() public {
         _deposit(alice, 20_000 * BAZAAR_SCALE);
         _deposit(bob, 20_000 * BAZAAR_SCALE);

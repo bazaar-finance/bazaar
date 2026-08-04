@@ -5,7 +5,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {BazaarTypes} from "./BazaarTypes.sol";
 
 /// @title FundingLib
-/// @notice Mark-price EMA and funding-index accrual math extracted from BazaarPair.
+/// @notice Mark-price EMA and funding-index accrual math for BazaarPair.
 /// @dev Deployed as an EXTERNAL library (DELEGATECALL, like MatchingEngineLib et al.) so its
 ///      bytecode does not count toward BazaarPair's EIP-170 limit. The pair's funding state
 ///      lives in scalar storage vars, so these functions take values and return the updated
@@ -21,6 +21,10 @@ library FundingLib {
     uint256 internal constant MARK_DECAY_PERIOD = 1 hours;
     uint256 internal constant MAX_MARK_DEVIATION_BP = 500; // 5%
 
+    uint256 internal constant VOLUME_HALFLIFE = 60 minutes;
+    uint256 internal constant MAX_ALPHA = 1000; // 10% of BP_SCALE
+    uint256 internal constant BASE_ALPHA = 100;
+
     /// @notice The pair's mark-price EMA state (scalar storage vars in BazaarPair).
     struct MarkState {
         uint256 markPrice;
@@ -34,8 +38,8 @@ library FundingLib {
     ///      at MAX_ALPHA = 1000 (10% of BP_SCALE): even a fill that dominates recent volume can't
     ///      move the mark more than 10% toward its print — the protocol's resistance to single-
     ///      batch manipulation. There is no lower floor, so a dust fill against deep volume gets
-    ///      ~0 weight and the mark just keeps decaying toward index; a tiny wash trade can no
-    ///      longer nudge the mark. The exec price is additionally clamped to ±MAX_MARK_DEVIATION_BP
+    ///      ~0 weight and the mark just keeps decaying toward index; a tiny wash trade cannot
+    ///      nudge the mark. The exec price is additionally clamped to ±MAX_MARK_DEVIATION_BP
     ///      of the index before it enters the EMA, so an implausible print can't move the mark and
     ///      the steady-state mark stays within that band of index.
     ///      Note: the zero-fill path intentionally leaves lastMarkUpdateTs unchanged.
@@ -44,10 +48,6 @@ library FundingLib {
         view
         returns (MarkState memory)
     {
-        uint256 VOLUME_HALFLIFE = 60 minutes;
-        uint256 MAX_ALPHA = 1000;
-        uint256 BASE_ALPHA = 100;
-
         uint256 elapsed = block.timestamp - s.lastMarkUpdateTs;
 
         uint256 decayedVolume;
@@ -78,7 +78,7 @@ library FundingLib {
 
         // Clamp the print to a band around the index before it enters the EMA, so a self-crossed
         // wash trade at an arbitrary price (a fresh-oracle Pass C cross skips the matching band)
-        // can't inject that price into the mark. See SECURITY_AUDIT H-3.
+        // can't inject that price into the mark.
         uint256 bandHigh = indexPrice * (BP_SCALE + MAX_MARK_DEVIATION_BP) / BP_SCALE;
         uint256 bandLow = indexPrice * (BP_SCALE - MAX_MARK_DEVIATION_BP) / BP_SCALE;
         uint256 boundedExec = Math.min(Math.max(execPrice, bandLow), bandHigh);

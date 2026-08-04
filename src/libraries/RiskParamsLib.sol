@@ -5,8 +5,8 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {BazaarTypes} from "./BazaarTypes.sol";
 
 /// @title RiskParamsLib
-/// @notice Risk-parameter math extracted from BazaarPair: the IMR/MMR curve, variance EMA,
-///         liquidation-gap EMA, insurance-fund targets and the taker insurance fee curves.
+/// @notice Risk-parameter math for BazaarPair: the IMR/MMR curve, variance EMA, liquidation-gap
+///         EMA, insurance-fund targets and the taker insurance fee curves.
 /// @dev Deployed as an EXTERNAL library (DELEGATECALL, like MatchingEngineLib et al.) so its
 ///      bytecode does not count toward BazaarPair's EIP-170 limit. Storage struct params run
 ///      in the calling pair's storage context.

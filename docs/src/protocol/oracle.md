@@ -15,7 +15,7 @@ Every price-touching entry point accepts a `priceUpdate` byte array so callers c
 
 Pyth publishes a confidence interval alongside every price. Bazaar consumes it two ways:
 
-- **Sanity gate** — any price with confidence > **2%** of spot is rejected outright (matches Drift's threshold).
+- **Sanity gate** — any price with confidence > **2%** of spot is rejected outright (`MAX_CONFIDENCE_BP`). A band that wide means the publishers disagree enough that neither edge is a usable margin input, so the read fails rather than picking one.
 - **Directional brackets** — reads return `(spot, low = spot − conf, high = spot + conf)`. Withdrawal checks value long exposure at `low` and short exposure at `high` — you cannot withdraw against the optimistic edge of the confidence band. Liquidations and ADL deliberately use plain spot: the 2% gate is the conservatism there, and bracket-pricing forced closures would systematically favor one side.
 
 Non-positive prices revert unconditionally on every path — operating on a zero price would mass-liquidate an entire side.

@@ -5,7 +5,7 @@ A practical guide to trading on Bazaar. Plain language first; every section link
 ## Getting in
 
 1. **Fund**: hold USDC on Arbitrum. That's the only collateral — no ETH needed if you use a [gasless relayer](../protocol/meta-transactions.md), and even the USDC approval can ride a permit signature.
-2. **Deposit**: `depositCollateral` into the specific market you want to trade (min $1). Collateral is per-market; a blowup in one market cannot touch your balance in another.
+2. **Deposit**: `depositCollateral` into the specific market you want to trade (min $5). Collateral is per-market; a blowup in one market cannot touch your balance in another. While you hold a position you must keep `max(0.5% of notional, $5)` in collateral — $5 on a $100 position, $500 on a $100k one. Fees come out of your balance, so this guarantees you can always pay the one that closes your position; without it, a position deep enough in profit could withdraw its whole deposit and then find its closing orders silently canceled.
 3. **Trade**: place orders. You hold **one net position per market** — buying 2 ETH long then selling 3 flips you to 1 short.
 
 ## Order types, practically
@@ -34,7 +34,7 @@ Honest list, in increasing order of severity:
 - **Your order auto-cancels.** If your equity drifts below what a fill would require, the match cancels your order instead of filling it. Resubmit after topping up.
 - **Liquidation.** Below maintenance margin, your position is closed *entirely* (no partials) and your remaining collateral is seized. Set stops, or watch `checkBucketSolvency`. See [Liquidations](../protocol/liquidations.md).
 - **Auto-deleveraging (ADL).** In a crisis, the *most profitable, most leveraged* traders on the winning side can be force-closed at a worse-than-market (but never loss-making) price to keep the market solvent. If you're up big with high leverage during chaos, you're first in line. See [Auto-Deleveraging](../protocol/adl.md).
-- **Market termination.** If the underlying dies (delisting, feed decommission), the market cash-settles at a final price and you withdraw. In deep insolvency, payouts are haircut pro-rata — never race-to-exit. See [Termination](../protocol/termination.md).
+- **Market termination.** If the underlying dies (delisting, feed decommission), the market cash-settles at a final price and you withdraw. Your deposit minus your own losses is always reserved for you and never expires; if there isn't enough left to pay every winner's profit, profits are haircut at one uniform percentage — never race-to-exit. You don't need to act during the wind-down: bots are paid to settle positions on your behalf, and `getTerminalEntitlement` on the lens shows exactly what a withdrawal will pay you. See [Termination](../protocol/termination.md).
 
 ## Fees you'll pay
 
@@ -46,4 +46,4 @@ Non-24/7 markets keep trading on the last price when their venue closes: margin 
 
 ## Getting out
 
-`withdrawCollateral` any time your equity covers initial margin on what remains — valued conservatively at the pessimistic edge of the oracle's confidence band. Flat (no position, no orders)? Withdraw everything, any time. Two freezes to know about: if you hold a position, withdrawals are blocked for as long as ADL remains *pending* (until the crisis clears or the 24-hour ADL timeout terminates the market — the 10-minute clock is only the auction's score decay); and *all* withdrawals pause during the ~1-hour terminal sweep just before a dying market settles.
+`withdrawCollateral` any time your equity covers initial margin on what remains — valued conservatively at the pessimistic edge of the oracle's confidence band. Flat (no position, no orders)? Withdraw everything, any time. Two freezes to know about: if you hold a position, withdrawals are blocked for as long as ADL remains *pending* (until the crisis clears or the 24-hour ADL timeout winds the market down — the 10-minute clock is only the auction's score decay); and *all* withdrawals pause during the 48-hour settlement window just before a dying market settles (that pause is what guarantees everyone is paid from the same, fully-tallied pot).

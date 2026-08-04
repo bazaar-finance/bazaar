@@ -10,7 +10,7 @@ contract InsuranceIntegrationTest is IntegrationBase {
     /// @dev Execute-with-fee: build the price update before the prank and forward the Pyth fee.
     function _executeInsuranceWithdrawal(address user) internal {
         bytes[] memory pu = _freshPrice();
-        uint256 fee = pair.getPythFee(pu);
+        uint256 fee = oracle.getUpdateFee(pu);
         vm.deal(user, fee);
         vm.prank(user);
         pair.executeInsuranceWithdrawal{value: fee}(pu, 0, 0, 0, "");
@@ -39,7 +39,7 @@ contract InsuranceIntegrationTest is IntegrationBase {
         // Executing before the cooldown elapses reverts.
         {
             bytes[] memory pu = _freshPrice();
-            uint256 fee = pair.getPythFee(pu);
+            uint256 fee = oracle.getUpdateFee(pu);
             vm.deal(carol, fee);
             vm.prank(carol);
             vm.expectRevert();
@@ -72,7 +72,7 @@ contract InsuranceIntegrationTest is IntegrationBase {
         // 20-day cooldown + 3-day window + slack → the request is stale.
         vm.warp(vm.getBlockTimestamp() + 20 days + 3 days + 1);
         bytes[] memory pu = _freshPrice();
-        uint256 fee = pair.getPythFee(pu);
+        uint256 fee = oracle.getUpdateFee(pu);
         vm.deal(carol, fee);
         vm.prank(carol);
         vm.expectRevert();

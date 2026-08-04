@@ -43,7 +43,7 @@ Integrators are naturally positioned to run the [meta-transaction relayer](../pr
 
 ## Checklist for a production integration
 
-1. Set `integrator` on every order (and test that fills emit your address's transfers).
+1. Set `integrator` on every order (and test that fills emit your address's transfers). `OrderFilled` is the only per-fill event — it carries `fillSize`, `executionPrice`, the total `fee` charged that side, and an `isMaker` flag, and a pair match emits one per side — so index that to attribute your revenue.
 2. Decide gasless vs. direct: relayed calls need the 2-second price-staleness tier — your relayer should attach a fresh Pyth update to each call.
 3. Read [Orders](../protocol/orders.md) for the per-user caps your UI must respect (100 resting limits, 1 market order, 1 TP + 1 SL per position) and surface auto-cancel events (`OrderUpdated` with `Canceled`) to users.
 4. Use `BazaarPairLens` for all read paths — solvency, margin, share prices — rather than re-deriving them client-side.

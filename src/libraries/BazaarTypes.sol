@@ -189,11 +189,17 @@ library BazaarTypes {
     }
 
     /// @notice Per-deposit insurance lot for vote-maturity (anti-snipe) tracking.
-    ///         uint64 + uint192 pack into a single storage slot. Written by
-    ///         InsuranceVaultLib.depositToInsurance, read by BazaarPair.getSharesAsOf.
+    ///         Written by InsuranceVaultLib.depositToInsurance, read by
+    ///         BazaarPair.getSharesAsOf.
+    /// @dev `shares` is deliberately FULL-WIDTH (two slots per lot, not one). Packing it beside
+    ///      `ts` would need an overflow guard on append, and repeated drain-and-recapitalize
+    ///      cycles inflate the share supply — so that guard could permanently brick insurance
+    ///      deposits while the fund was still alive. A share count can be as large as the supply
+    ///      itself, so it gets a whole slot; the extra SSTORE per deposit is the price of never
+    ///      bricking recap.
     struct DepositLot {
         uint64 ts;
-        uint192 shares;
+        uint256 shares;
     }
 
     struct PairPrice {
@@ -291,12 +297,19 @@ library BazaarTypes {
     // Bug bounty tax
     uint256 internal constant BUG_BOUNTY_TAX_BP = 100;
 
+    /// @notice Smallest insurance seed a pair may be initialized with.
+    /// @dev Lives here because two contracts enforce it at different moments and must not drift:
+    ///      BazaarFactory rejects an under-funded proposal up front, and BazaarPair.initialize
+    ///      rejects an under-funded seed at deployment — which happens inside OOv3's resolve
+    ///      callback, where a revert would take settlement down with it and strand both the escrow
+    ///      and the pairId permanently. One constant makes the two checks the same check.
+    uint256 internal constant MIN_INSURANCE_SEED = 3_000 * BAZAAR_SCALE;
+
     // Order constants (shared between BazaarPair and OrderManagementLib)
     uint256 internal constant MIN_ORDER_AMOUNT = 5 * BAZAAR_SCALE;
     uint256 internal constant MAX_SLIPPAGE_BP = 500; // 5% max slippage for market-type orders
 
-    // Block-based lifetime constants — Arbitrum ~250ms blocks (4 blocks/sec).
-    // Derived from prior time-based 4s / 4s / 365d limits.
+    // Order-lifetime constants, in Arbitrum L2 blocks (~250ms each, 4 blocks/sec).
     uint64 internal constant MIN_ORDER_LIFETIME_BLOCKS = 12; // ~3 s
     uint64 internal constant MARKET_ORDER_LIFETIME_BLOCKS = 12; // ~3 s
     uint64 internal constant MAX_ORDER_LIFETIME_BLOCKS = 365 * 24 * 60 * 60 * 4; // ~126.1M, ~1 year
@@ -333,10 +346,9 @@ library BazaarTypes {
     ///         preimage so challengers can reconstruct without extra storage.
     event BatchRecorded(bytes32 indexed pairId, uint256 indexed batchId, address indexed sequencer, BatchInfo info);
 
-    // OrdersMatched was removed (MatchingEngineLib EIP-170 headroom): every field it carried is
-    // in the two same-transaction OrderFilled events — fillSize/fillPrice/fees verbatim, and the
-    // maker/taker labeling now lives in OrderFilled.isMaker. Pair matches emit two OrderFilled
-    // events (one per side); vault-liquidation closes emit one (the user side, always maker).
+    // OrderFilled is the sole per-fill event: it carries fillSize/fillPrice/fees plus the
+    // maker/taker label in `isMaker`, so no separate match-level event is emitted. A pair match
+    // emits two (one per side); a vault-liquidation close emits one (the user side, always maker).
     event OrderFilled(
         bytes32 indexed pairId,
         uint256 indexed orderId,
@@ -447,13 +459,13 @@ library BazaarTypes {
         uint256 emergencyHaircutBp; // emergencyTerminalCollateralWithdrawalRatioBp
         bool isOracleStale; // true when oracle is stale
         uint256 normalTerminationPrice; // settlement price for normal termination
-        uint256 normalTerminalWinnersPayoutRatioBp; // payout ratio for winning positions on normal termination
         uint256 normalTerminalCollateralRatioBp; // principal haircut for deep-insolvency normal termination (BP_SCALE/0 = none)
         bool isVaultHealthy; // result of vault health check (only relevant when exposure present)
         uint8 vaultHealthReason; // reason code from vault health check
         uint256 outstandingLongOrderExposure; // total notional of user's active long limit orders
         uint256 outstandingShortOrderExposure; // total notional of user's active short limit orders
         uint64 currentBlock; // L2 block number at tx execution time
+        address usdcToken; // USDC address — terminal branch reads cash for the surplus clip
     }
 
     /// @notice Result from withdrawCollateral
@@ -520,14 +532,13 @@ library BazaarTypes {
     ///         Per-type aggregates are populated during the walk and copied into BatchInfo at finalize.
     /// @dev `staleSkippedIds` is preallocated to totalIds capacity at executeBatch entry; only
     ///      indices [0, staleSkippedCount) are valid. At finalize, the array is truncated via
-    ///      assembly to staleSkippedCount before being copied to BatchInfo.
-    /// @dev Aggregate (OI deltas, fees) and IntegratorBag are bundled here too — saves stack
-    ///      pressure in the matching engine by avoiding separate mem-pointer params.
+    ///      assembly to staleSkippedCount before being copied to BatchInfo. Aggregates (OI deltas,
+    ///      fees) and IntegratorBag are bundled here too, which saves stack pressure in the
+    ///      matching engine by avoiding separate mem-pointer params.
     struct BatchResult {
         uint256 successCount;
         // Σ fillNotional across all passes — serves triple duty: capacity checks + recordVolume,
         // the VWAP numerator (Σ price×size ≡ Σ notional), and BatchInfo.totalMatchNotional.
-        // (Former sumPriceTimesSize / totalMatchNotional fields accumulated this same number.)
         uint256 totalMatchedVolume;
         uint256 totalFillSize; // VWAP denominator
 
@@ -578,6 +589,30 @@ library BazaarTypes {
         uint256 terminationPrice;
         address usdc; // USDC token address for balanceOf
         bytes32 pairId;
+        int256 currentFundingIndex; // frozen funding index — settles the estate funding leg
+    }
+
+    /// @notice Terminal-settlement state for the two-stage normal termination (frozen-ratio
+    ///         design). Registered profit claims accumulate during the 48h settlement window;
+    ///         finalize charges bad debt to insurance and freezes profitRatioBp once. Principal
+    ///         (totalCollateralDeposited) is reserved at all times; profits pay only from the
+    ///         surplus = cash - D - I. Lives in BazaarPair storage, passed to libs by reference.
+    struct TerminalSettlement {
+        uint256 totalProfitClaims; // Σ registered winner PnL (window settlements only)
+        uint256 terminalBadDebt; // Σ uncovered losses (loss beyond collateral, funding incl.)
+        uint256 profitRatioBp; // frozen at finalize: min(BP_SCALE, surplus / claims)
+        uint256 profitReserve; // still-unpaid portion of registered claims x ratio
+    }
+
+    /// @notice Parameters for the internal _settleOne terminal-settlement helper. No marginReqs:
+    ///         settlement PnL ignores margins, and the bucket-update event uses a zeroed default.
+    struct TerminalSettleParams {
+        uint256 settlementPrice; // the fixed terminal price
+        int256 currentFundingIndex;
+        bool postFinalize; // false: window (register claims); true: junior/late path
+        bool payBounty; // false for inline self-settlement during withdraw
+        bytes32 pairId;
+        address usdc;
     }
 
     /// @notice Results from TerminationLib.executeTermination — written back by BazaarPair

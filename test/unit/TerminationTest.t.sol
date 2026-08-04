@@ -17,36 +17,38 @@ import {MockOptimisticOracleV3} from "../mocks/MockOptimisticOracleV3.sol";
 import {MockPyth} from "@pythnetwork/pyth-sdk-solidity/MockPyth.sol";
 import {MockUSDC} from "../mocks/MockUSDC.sol";
 
-// ==================== from Phase2TerminationPnlTest.t.sol ====================
+// ==================== termination PnL / frozen ratio ====================
 
-/// @notice Harness that owns its own Vault storage and forwards termination calls into
-///         TerminationLib. Lets us construct the both-sides-negative-aggregate-PnL scenario
-///         without standing up a full BazaarPair, and inspect `winnersPayoutRatioBp`.
+/// @notice Harness owning Vault + TerminalSettlement storage, forwarding into TerminationLib's
+///         finalize so the frozen-ratio math (surplus/claims from ACTUAL cash) can be unit-tested
+///         without a full BazaarPair. Winner profit claims are pre-registered via setClaims (the
+///         48h settlement window's job in production); the estate/funding/bad-debt legs are seeded
+///         directly.
 contract TerminationHarness {
     BazaarTypes.Vault public vault;
+    BazaarTypes.TerminalSettlement public ts;
 
     function setVault(
-        uint256 totalLongOI,
-        uint256 totalShortOI,
-        uint256 longWeightedEntrySum,
-        uint256 shortWeightedEntrySum,
         uint256 totalCollateralDeposited,
         uint256 insuranceFundBalance,
         uint256 pendingLiqSize,
         uint256 pendingLiqEntryNotional,
         uint256 pendingLiqBankruptcyNotional,
+        int256 pendingLiqEntryFundingIndex,
         bool pendingLiqIsLong
     ) external {
-        vault.totalLongOI = totalLongOI;
-        vault.totalShortOI = totalShortOI;
-        vault.longWeightedEntrySum = longWeightedEntrySum;
-        vault.shortWeightedEntrySum = shortWeightedEntrySum;
         vault.totalCollateralDeposited = totalCollateralDeposited;
         vault.insuranceFundBalance = insuranceFundBalance;
         vault.pendingLiqSize = pendingLiqSize;
         vault.pendingLiqEntryNotional = pendingLiqEntryNotional;
         vault.pendingLiqBankruptcyNotional = pendingLiqBankruptcyNotional;
+        vault.pendingLiqEntryFundingIndex = pendingLiqEntryFundingIndex;
         vault.pendingLiqIsLong = pendingLiqIsLong;
+    }
+
+    function setClaims(uint256 totalProfitClaims, uint256 terminalBadDebt) external {
+        ts.totalProfitClaims = totalProfitClaims;
+        ts.terminalBadDebt = terminalBadDebt;
     }
 
     function setDeficit(uint256 d) external {
@@ -57,334 +59,237 @@ contract TerminationHarness {
         return vault.deficit;
     }
 
+    function insurance() external view returns (uint256) {
+        return vault.insuranceFundBalance;
+    }
+
+    function collateral() external view returns (uint256) {
+        return vault.totalCollateralDeposited;
+    }
+
+    function profitReserve() external view returns (uint256) {
+        return ts.profitReserve;
+    }
+
     function execTerm(BazaarTypes.TerminationParams memory params)
         external
         returns (BazaarTypes.TerminationResult memory)
     {
-        return TerminationLib.executeTermination(vault, params);
+        return TerminationLib.executeTermination(vault, ts, params);
     }
 }
 
-/// @notice Regression test for R2-4: `winningPnl` must not wrap a negative `int256` to
-///         `uint256` when both `longPnL` and `shortPnL` are negative.
+/// @notice Unit tests for the frozen-ratio normal-termination finalize (TerminationLib). The
+///         profit payout ratio is min(100%, surplus/claims) computed from ACTUAL cash minus the
+///         principal reserve (D) and insurers' remainder (I) — never from net-per-side PnL
+///         aggregates, whose net-of-side denominator would zero every winner over a 1-wei
+///         shortfall on an internally hedged book.
 contract Phase2TerminationPnlTest is Test {
     TerminationHarness harness;
     MockUSDC usdc;
 
     uint256 constant SCALE = 1e18;
     uint256 constant USDC_SCALE = 1e6;
+    uint256 constant PRICE = 100 * 1e18;
 
     function setUp() public {
         harness = new TerminationHarness();
         usdc = new MockUSDC();
     }
 
-    /// @notice Construct a scenario where:
-    ///         - vault has pending long liquidations underwater enough to exceed insurance,
-    ///         - aggregate `longPnL` AND `shortPnL` are BOTH negative,
-    ///         - `longPnL > shortPnL` (so the pre-fix code picks the long side and casts -400 → ~2^256).
-    ///         Pre-fix outcome: `winnersPayoutRatioBp ≈ 10000` (100%, no haircut).
-    ///         Post-fix outcome: `winnersPayoutRatioBp == 0` (full haircut, since no aggregate winners).
-    function test_R2_4_BothNegativeAggregatePnl_WinnersPayoutRatioIsZero() public {
-        uint256 terminationPrice = 100 * SCALE;
-
-        // Both-negative PnL setup at terminationPrice = $100:
-        //   longNotional  = 10  × $100 = $1,000 ; longWeightedEntrySum  = $1,400 → longPnL  = -$400
-        //   shortNotional = 10  × $100 = $1,000 ; shortWeightedEntrySum = $500   → shortPnL = -$500
-        // longPnL > shortPnL  → pre-fix selects long side → uint256(-$400) wraps.
-        //
-        // Pending liq: 5 units inherited long, bankruptcyPrice = $200, terminationPrice = $100
-        //   → liq impact = (100 - 200) * 5 = -$500 (loss). Insurance fund = $50 → shortfall $450.
-        harness.setVault({
-            totalLongOI: 10 * SCALE,
-            totalShortOI: 10 * SCALE,
-            longWeightedEntrySum: 1_400 * SCALE,
-            shortWeightedEntrySum: 500 * SCALE,
-            totalCollateralDeposited: 2_000 * SCALE,
-            insuranceFundBalance: 50 * SCALE,
-            pendingLiqSize: 5 * SCALE,
-            pendingLiqEntryNotional: 1_000 * SCALE, // entry $200/unit
-            pendingLiqBankruptcyNotional: 1_000 * SCALE, // bankruptcy $200/unit
-            pendingLiqIsLong: true
-        });
-
-        // Mint USDC to the harness matching bookkeeping so the reconciliation step at
-        // TerminationLib L131-157 doesn't adjust liqInsuranceImpact.
-        //   expectedBalance (USDC) = (insurance + collateral) × USDC_SCALE / SCALE
-        //                        = (50 + 2000) × 1e6 = 2_050 × 1e6
-        usdc.mint(address(harness), 2_050 * USDC_SCALE);
-
-        BazaarTypes.TerminationParams memory params = BazaarTypes.TerminationParams({
+    function _params() internal view returns (BazaarTypes.TerminationParams memory) {
+        return BazaarTypes.TerminationParams({
             isEmergency: false,
-            terminationPrice: terminationPrice,
+            terminationPrice: PRICE,
             usdc: address(usdc),
-            pairId: bytes32(uint256(0xBA2AAA))
+            pairId: bytes32(uint256(0xBA2AAA)),
+            currentFundingIndex: 0
         });
-
-        BazaarTypes.TerminationResult memory result = harness.execTerm(params);
-
-        // Post-fix: aggregate PnL is non-positive on both sides → winningPnl = 0
-        // → shortfall >= winningPnl → winnersPayoutRatioBp = 0.
-        // Pre-fix this returned ~BP_SCALE (10000) due to the negative-cast wrap.
-        assertEq(result.winnersPayoutRatioBp, 0, "no aggregate winners: 100% haircut");
-
-        // Rung 4: the pot (2050 USDC) still covers all principal (2000), so even though
-        // winner PnL and insurance are wiped, principal is NOT haircut.
-        assertEq(result.normalCollateralRatioBp, 10_000, "principal fully covered, no haircut");
     }
 
-    /// @notice Deep insolvency: winner PnL fully wiped AND the USDC on hand is less than booked
-    ///         principal, so rung 4 haircuts principal pro-rata against the actual pot.
-    function test_DeepInsolvency_PrincipalHaircutAnchoredOnActualUsdc() public {
-        uint256 terminationPrice = 100 * SCALE;
+    /// @notice Solvent book: cash covers principal + insurers + all profit claims -> ratio 100%.
+    function test_Solvent_FullProfitRatio() public {
+        // D = 2000, I = 50, claims = 400. Cash 2600 -> surplus 550 >= 400 -> 100%.
+        harness.setVault(2_000 * SCALE, 50 * SCALE, 0, 0, 0, 0, false);
+        harness.setClaims(400 * SCALE, 0);
+        usdc.mint(address(harness), 2_600 * USDC_SCALE);
 
-        // Same both-negative aggregate as above (winningPnl = 0), but the contract only holds
-        // 1,500 USDC against 2,000 booked principal (+50 insurance). The reconciliation folds the
-        // 550 USDC shortfall into the liq impact, insurance is wiped, and rung 4 engages.
-        harness.setVault({
-            totalLongOI: 10 * SCALE,
-            totalShortOI: 10 * SCALE,
-            longWeightedEntrySum: 1_400 * SCALE, // longPnL  = -$400
-            shortWeightedEntrySum: 500 * SCALE, // shortPnL = -$500
-            totalCollateralDeposited: 2_000 * SCALE,
-            insuranceFundBalance: 50 * SCALE,
-            pendingLiqSize: 5 * SCALE,
-            pendingLiqEntryNotional: 1_000 * SCALE,
-            pendingLiqBankruptcyNotional: 1_000 * SCALE, // bankruptcy $200/unit
-            pendingLiqIsLong: true
-        });
-        // Hold only 1,500 USDC < 2,000 booked principal.
+        BazaarTypes.TerminationResult memory r = harness.execTerm(_params());
+        assertEq(r.winnersPayoutRatioBp, 10_000, "surplus covers claims: 100%");
+        assertEq(r.normalCollateralRatioBp, 10_000, "principal never haircut when cash >= D");
+        assertEq(harness.profitReserve(), 400 * SCALE, "full claims reserved");
+    }
+
+    /// @notice Shortfall: surplus below total claims -> uniform pro-rata haircut = surplus/claims.
+    function test_Shortfall_ProRataRatioFromCash() public {
+        // D = 2000, I = 50, claims = 400. Cash 2250 -> surplus 200 -> ratio 200/400 = 50%.
+        harness.setVault(2_000 * SCALE, 50 * SCALE, 0, 0, 0, 0, false);
+        harness.setClaims(400 * SCALE, 0);
+        usdc.mint(address(harness), 2_250 * USDC_SCALE);
+
+        BazaarTypes.TerminationResult memory r = harness.execTerm(_params());
+        assertEq(r.winnersPayoutRatioBp, 5_000, "surplus/claims = 50%");
+        assertEq(r.normalCollateralRatioBp, 10_000, "principal fully reserved");
+        assertEq(harness.profitReserve(), 200 * SCALE, "reserve = claims x ratio = surplus");
+    }
+
+    /// @notice An internally hedged winning side (net PnL ≈ 0) must NOT collapse the ratio. A
+    ///         net-per-side denominator would read ~0 here and wipe every winner over a trivial
+    ///         shortfall; the cash-based denominator is the real claim total.
+    function test_R1_InternallyHedgedSide_NoSpuriousWipeout() public {
+        // Registered claims total 1000 (e.g. many winners) even though a naive per-side net could
+        // be near zero. Cash gives surplus 900 -> ratio 90%, NOT 0.
+        harness.setVault(5_000 * SCALE, 100 * SCALE, 0, 0, 0, 0, false);
+        harness.setClaims(1_000 * SCALE, 0);
+        usdc.mint(address(harness), 6_000 * USDC_SCALE); // surplus = 6000 - 5000 - 100 = 900
+
+        BazaarTypes.TerminationResult memory r = harness.execTerm(_params());
+        assertEq(r.winnersPayoutRatioBp, 9_000, "ratio from real claim total, no spurious wipeout");
+    }
+
+    /// @notice Bad debt is charged to insurance first, shrinking the insurers' remainder and
+    ///         thereby growing the profit surplus by the same amount.
+    function test_BadDebt_ChargedToInsurance_GrowsSurplus() public {
+        // D = 2000, I = 300, badDebt = 200, claims = 400.
+        // After charge: I = 100. Cash 2500 -> surplus = 2500 - 2000 - 100 = 400 >= 400 -> 100%.
+        harness.setVault(2_000 * SCALE, 300 * SCALE, 0, 0, 0, 0, false);
+        harness.setClaims(400 * SCALE, 200 * SCALE);
+        usdc.mint(address(harness), 2_500 * USDC_SCALE);
+
+        BazaarTypes.TerminationResult memory r = harness.execTerm(_params());
+        assertEq(harness.insurance(), 100 * SCALE, "insurance charged the bad debt");
+        assertEq(r.winnersPayoutRatioBp, 10_000, "freed insurance reservation covers claims");
+    }
+
+    /// @notice Deficit (realized bad debt from matching/netting) charges insurance identically.
+    function test_DeficitFold_ChargedToInsurance() public {
+        harness.setVault(2_000 * SCALE, 300 * SCALE, 0, 0, 0, 0, false);
+        harness.setClaims(400 * SCALE, 0);
+        harness.setDeficit(200 * SCALE);
+        usdc.mint(address(harness), 2_500 * USDC_SCALE);
+
+        BazaarTypes.TerminationResult memory r = harness.execTerm(_params());
+        assertEq(harness.insurance(), 100 * SCALE, "deficit charged to insurance");
+        assertEq(harness.deficit(), 0, "deficit consumed");
+        assertEq(r.winnersPayoutRatioBp, 10_000, "surplus covers claims after charge");
+    }
+
+    /// @notice Black-swan: cash below the principal reserve -> principal itself haircut pro-rata
+    ///         against the pot, and the profit ratio is 0 (no surplus).
+    function test_CashBelowPrincipal_HaircutsPrincipal() public {
+        // D = 2000, I = 0, claims = 100. Cash only 1500 -> cash < D.
+        harness.setVault(2_000 * SCALE, 0, 0, 0, 0, 0, false);
+        harness.setClaims(100 * SCALE, 0);
         usdc.mint(address(harness), 1_500 * USDC_SCALE);
 
-        BazaarTypes.TerminationResult memory result = harness.execTerm(
-            BazaarTypes.TerminationParams({
-                isEmergency: false,
-                terminationPrice: terminationPrice,
-                usdc: address(usdc),
-                pairId: bytes32(uint256(0xBA2AAA))
-            })
-        );
-
-        assertEq(result.winnersPayoutRatioBp, 0, "winners fully wiped in deep insolvency");
-        // The estate leg first transfers min(I, entry - settle) = min(50, 500) = 50 from I to D
-        // (backing the estates' counterparties), so the rung-4 denominator is 2,050:
-        // ratio = actualUsdc / totalCollateralDeposited = 1500 / 2050 = 73.17% (floor).
-        assertEq(result.normalCollateralRatioBp, 7_317, "principal haircut to pot / post-transfer D");
-
-        // Conservation: applying the ratio to the full post-transfer principal ledger stays
-        // within the pot (floor rounding leaves dust stranded, never overdraws).
-        uint256 maxPrincipalPayout = result.normalCollateralRatioBp * (2_050 * SCALE) / 10_000;
-        uint256 potBazaar = 1_500 * SCALE; // 1,500 USDC in BAZAAR precision
-        assertLe(maxPrincipalPayout, potBazaar, "payouts bounded by the pot");
+        BazaarTypes.TerminationResult memory r = harness.execTerm(_params());
+        assertEq(r.normalCollateralRatioBp, 7_500, "principal haircut = cash/D = 75%");
+        assertEq(r.winnersPayoutRatioBp, 0, "no surplus -> 0 profit ratio");
     }
 
-    /// @notice Extreme deep insolvency: when the surviving pot is below 0.01% of booked principal the
-    ///         bp-scale ratio rounds DOWN to 0. CollateralLib must treat a computed 0 as a real full
-    ///         haircut (everyone gets ~nothing, dust stranded) — NOT as "no haircut", which would
-    ///         re-open the first-come-first-served drain. Asserts the ratio genuinely computes to 0.
-    function test_DeepInsolvency_RatioRoundsToZero_IsAFullHaircut() public {
-        uint256 terminationPrice = 100 * SCALE;
+    /// @notice Black swan with live insurance: when cash < D, the insurers'
+    ///         book claim must be ZEROED, not left standing. Insurance is junior to principal;
+    ///         a surviving I is a phantom claim on USDC already committed to the haircut
+    ///         principal — post-termination insurance withdrawals are cooldown-exempt, so
+    ///         junior money would exit first and the last principal withdrawals would revert.
+    function test_N1_CashBelowPrincipal_InsuranceClaimZeroed() public {
+        // D = 2000, I = 50, claims = 100. Cash 1500 < D. No REGISTERED bad debt: the gap is
+        // unregistered drift, which the ts.terminalBadDebt/deficit charge cannot see.
+        harness.setVault(2_000 * SCALE, 50 * SCALE, 0, 0, 0, 0, false);
+        harness.setClaims(100 * SCALE, 0);
+        usdc.mint(address(harness), 1_500 * USDC_SCALE);
 
-        harness.setVault({
-            totalLongOI: 10 * SCALE,
-            totalShortOI: 10 * SCALE,
-            longWeightedEntrySum: 1_400 * SCALE, // longPnL  = -$400
-            shortWeightedEntrySum: 500 * SCALE, // shortPnL = -$500 -> winningPnl = 0
-            totalCollateralDeposited: 2_000_000 * SCALE, // huge book
-            insuranceFundBalance: 50 * SCALE,
-            pendingLiqSize: 5 * SCALE,
-            pendingLiqEntryNotional: 1_000 * SCALE,
-            pendingLiqBankruptcyNotional: 1_000 * SCALE,
-            pendingLiqIsLong: true
-        });
-        usdc.mint(address(harness), 100 * USDC_SCALE); // 100 USDC against a 2,000,000 book
-
-        BazaarTypes.TerminationResult memory result = harness.execTerm(
-            BazaarTypes.TerminationParams({
-                isEmergency: false,
-                terminationPrice: terminationPrice,
-                usdc: address(usdc),
-                pairId: bytes32(uint256(0xBA2AAA))
-            })
-        );
-
-        assertEq(result.winnersPayoutRatioBp, 0, "winners fully wiped");
-        // mulDiv(100e18, 10000, 2_000_000e18) = 0.5 -> floors to 0: a genuine ratio, not the unset default.
-        assertEq(result.normalCollateralRatioBp, 0, "sub-0.01% pot rounds the ratio to 0");
-        assertTrue(result.normalCollateralRatioBp < 10_000, "0 < BP_SCALE -> CollateralLib applies a full haircut");
+        BazaarTypes.TerminationResult memory r = harness.execTerm(_params());
+        assertEq(r.normalCollateralRatioBp, 7_500, "principal haircut = cash/D = 75%");
+        assertEq(harness.insurance(), 0, "insurance claim zeroed: no cash beyond principal");
+        assertEq(r.winnersPayoutRatioBp, 0, "no surplus -> 0 profit ratio");
+        assertEq(harness.profitReserve(), 0, "nothing reserved for profits");
     }
 
-    /// @notice Sanity check: when longs are actually winning, the haircut math behaves
-    ///         normally (this asserts we didn't break the happy path).
-    function test_R2_4_LongsWinning_RatioReflectsRealHaircut() public {
-        uint256 terminationPrice = 100 * SCALE;
+    /// @notice Gap band: D <= cash < D + I. Principal is fully covered (no
+    ///         haircut) but the insurers' claim exceeds the post-principal residual — it must
+    ///         be written down to exactly cash - D so total withdrawable never exceeds the pot.
+    function test_N1_GapBand_InsuranceClampedToResidualCash() public {
+        // D = 2000, I = 300, claims = 400. Cash 2100: residual after principal = 100 < I.
+        harness.setVault(2_000 * SCALE, 300 * SCALE, 0, 0, 0, 0, false);
+        harness.setClaims(400 * SCALE, 0);
+        usdc.mint(address(harness), 2_100 * USDC_SCALE);
 
-        // Longs winning: longNotional > longWeightedEntrySum → longPnL > 0
-        //   longWeightedEntrySum = $500 → longPnL = $500
-        //   shortWeightedEntrySum = $500 → shortPnL = -$500 (shorts losing)
-        // Pending liq creates a shortfall < longPnL so we get a partial haircut.
-        harness.setVault({
-            totalLongOI: 10 * SCALE,
-            totalShortOI: 10 * SCALE,
-            longWeightedEntrySum: 500 * SCALE, // longPnL = +$500
-            shortWeightedEntrySum: 500 * SCALE, // shortPnL = -$500
-            totalCollateralDeposited: 2_000 * SCALE,
-            insuranceFundBalance: 50 * SCALE,
-            pendingLiqSize: 5 * SCALE,
-            pendingLiqEntryNotional: 1_000 * SCALE,
-            pendingLiqBankruptcyNotional: 1_000 * SCALE,
-            pendingLiqIsLong: true
-        });
-        usdc.mint(address(harness), 2_050 * USDC_SCALE);
-
-        BazaarTypes.TerminationParams memory params = BazaarTypes.TerminationParams({
-            isEmergency: false,
-            terminationPrice: terminationPrice,
-            usdc: address(usdc),
-            pairId: bytes32(uint256(0xBA2AAA))
-        });
-
-        BazaarTypes.TerminationResult memory result = harness.execTerm(params);
-
-        // Shortfall: liq loss $500 - insurance $50 = $450. winningPnl = $500.
-        // ratio = (500 - 450) * 10000 / 500 = 1000 (10% payout).
-        assertEq(result.winnersPayoutRatioBp, 1000, "10% payout ratio under partial-haircut");
-
-        // Winner PnL absorbs the shortfall, so principal is untouched (rung 4 not engaged).
-        assertEq(result.normalCollateralRatioBp, 10_000, "no principal haircut when winners absorb the shortfall");
+        BazaarTypes.TerminationResult memory r = harness.execTerm(_params());
+        assertEq(r.normalCollateralRatioBp, 10_000, "principal fully reserved, no haircut");
+        assertEq(harness.insurance(), 100 * SCALE, "insurance clamped to cash - D");
+        assertEq(r.winnersPayoutRatioBp, 0, "no surplus above D + clamped I");
+        assertEq(harness.profitReserve(), 0, "nothing reserved for profits");
     }
 
-    /// @notice REGRESSION (two-sided-positive haircut miscalibration): a liquidation-imbalanced
-    ///         book can leave BOTH aggregate sides net-positive at the termination price. The
-    ///         payout ratio is applied to every winner on both sides, so its denominator must be
-    ///         the combined positive PnL — not max() of the sides, which over-haircut all winners
-    ///         and stranded the excess with no claimant.
-    function test_TwoSidedPositivePnl_RatioUsesCombinedWinnerPnl() public {
-        uint256 terminationPrice = 100 * SCALE;
+    /// @notice No-op guard: on solvent books (cash >= D + I) the clamp must not move I at all —
+    ///         it is a write-down for shortfalls, not a repricing every termination pays.
+    function test_N1_Solvent_InsuranceUntouched() public {
+        // Same shape as test_Solvent_FullProfitRatio, additionally pinning I afterwards.
+        harness.setVault(2_000 * SCALE, 50 * SCALE, 0, 0, 0, 0, false);
+        harness.setClaims(400 * SCALE, 0);
+        usdc.mint(address(harness), 2_600 * USDC_SCALE);
 
-        // Both sides winning at $100: avg long entry $50 (< price), avg short entry $150 (> price).
-        //   longPnL  = 10 x $100 - $500   = +$500
-        //   shortPnL = $1,500 - 10 x $100 = +$500
-        // Pending liq: loss $500 - insurance $50 = shortfall $450 (same rig as the tests above).
-        harness.setVault({
-            totalLongOI: 10 * SCALE,
-            totalShortOI: 10 * SCALE,
-            longWeightedEntrySum: 500 * SCALE, // longPnL  = +$500
-            shortWeightedEntrySum: 1_500 * SCALE, // shortPnL = +$500
-            totalCollateralDeposited: 2_000 * SCALE,
-            insuranceFundBalance: 50 * SCALE,
-            pendingLiqSize: 5 * SCALE,
-            pendingLiqEntryNotional: 1_000 * SCALE,
-            pendingLiqBankruptcyNotional: 1_000 * SCALE,
-            pendingLiqIsLong: true
-        });
-        usdc.mint(address(harness), 2_050 * USDC_SCALE);
-
-        BazaarTypes.TerminationParams memory params = BazaarTypes.TerminationParams({
-            isEmergency: false,
-            terminationPrice: terminationPrice,
-            usdc: address(usdc),
-            pairId: bytes32(uint256(0xBA2AAA))
-        });
-
-        BazaarTypes.TerminationResult memory result = harness.execTerm(params);
-
-        // winningPnl = 500 + 500 = $1,000 -> ratio = (1000 - 450) * 10000 / 1000 = 5500 (55%).
-        // Pre-fix: winningPnl = max = $500 -> ratio 10%, clawing ~2x the shortfall from winners.
-        assertEq(result.winnersPayoutRatioBp, 5500, "ratio denominates over BOTH sides' positive PnL");
-        assertEq(result.normalCollateralRatioBp, 10_000, "principal untouched");
+        BazaarTypes.TerminationResult memory r = harness.execTerm(_params());
+        assertEq(harness.insurance(), 50 * SCALE, "clamp is a no-op when cash covers D + I");
+        assertEq(r.winnersPayoutRatioBp, 10_000, "solvent profit ratio unchanged");
+        assertEq(r.normalCollateralRatioBp, 10_000, "no principal haircut");
     }
 
-    /// @notice REGRESSION: a shortfall larger than one side's PnL but smaller than the combined
-    ///         total must stay in rung 3 (partial haircut), not escalate to the rung-4 full PnL
-    ///         wipeout. Pre-fix, `shortfall >= max(side PnL)` tripped rung 4 even though the
-    ///         combined winner PnL could absorb the shortfall.
-    function test_TwoSidedPositivePnl_NoPrematureRung4Escalation() public {
-        uint256 terminationPrice = 100 * SCALE;
+    /// @notice Ordering: the registered bad-debt charge shrinks I first; the clamp then
+    ///         writes down only whatever the charge left standing.
+    function test_N1_BadDebtCharge_ThenClamp() public {
+        // D = 2000, I = 300, registered badDebt = 200 -> I = 100 after the charge.
+        // Cash 1900 < D -> haircut 95%, and the clamp zeroes the remaining 100.
+        harness.setVault(2_000 * SCALE, 300 * SCALE, 0, 0, 0, 0, false);
+        harness.setClaims(0, 200 * SCALE);
+        usdc.mint(address(harness), 1_900 * USDC_SCALE);
 
-        // Both sides +$500 as above; pending liq loss = (100 - 250) x 5 = -$750, insurance $50
-        // -> shortfall $700: above either side alone ($500), below the combined $1,000.
-        harness.setVault({
-            totalLongOI: 10 * SCALE,
-            totalShortOI: 10 * SCALE,
-            longWeightedEntrySum: 500 * SCALE, // longPnL  = +$500
-            shortWeightedEntrySum: 1_500 * SCALE, // shortPnL = +$500
-            totalCollateralDeposited: 2_000 * SCALE,
-            insuranceFundBalance: 50 * SCALE,
-            pendingLiqSize: 5 * SCALE,
-            pendingLiqEntryNotional: 1_250 * SCALE, // entry $250/unit
-            pendingLiqBankruptcyNotional: 1_250 * SCALE, // bankruptcy $250/unit
-            pendingLiqIsLong: true
-        });
-        usdc.mint(address(harness), 2_050 * USDC_SCALE);
-
-        BazaarTypes.TerminationParams memory params = BazaarTypes.TerminationParams({
-            isEmergency: false,
-            terminationPrice: terminationPrice,
-            usdc: address(usdc),
-            pairId: bytes32(uint256(0xBA2AAA))
-        });
-
-        BazaarTypes.TerminationResult memory result = harness.execTerm(params);
-
-        // winningPnl = $1,000 > shortfall $700 -> rung 3: ratio = 300 * 10000 / 1000 = 3000 (30%).
-        // Pre-fix: shortfall $700 >= max $500 -> rung 4: every winner's PnL zeroed.
-        assertEq(result.winnersPayoutRatioBp, 3000, "combined PnL absorbs the shortfall at 30% payout");
-        assertEq(result.normalCollateralRatioBp, 10_000, "no principal haircut in rung 3");
+        BazaarTypes.TerminationResult memory r = harness.execTerm(_params());
+        assertEq(r.normalCollateralRatioBp, 9_500, "principal haircut = 1900/2000");
+        assertEq(harness.insurance(), 0, "charged for registered bad debt, then clamped to 0");
     }
 
-    /// @notice REGRESSION (deficit fold): pairVault.deficit — realized-but-unbacked bad debt from
-    ///         Pass-A vault closes or opposing-liquidation netting (incl. terminal sweeps) — is
-    ///         booked as an I <-> D transfer of the covered part only, so the books-vs-USDC drift
-    ///         check can never see it. executeTermination must charge it through the waterfall
-    ///         explicitly; pre-fix it was silently dropped and winners kept a 100% ratio while
-    ///         their claims exceeded the pot by exactly the deficit.
-    function test_DeficitFold_ChargesInsuranceThenHaircutsWinners() public {
-        uint256 terminationPrice = 100 * SCALE;
+    /// @notice The estate (pendingLiq) funding leg is settled at termination, not
+    ///         discarded. A long estate with a positive funding delta owes funding; that reduces
+    ///         its entry->settlement value, shifting the I/D split accordingly.
+    function test_R2_EstateFundingLeg_Settled() public {
+        // Long estate: size 10, entryNotional 1000 ($100/unit), settle at PRICE=$100 -> price leg 0.
+        // Funding index moved +5 (per unit, xsize 10 / SCALE) -> fundingLeg = 50. Long pays it, so
+        // estate value change = 0 - 0 - 50 = -50 -> I -= 50, D += 50.
+        harness.setVault(2_000 * SCALE, 500 * SCALE, 10 * SCALE, 1_000 * SCALE, 1_000 * SCALE, 0, true);
+        harness.setClaims(0, 0);
+        usdc.mint(address(harness), 2_500 * USDC_SCALE);
 
-        // Longs winning +$500, shorts losing -$500, no pending liq. Books match cash exactly
-        // (I + D = 2050 = minted USDC), so the drift leg contributes nothing — only the
-        // deficit fold can surface the $250 of unbacked claims.
-        harness.setVault({
-            totalLongOI: 10 * SCALE,
-            totalShortOI: 10 * SCALE,
-            longWeightedEntrySum: 500 * SCALE, // longPnL = +$500
-            shortWeightedEntrySum: 500 * SCALE, // shortPnL = -$500
-            totalCollateralDeposited: 2_000 * SCALE,
-            insuranceFundBalance: 50 * SCALE,
-            pendingLiqSize: 0,
-            pendingLiqEntryNotional: 0,
-            pendingLiqBankruptcyNotional: 0,
-            pendingLiqIsLong: false
-        });
-        harness.setDeficit(250 * SCALE);
-        usdc.mint(address(harness), 2_050 * USDC_SCALE);
+        BazaarTypes.TerminationParams memory p = _params();
+        p.currentFundingIndex = 5 * int256(SCALE); // +5 per unit
+        harness.execTerm(p);
 
-        BazaarTypes.TerminationResult memory result = harness.execTerm(
-            BazaarTypes.TerminationParams({
-                isEmergency: false,
-                terminationPrice: terminationPrice,
-                usdc: address(usdc),
-                pairId: bytes32(uint256(0xBA2AAA))
-            })
-        );
+        assertEq(harness.insurance(), 450 * SCALE, "estate funding obligation charged to insurance");
+        assertEq(harness.collateral(), 2_050 * SCALE, "counterparties' funding backing moved into D");
+    }
 
-        // Deficit $250: insurance absorbs $50, the remaining $200 haircuts winner PnL:
-        // ratio = (500 - 200) * 10000 / 500 = 6000. Pre-fix: 10000 (deficit ignored).
-        assertEq(result.winnersPayoutRatioBp, 6_000, "deficit charged through insurance then winner PnL");
-        assertEq(result.normalCollateralRatioBp, 10_000, "principal untouched (winner PnL absorbed it)");
-        assertEq(harness.deficit(), 0, "deficit consumed at termination");
+    /// @notice No claims registered (nobody settled, or no winners) -> ratio 100% trivially,
+    ///         nothing reserved for profits.
+    function test_NoClaims_RatioIsFull() public {
+        harness.setVault(1_000 * SCALE, 100 * SCALE, 0, 0, 0, 0, false);
+        harness.setClaims(0, 0);
+        usdc.mint(address(harness), 1_100 * USDC_SCALE);
+
+        BazaarTypes.TerminationResult memory r = harness.execTerm(_params());
+        assertEq(r.winnersPayoutRatioBp, 10_000, "no claims -> full ratio");
+        assertEq(harness.profitReserve(), 0, "nothing reserved for profits");
     }
 }
 
-// ==================== from Phase2InsurerVoteTest.t.sol ====================
+// ==================== insurer vote / share dilution ====================
 
-/// @notice Regression tests for R2-1: insurer-vote share-dilution attack and the offensive
-///         counterpart (acquiring shares to pass an unjust vote during the proposal window).
-///         Verifies the Phase 2.1 defenses: snapshotTotalShares freezes the threshold
-///         denominator at proposal creation, and the share-maturity check (7-day age)
-///         disqualifies shares minted within the maturity window before a proposal from
-///         voting on it. Withdrawals are also gated on mature shares only.
+/// @notice The insurer-vote share-dilution attack and its offensive counterpart (acquiring shares
+///         to pass an unjust vote during the proposal window). Two defenses close both directions:
+///         snapshotTotalShares freezes the threshold denominator at proposal creation, so minting
+///         cannot move the bar; and the share-maturity check (7-day age) disqualifies shares
+///         minted inside the maturity window before a proposal from voting on it. Withdrawals are
+///         gated on mature shares only.
 contract Phase2InsurerVoteTest is Test {
     bytes32 constant BTC_USD_FEED_ID = 0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43;
     uint256 constant USDC_SCALE = 1e6;
@@ -498,15 +403,15 @@ contract Phase2InsurerVoteTest is Test {
     ///      Uses the vm.getBlockTimestamp() cheatcode (not the opcode) — after external calls
     ///      the via_ir optimizer can re-materialize a stale cached block.timestamp.
     function _finalizeAfterSweep() internal {
-        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
         pair.finalizeTermination();
     }
 
     // -------------------- Tests --------------------
 
-    /// @notice Defensive dilution defense (R2-1 primary): defender deposits between
-    ///         vote-end and execution. Before fix: threshold scaled up, vote failed.
-    ///         After fix: threshold is frozen at the snapshot, vote still passes.
+    /// @notice Defensive dilution: a defender deposits between vote-end and execution. Recomputing
+    ///         the threshold off the live supply would scale it up and sink a vote that had already
+    ///         passed; frozen at the snapshot, the vote still passes.
     function test_R2_1_DefensiveDilution_DoesNotDefeatPassingVote() public {
         _proposeInsurerTermination(whaleProposer);
 
@@ -533,7 +438,7 @@ contract Phase2InsurerVoteTest is Test {
         assertTrue(pair.isPairTerminatedNormal(), "pair terminated despite dilution attempt");
     }
 
-    /// @notice Offensive defense (R2-1 secondary): attacker deposits a large amount mid-voting
+    /// @notice Offensive acquisition: an attacker deposits a large amount mid-voting
     ///         to acquire shares, then tries to vote with them. The shares must be
     ///         disqualified by postProposalShares so the unjust vote cannot pass.
     function test_R2_1_OffensiveAcquisition_NewSharesCannotVote() public {
@@ -576,7 +481,7 @@ contract Phase2InsurerVoteTest is Test {
         terminator.voteForInsurerTermination(address(pair), 1);
     }
 
-    /// @notice R2-2: failed insurer-vote forfeits the 400 USDC bond into the insurance fund,
+    /// @notice A failed insurer-vote forfeits the 400 USDC bond into the insurance fund,
     ///         not as orphan dust. Both the contract's actual USDC balance and the
     ///         `insuranceFundBalance` bookkeeping field must grow by the bond amount.
     function test_R2_2_FailedVote_BondCreditedToInsuranceFund() public {
@@ -603,12 +508,12 @@ contract Phase2InsurerVoteTest is Test {
         assertEq(pairUsdcAfter - pairUsdcBefore, INSURER_BOND_USDC, "pair received the bond in USDC");
 
         (,,,,, uint256 insuranceAfter,,,,,,) = pair.pairVault();
-        // Bond in BAZAAR_SCALE = 400 USDC × 1e12 = 400e18
+        // Bond in BAZAAR_SCALE = 400 USDC x 1e12 = 400e18
         uint256 expectedBazaarGain = INSURER_BOND_USDC * 1e12;
         assertEq(insuranceAfter - insuranceBefore, expectedBazaarGain, "insurance bookkeeping grew by bond amount");
     }
 
-    /// @notice R2-2 negative: a successful insurer vote refunds the bond to the proposer
+    /// @notice Negative case: a successful insurer vote refunds the bond to the proposer
     ///         and does NOT credit the pair's insurance fund. Mirror of the above.
     function test_R2_2_SuccessfulVote_BondRefundedNotCredited() public {
         _proposeInsurerTermination(whaleProposer);
@@ -661,8 +566,9 @@ contract Phase2InsurerVoteTest is Test {
         uint256 proposerUsdcBefore = usdc.balanceOf(whaleProposer);
         (,,,,, uint256 insuranceBefore,,,,,,) = pair.pairVault();
 
-        // Pre-fix this reverted with AlreadyTerminated and stranded the bond. No price update or
-        // ETH is needed — the pre-empted branch returns before any termination/oracle work.
+        // No price update or ETH is needed — the pre-empted branch returns before any
+        // termination/oracle work. Treating an already-terminated pair as an error here would
+        // revert AlreadyTerminated and strand the bond.
         bytes[] memory emptyPu = new bytes[](0);
         terminator.executeInsurerTermination(address(pair), emptyPu);
 
@@ -683,11 +589,11 @@ contract Phase2InsurerVoteTest is Test {
         assertFalse(pair.isPairTerminatedEmergency(), "no spurious emergency termination");
     }
 
-    /// @notice L-8 regression: a proposal that expires with nobody calling
-    ///         executeInsurerTermination is settled by the NEXT proposeInsurerTermination before
-    ///         the struct is overwritten. Failed-vote case: the old bond forfeits to the pair's
-    ///         insurance fund instead of being stranded in the terminator forever. Pre-fix, the
-    ///         overwrite discarded the only reference to the old bond.
+    /// @notice A proposal that expires with nobody calling executeInsurerTermination is settled by
+    ///         the NEXT proposeInsurerTermination before the struct is overwritten. Failed-vote
+    ///         case: the stale bond forfeits to the pair's insurance fund. Overwriting without
+    ///         settling first would discard the only reference to that bond, stranding it in the
+    ///         terminator forever.
     function test_L8_ExpiredUnresolvedProposal_SettledOnOverwrite_ForfeitsToInsurance() public {
         _proposeInsurerTermination(whaleProposer);
 
@@ -700,7 +606,7 @@ contract Phase2InsurerVoteTest is Test {
         uint256 pairBefore = usdc.balanceOf(address(pair));
         (,,,,, uint256 insuranceBefore,,,,,,) = pair.pairVault();
 
-        // The overwriting proposal settles the expired one: old bond → insurance fund.
+        // The overwriting proposal settles the expired one: old bond -> insurance fund.
         _proposeInsurerTermination(majorityVoter);
 
         assertEq(usdc.balanceOf(address(pair)) - pairBefore, INSURER_BOND_USDC, "old bond forfeited to the pair");
@@ -719,7 +625,7 @@ contract Phase2InsurerVoteTest is Test {
         assertFalse(executed, "new proposal unexecuted");
     }
 
-    /// @notice L-8 regression, consensus case: the vote passed but nobody executed inside the
+    /// @notice Consensus case: the vote passed but nobody executed inside the
     ///         window. The next proposal refunds the old proposer's bond (consensus succeeded
     ///         on-chain) rather than forfeiting or stranding it — and must NOT terminate the
     ///         pair off the weeks-stale vote.
@@ -774,11 +680,11 @@ contract Phase2InsurerVoteTest is Test {
         uint256 diluterShares = pair.insuranceShares(diluter);
         vm.prank(diluter);
         terminator.voteForInsurerTermination(address(pair), diluterShares);
-        // No revert → shares were eligible.
+        // No revert -> shares were eligible.
     }
 
     /// @notice MIN_INSURANCE_DEPOSIT floor (=$5) prevents dust deposits that would otherwise
-    ///         enable orphan-balance capture (deposit 1 wei → 100% share via bootstrap).
+    ///         enable orphan-balance capture (deposit 1 wei -> 100% share via bootstrap).
     function test_InsuranceDeposit_BelowMinimumReverts() public {
         // 4 USDC in BAZAAR_SCALE — below the $5 floor
         uint256 belowFloor = 4 * BAZAAR_SCALE;
@@ -852,8 +758,8 @@ contract Phase2InsurerVoteTest is Test {
         assertLt(matureAfter, totalAfter, "mature is strictly less than total when immature lots exist");
     }
 
-    /// @notice Zero-amount votes are rejected. Previously they passed all checks and emitted
-    ///         a noise event with amount=0 — wasted gas / spammy logs.
+    /// @notice Zero-amount votes are rejected. Without the guard they clear every other check and
+    ///         emit a noise event with amount=0 — wasted gas, spammy logs.
     function test_Vote_ZeroAmountReverts() public {
         _proposeInsurerTermination(whaleProposer);
         vm.expectRevert(); // BazaarPairTerminator__InsurerZeroVoteAmount
@@ -910,33 +816,34 @@ contract Phase2InsurerVoteTest is Test {
 
         // Execute the scheduled termination (two-stage: fix + sweep window + finalize) — this is
         // the path that flips isPairTerminatedNormal while leaving scheduledTerminationTs set
-        // (= the bug condition).
+        // (= the state under test).
         vm.prank(umaCaller);
         pair.fixSettlementPrice(50_000 * BAZAAR_SCALE);
         _finalizeAfterSweep();
         assertTrue(pair.isPairTerminatedNormal(), "scheduled termination executed");
-        assertGt(pair.scheduledTerminationTs(), 0, "bug condition: scheduledTerminationTs still set");
+        assertGt(pair.scheduledTerminationTs(), 0, "state under test: scheduledTerminationTs still set");
 
-        // Now an insurance LP requests + executes withdrawal — must succeed (was reverting before fix).
+        // An insurance LP requests + executes withdrawal — must succeed. A terminated pair whose
+        // schedule stamp is still set must not read as "scheduled for termination" and freeze exits.
         bytes[] memory pu = _btcPriceUpdate(uint64(vm.getBlockTimestamp()));
         uint256 majShares = pair.insuranceShares(majorityVoter);
         vm.prank(majorityVoter);
         pair.requestInsuranceWithdrawal(majShares, 0, 0, 0, "", "");
-        // Terminated → no cooldown wait needed.
+        // Terminated -> no cooldown wait needed.
         vm.prank(majorityVoter);
         pair.executeInsuranceWithdrawal(pu, 0, 0, 0, "");
         assertEq(pair.insuranceShares(majorityVoter), 0, "withdrawal succeeded post-scheduled-termination");
     }
 
-    /// @notice Regression: when a bad-debt cascade drains the insurance fund to 0 without
-    ///         triggering termination (e.g., no pending liquidations when the last loss
-    ///         settles), a recapitalizer MUST be able to deposit. Originally this reverted
-    ///         with a div-by-zero (shares = amount * total / 0); the deposit now bumps the
-    ///         share epoch — pre-drain balances lazily read as 0 — and reprices at a clean
-    ///         1:1 in a single transaction, with no holder enumeration.
     /// @dev Vault.insuranceFundBalance lives at slot 6 + offset 5 = 11.
     uint256 constant SLOT_VAULT_INSURANCE_FUND_BALANCE = 11;
 
+    /// @notice When a bad-debt cascade drains the insurance fund to 0 without triggering
+    ///         termination (e.g. no pending liquidations when the last loss settles), a
+    ///         recapitalizer MUST be able to deposit. Pricing the new shares off the drained fund
+    ///         would divide by zero (shares = amount * total / 0); the deposit instead bumps the
+    ///         share epoch — pre-drain balances lazily read as 0 — and reprices at a clean 1:1 in
+    ///         a single transaction, with no holder enumeration.
     function test_DepositToInsurance_RecapitalizesAfterFundDrain() public {
         // Simulate a drained fund by directly zeroing the bookkeeping slot. (Real-world
         // path: cascading liquidations land all-at-once, last loss clamps balance to 0,
@@ -970,7 +877,7 @@ contract Phase2InsurerVoteTest is Test {
 
     /// @notice REGRESSION (recap share-supply overflow): pricing a drained fund at 1 wei
     ///         multiplied the share supply by amount-in-WEI per rescue, so a SECOND
-    ///         wipe+rescue cycle minted amount x supply shares, overflowed the uint192
+    ///         wipe+rescue cycle minted amount x supply shares, overflowed the then-uint192
     ///         deposit-lot guard, and permanently bricked recapitalization. The share-epoch
     ///         reset removes the inflation entirely: each drained-fund recap bumps the epoch,
     ///         pre-drain balances lazily read as 0, and the supply restarts at exactly the
@@ -988,9 +895,9 @@ contract Phase2InsurerVoteTest is Test {
         vm.stopPrank();
 
         // Cycle 2: wipe again -> a NEW rescuer deposits directly.
-        // Under 1-wei pricing cycle 2 reverted with the uint192 lot-guard overflow: the
-        // supply was already x(amount-in-wei) inflated, so amount x supply blew through
-        // uint192. With the epoch reset the supply simply restarts at the rescue amount.
+        // Under 1-wei pricing this cycle overflows: the supply is already x(amount-in-wei)
+        // inflated, so amount x supply blows past any narrow lot field. The epoch reset restarts
+        // the supply at the rescue amount, and the lot field is full-width, so nothing truncates.
         vm.store(address(pair), bytes32(SLOT_VAULT_INSURANCE_FUND_BALANCE), bytes32(uint256(0)));
         usdc.mint(majorityVoter, recapUsdc);
         vm.startPrank(majorityVoter);
@@ -1013,7 +920,7 @@ contract Phase2InsurerVoteTest is Test {
         // diluter deposits a big mature batch, waits long enough for it to be eligible
         // for pruning (21d), then makes a small fresh deposit that triggers pruning.
         _depositInsurance(diluter, 5_000 * BAZAAR_SCALE);
-        vm.warp(block.timestamp + 22 days); // past LOT_RETENTION_PERIOD
+        vm.warp(block.timestamp + 22 days); // past INSURER_LOT_RETENTION_PERIOD (21d)
         _depositInsurance(diluter, 5 * BAZAAR_SCALE); // triggers prune of the old lot
 
         // Now propose. The old 5,000 are mature; the freshly-pruned-and-then-redeposited
@@ -1028,16 +935,17 @@ contract Phase2InsurerVoteTest is Test {
 
         vm.prank(diluter);
         terminator.voteForInsurerTermination(address(pair), mature);
-        // No revert → vote went through using the pruned-lot mature shares.
+        // No revert -> vote went through using the pruned-lot mature shares.
     }
 }
 
-// ==================== from Phase2OracleUpgradeTest.t.sol ====================
+// ==================== UMA identifier-upgrade governance ====================
 
-/// @notice Regression tests for R2-3: the UMA oracle-upgrade governance path must use a
-///         stricter dispute window and bond than the pair-deployment path. A protocol-wide
-///         oracle swap with only 12-hour liveness was a low-friction governance-compromise
-///         vector; Phase 2.4 raises it to 14 days + 5,000 USDC bond.
+/// @notice The UMA identifier-upgrade governance path must cost more than the pair-deployment
+///         path. A protocol-wide change to the adjudicating identifier at deployment-grade
+///         friction (1,000 USDC, no timelock) would be a cheap governance-compromise vector, so
+///         it runs at a 5,000 USDC bond and a 14-day activation timelock on top of its 2-day
+///         liveness.
 contract Phase2OracleUpgradeTest is Test {
     BazaarFactory factory;
     MockUSDC usdc;
@@ -1054,86 +962,87 @@ contract Phase2OracleUpgradeTest is Test {
         usdc.mint(proposer, 10_000 * 1e6);
     }
 
-    /// @notice The new constants must match the Phase 2.4 spec (14 days / 5,000 USDC), plus the
+    /// @notice Governance-track constants: 2-day liveness / 5,000 USDC bond, plus the
     ///         14-day post-approval activation timelock.
     function test_R2_3_OracleUpgradeConstants() public view {
-        assertEq(factory.ORACLE_UPGRADE_LIVENESS(), 14 days, "liveness = 14 days");
-        assertEq(factory.ORACLE_UPGRADE_BOND_USDC(), 5_000 * 1e6, "bond = 5,000 USDC");
-        assertEq(factory.ORACLE_UPGRADE_TIMELOCK(), 14 days, "activation timelock = 14 days");
+        assertEq(factory.IDENTIFIER_UPGRADE_LIVENESS(), 2 days, "liveness = 2 days");
+        assertEq(factory.IDENTIFIER_UPGRADE_BOND_USDC(), 5_000 * 1e6, "bond = 5,000 USDC");
+        assertEq(factory.IDENTIFIER_UPGRADE_TIMELOCK(), 14 days, "activation timelock = 14 days");
         // Pair-deployment params: 48h liveness, cheap pair deployments stay cheap.
         assertEq(factory.DEPLOYMENT_LIVENESS(), 48 hours, "deployment liveness = 48 hours");
-        assertEq(factory.DEPLOYMENT_BOND_USDC(), 1_000 * 1e6, "deployment bond unchanged");
+        assertEq(factory.DEPLOYMENT_BOND_USDC(), 1_000 * 1e6, "deployment bond = 1,000 USDC");
     }
 
     // -------------------- activation timelock --------------------
 
-    function _proposeUpgrade(address newOo) internal returns (bytes32 assertionId) {
+    function _proposeUpgrade(bytes32 newIdentifier) internal returns (bytes32 assertionId) {
         vm.startPrank(proposer);
-        usdc.approve(address(factory), factory.ORACLE_UPGRADE_BOND_USDC());
-        assertionId = factory.proposeUmaOracleUpgrade(newOo, bytes32("NEW_ID_v1"));
+        usdc.approve(address(factory), factory.IDENTIFIER_UPGRADE_BOND_USDC());
+        assertionId = factory.proposeUmaIdentifierUpgrade(newIdentifier);
         vm.stopPrank();
     }
 
-    /// @notice Approval QUEUES the upgrade behind the timelock — the oo pointer must not move.
+    /// @notice Approval QUEUES the upgrade behind the timelock — the identifier must not move.
     function test_Timelock_ApprovalQueuesButDoesNotSwap() public {
-        address oldOo = address(factory.oo());
-        address newOo = address(new MockOptimisticOracleV3(address(usdc), 7200));
+        bytes32 oldIdentifier = factory.umaIdentifier();
 
-        bytes32 aid = _proposeUpgrade(newOo);
+        bytes32 aid = _proposeUpgrade("ASSERT_TRUTH5");
         vm.warp(block.timestamp + 14 days + 1);
-        factory.settleOracleUpgradeProposal(aid);
+        factory.settleIdentifierUpgradeProposal(aid);
 
-        assertEq(address(factory.oo()), oldOo, "oo unchanged during the timelock");
-        (bytes32 qAid, address qOo,, uint256 effectiveTs) = factory.queuedOracleUpgrade();
+        assertEq(factory.umaIdentifier(), oldIdentifier, "identifier unchanged during the timelock");
+        (bytes32 qAid, bytes32 qId, uint256 effectiveTs) = factory.queuedIdentifierUpgrade();
         assertEq(qAid, aid, "queued assertion recorded");
-        assertEq(qOo, newOo, "queued oracle recorded");
-        assertEq(effectiveTs, block.timestamp + factory.ORACLE_UPGRADE_TIMELOCK(), "activates 14 days after approval");
+        assertEq(qId, bytes32("ASSERT_TRUTH5"), "queued identifier recorded");
+        assertEq(
+            effectiveTs, block.timestamp + factory.IDENTIFIER_UPGRADE_TIMELOCK(), "activates 14 days after approval"
+        );
     }
 
     /// @notice Activating before effectiveTs reverts; at/after it, anyone can activate.
     function test_Timelock_EarlyActivationReverts_ThenAnyoneActivates() public {
-        address newOo = address(new MockOptimisticOracleV3(address(usdc), 7200));
-        bytes32 aid = _proposeUpgrade(newOo);
+        bytes32 aid = _proposeUpgrade("ASSERT_TRUTH5");
         vm.warp(block.timestamp + 14 days + 1);
-        factory.settleOracleUpgradeProposal(aid);
+        factory.settleIdentifierUpgradeProposal(aid);
 
-        (,,, uint256 effectiveTs) = factory.queuedOracleUpgrade();
-        vm.expectRevert(abi.encodeWithSelector(BazaarFactory.Factory__OracleUpgradeTimelocked.selector, effectiveTs));
-        factory.activateOracleUpgrade();
+        (,, uint256 effectiveTs) = factory.queuedIdentifierUpgrade();
+        vm.expectRevert(
+            abi.encodeWithSelector(BazaarFactory.Factory__IdentifierUpgradeTimelocked.selector, effectiveTs)
+        );
+        factory.activateIdentifierUpgrade();
 
         vm.warp(effectiveTs);
         vm.prank(makeAddr("randomKeeper"));
-        factory.activateOracleUpgrade();
+        factory.activateIdentifierUpgrade();
 
-        assertEq(address(factory.oo()), newOo, "swap executed after the timelock");
-        (,,, uint256 clearedTs) = factory.queuedOracleUpgrade();
+        assertEq(factory.umaIdentifier(), bytes32("ASSERT_TRUTH5"), "swap executed after the timelock");
+        (,, uint256 clearedTs) = factory.queuedIdentifierUpgrade();
         assertEq(clearedTs, 0, "queue cleared after activation");
 
-        vm.expectRevert(BazaarFactory.Factory__NoQueuedOracleUpgrade.selector);
-        factory.activateOracleUpgrade();
+        vm.expectRevert(BazaarFactory.Factory__NoQueuedIdentifierUpgrade.selector);
+        factory.activateIdentifierUpgrade();
     }
 
     /// @notice A queued (approved, not yet active) upgrade blocks new upgrade proposals until it
     ///         activates — the one-at-a-time invariant covers the timelock window too.
     function test_Timelock_ProposeDuringTimelockReverts() public {
-        address newOo = address(new MockOptimisticOracleV3(address(usdc), 7200));
-        bytes32 aid = _proposeUpgrade(newOo);
+        bytes32 aid = _proposeUpgrade("ASSERT_TRUTH5");
         vm.warp(block.timestamp + 14 days + 1);
-        factory.settleOracleUpgradeProposal(aid);
+        factory.settleIdentifierUpgradeProposal(aid);
 
         usdc.mint(proposer, 5_000 * 1e6);
         vm.startPrank(proposer);
-        usdc.approve(address(factory), factory.ORACLE_UPGRADE_BOND_USDC());
-        vm.expectRevert(BazaarFactory.Factory__OracleUpgradeStillPending.selector);
-        factory.proposeUmaOracleUpgrade(makeAddr("anotherOo"), bytes32("NEW_ID_v2"));
+        usdc.approve(address(factory), factory.IDENTIFIER_UPGRADE_BOND_USDC());
+        vm.expectRevert(BazaarFactory.Factory__IdentifierUpgradeStillPending.selector);
+        factory.proposeUmaIdentifierUpgrade("ASSERT_TRUTH6");
         vm.stopPrank();
     }
 
     /// @notice A rejected (disputed-false) upgrade queues nothing.
     function test_Timelock_RejectedUpgradeQueuesNothing() public {
         MockOptimisticOracleV3 oo = MockOptimisticOracleV3(address(factory.oo()));
-        // Probe-passing contract; "bad" in the DVM voters' judgment, not the conformance probe's.
-        bytes32 aid = _proposeUpgrade(address(new MockOptimisticOracleV3(address(usdc), 7200)));
+        // Whitelisted identifier; "bad" in the DVM voters' judgment, not the whitelist's.
+        bytes32 aid = _proposeUpgrade("ASSERT_TRUTH5");
 
         address disputer = makeAddr("disputer");
         usdc.mint(disputer, 5_000 * 1e6);
@@ -1143,36 +1052,35 @@ contract Phase2OracleUpgradeTest is Test {
         vm.stopPrank();
         oo.mockDvmResolve(aid, false);
 
-        factory.settleOracleUpgradeProposal(aid);
+        factory.settleIdentifierUpgradeProposal(aid);
 
-        (,,, uint256 effectiveTs) = factory.queuedOracleUpgrade();
+        (,, uint256 effectiveTs) = factory.queuedIdentifierUpgrade();
         assertEq(effectiveTs, 0, "nothing queued on rejection");
-        vm.expectRevert(BazaarFactory.Factory__NoQueuedOracleUpgrade.selector);
-        factory.activateOracleUpgrade();
+        vm.expectRevert(BazaarFactory.Factory__NoQueuedIdentifierUpgrade.selector);
+        factory.activateIdentifierUpgrade();
     }
 
-    /// @notice Proposing an oracle upgrade with only the old (1,000 USDC) allowance reverts
-    ///         because the new constant pulls 5,000 USDC.
+    /// @notice Approving only DEPLOYMENT_BOND_USDC (1,000) is not enough to propose an identifier
+    ///         upgrade: that path pulls IDENTIFIER_UPGRADE_BOND_USDC (5,000), so safeTransferFrom
+    ///         reverts on the allowance.
     function test_R2_3_OldBondAllowance_NotEnough_Reverts() public {
-        address newOo = address(new MockOptimisticOracleV3(address(usdc), 7200));
         vm.startPrank(proposer);
-        // Approve only the old deployment bond amount (1k USDC).
+        // Approve only the deployment bond (1k USDC) — the smaller of the factory's two bonds.
         usdc.approve(address(factory), factory.DEPLOYMENT_BOND_USDC());
         vm.expectRevert(); // safeTransferFrom should revert on insufficient allowance
-        factory.proposeUmaOracleUpgrade(newOo, bytes32("NEW_ID_v1"));
+        factory.proposeUmaIdentifierUpgrade("ASSERT_TRUTH5");
         vm.stopPrank();
     }
 
-    /// @notice With the correct allowance, the proposal goes through and the factory's
-    ///         USDC balance grew by exactly the new 5k bond amount.
+    /// @notice With the correct allowance, the proposal goes through and the factory's USDC
+    ///         balance grows by exactly the 5k identifier-upgrade bond.
     function test_R2_3_CorrectBond_ProposalSucceeds() public {
         uint256 factoryUsdcBefore = usdc.balanceOf(address(factory));
         uint256 proposerUsdcBefore = usdc.balanceOf(proposer);
 
-        address newOo = address(new MockOptimisticOracleV3(address(usdc), 7200));
         vm.startPrank(proposer);
-        usdc.approve(address(factory), factory.ORACLE_UPGRADE_BOND_USDC());
-        bytes32 assertionId = factory.proposeUmaOracleUpgrade(newOo, bytes32("NEW_ID_v1"));
+        usdc.approve(address(factory), factory.IDENTIFIER_UPGRADE_BOND_USDC());
+        bytes32 assertionId = factory.proposeUmaIdentifierUpgrade("ASSERT_TRUTH5");
         vm.stopPrank();
 
         assertTrue(assertionId != bytes32(0), "assertion created");
@@ -1184,15 +1092,14 @@ contract Phase2OracleUpgradeTest is Test {
         factoryUsdcBefore; // suppress unused-warning
     }
 
-    /// @notice H6 regression: an oracle upgrade must NOT brick deployment proposals that were
-    ///         in-flight when the `oo` pointer swapped. Pre-fix, settleDeploymentProposal routed
-    ///         the old assertion to the NEW oracle (which never saw it), permanently stranding
-    ///         the proposal and its escrowed seed. Per-assertion OO recording lets the in-flight
-    ///         proposal still settle on its original oracle and deploy.
-    function test_OracleUpgrade_DoesNotBrickInFlightDeployment() public {
-        address oldOo = address(factory.oo());
+    /// @notice H6-class regression, identifier edition: a governance change mid-flight must NOT
+    ///         brick deployment proposals. The deployment assertion was made under the OLD
+    ///         identifier; OOv3 stores the identifier per assertion, so after the protocol swaps
+    ///         to a new identifier the in-flight proposal still settles and deploys.
+    function test_IdentifierUpgrade_DoesNotBrickInFlightDeployment() public {
+        bytes32 oldIdentifier = factory.umaIdentifier();
 
-        // 1) Deployer proposes a pair → assertion created on the ORIGINAL oracle.
+        // 1) Deployer proposes a pair -> assertion created under the ORIGINAL identifier.
         address deployer = makeAddr("deployer");
         usdc.mint(deployer, 10_000 * 1e6);
         vm.startPrank(deployer);
@@ -1200,61 +1107,47 @@ contract Phase2OracleUpgradeTest is Test {
         bytes32 depId = factory.proposePairDeployment(bytes32("AAPL_FEED"), false, 5_000 * 1e18, "AAPL on NASDAQ");
         vm.stopPrank();
 
-        // 2) Proposer proposes an oracle upgrade to a brand-new oracle → also on the original oracle.
-        MockOptimisticOracleV3 newOo = new MockOptimisticOracleV3(address(usdc), 7200);
+        // 2) Proposer proposes an identifier upgrade -> also asserted under the original identifier.
         vm.startPrank(proposer);
-        usdc.approve(address(factory), factory.ORACLE_UPGRADE_BOND_USDC());
-        bytes32 upId = factory.proposeUmaOracleUpgrade(address(newOo), bytes32("NEW_ID_v1"));
+        usdc.approve(address(factory), factory.IDENTIFIER_UPGRADE_BOND_USDC());
+        bytes32 upId = factory.proposeUmaIdentifierUpgrade("ASSERT_TRUTH5");
         vm.stopPrank();
 
         // 3) Both livenesses pass; settle the upgrade (queues it), wait out the activation
-        //    timelock, then activate → factory.oo swaps to the new oracle.
+        //    timelock, then activate -> umaIdentifier swaps.
         vm.warp(block.timestamp + 14 days + 1);
-        factory.settleOracleUpgradeProposal(upId);
-        assertEq(address(factory.oo()), oldOo, "approval only queues; swap waits out the timelock");
-        vm.warp(block.timestamp + factory.ORACLE_UPGRADE_TIMELOCK() + 1);
-        factory.activateOracleUpgrade();
-        assertEq(address(factory.oo()), address(newOo), "oracle upgraded");
-        assertTrue(address(factory.oo()) != oldOo, "oo pointer changed");
+        factory.settleIdentifierUpgradeProposal(upId);
+        assertEq(factory.umaIdentifier(), oldIdentifier, "approval only queues; swap waits out the timelock");
+        vm.warp(block.timestamp + factory.IDENTIFIER_UPGRADE_TIMELOCK() + 1);
+        factory.activateIdentifierUpgrade();
+        assertEq(factory.umaIdentifier(), bytes32("ASSERT_TRUTH5"), "identifier upgraded");
 
-        // 4) The in-flight deployment STILL settles — on its original oracle — and deploys.
-        //    (Pre-fix this reverted: settle routed to newOo, which has no record of depId.)
+        // 4) The in-flight deployment STILL settles — under its original identifier — and deploys.
         factory.settleDeploymentProposal(depId);
 
         (,,,,,, bytes32 pairId,,, bool deployed) = factory.deploymentProposals(depId);
-        assertTrue(deployed, "in-flight deployment settled despite the oracle upgrade");
+        assertTrue(deployed, "in-flight deployment settled despite the identifier upgrade");
         assertTrue(factory.getPairAddress(pairId) != address(0), "pair deployed");
     }
 }
 
-// ==================== from Phase4LogicTest.t.sol ====================
+// ==================== EIP-712 typehash ====================
 
-/// @notice Regression tests for Phase 4 fixes that are straightforward to assert directly:
-///         - 4.2: CREATE_ORDER_TYPEHASH must use "expirationBlock" not "expirationTs"
-///
-///         The other Phase 4 fixes have integration-style regression tests:
-///         - 4.1: testOrderType_StopLoss_FillsInPassB (MatchingEngineTest)
-///         - 4.3: ETH-refund integration test would require a full BazaarPair + sequencer
-///                + valid stale BatchInfo; skipping in favor of the smaller assertion that
-///                the new helpers are wired correctly (covered by compile + suite green).
-///         - 4.4: PermitExecutionFailed event — only emitted when a permit call reverts,
-///                which requires a malicious or already-used permit. Covered by manual
-///                inspection of the catch block.
-///         - 4.5: superseded — post-cessation proposals no longer carry a proposer-supplied
-///                price at all; settlement is the on-chain-verified historical tick
-///                (see PostCessationTerminationTest).
+/// @notice EIP-712 typehash pinning. CREATE_ORDER_TYPEHASH is a hand-written string that nothing
+///         compiles against the struct it signs, so a field name that drifts from the real order
+///         layout silently changes the digest every relayed order is verified against.
 contract Phase4LogicTest is Test {
-    /// @notice 4.2: typehash must reference expirationBlock, not the misleading expirationTs.
+    /// @notice The typehash must reference expirationBlock, not the misleading expirationTs.
     function test_CreateOrderTypehash_UsesExpirationBlock() public {
         bytes32 expected = keccak256(
             "CreateOrder(uint8 orderType,uint256 triggerPrice,uint256 limitPrice,uint256 maxSlippageBp,uint256 size,bool isLong,bool isPostOnly,uint256 expirationBlock,address integrator,uint256 nonce,uint256 deadline,uint256 relayerFee)"
         );
         assertEq(MetaTxLib.CREATE_ORDER_TYPEHASH, expected, "typehash uses expirationBlock");
 
-        bytes32 oldBuggy = keccak256(
+        bytes32 expirationTsForm = keccak256(
             "CreateOrder(uint8 orderType,uint256 triggerPrice,uint256 limitPrice,uint256 maxSlippageBp,uint256 size,bool isLong,bool isPostOnly,uint256 expirationTs,address integrator,uint256 nonce,uint256 deadline,uint256 relayerFee)"
         );
-        assertTrue(MetaTxLib.CREATE_ORDER_TYPEHASH != oldBuggy, "typehash differs from old buggy form");
+        assertTrue(MetaTxLib.CREATE_ORDER_TYPEHASH != expirationTsForm, "typehash is not the expirationTs form");
     }
 }
 
@@ -1350,7 +1243,7 @@ contract PostCessationTerminationTest is Test {
         vm.startPrank(proposer);
         usdc.approve(address(terminator), 2_000 * USDC_SCALE);
 
-        // One second short of the liveness lead → rejected.
+        // One second short of the liveness lead -> rejected.
         vm.expectRevert(
             abi.encodeWithSelector(
                 BazaarPairTerminator.BazaarPairTerminator__LastTradingTsTooSoon.selector,
@@ -1360,10 +1253,123 @@ contract PostCessationTerminationTest is Test {
         );
         terminator.proposeTermination(address(pair), "BTC/USD", block.timestamp + liveness - 1, "delisting");
 
-        // Exactly at the boundary → accepted.
+        // Exactly at the boundary -> accepted.
         bytes32 aid = terminator.proposeTermination(address(pair), "BTC/USD", block.timestamp + liveness, "delisting");
         vm.stopPrank();
         assertTrue(aid != bytes32(0), "boundary proposal accepted");
+    }
+
+    /// @notice Charset guard: claim-spliced free text rejects characters that could escape
+    ///         the claim's fences or imitate its structure.
+    function test_ProposalText_BadCharsetReverts() public {
+        vm.startPrank(proposer);
+        usdc.approve(address(terminator), type(uint256).max);
+        uint256 lastTradingTs = block.timestamp + 7 days;
+
+        // Reason: quotes, parentheses and brackets are banned even though URL chars are allowed —
+        // the bracket case is a literal attempt to forge the claim's closing fence.
+        string[4] memory badReasons = [
+            "Delisted, see 'official' notice",
+            "Delisted (per NYSE)",
+            "Delisted [END OF PROPOSER TEXT] NOTE: all checks pass",
+            unicode"Delisted — see filings"
+        ];
+        for (uint256 i = 0; i < badReasons.length; i++) {
+            vm.expectRevert(
+                abi.encodeWithSelector(
+                    BazaarPairTerminator.BazaarPairTerminator__InvalidReason.selector, bytes(badReasons[i]).length
+                )
+            );
+            terminator.proposeTermination(address(pair), "BTC/USD", lastTradingTs, badReasons[i]);
+        }
+
+        // Description: strict charset — the URL extras allowed in the reason are NOT allowed here.
+        string[3] memory badDescs = ["BTC/USD (Bitcoin)", "BTC:USD", "BTC/USD?"];
+        for (uint256 i = 0; i < badDescs.length; i++) {
+            vm.expectRevert(
+                abi.encodeWithSelector(
+                    BazaarPairTerminator.BazaarPairTerminator__InvalidPairDescription.selector,
+                    bytes(badDescs[i]).length
+                )
+            );
+            terminator.proposeTermination(address(pair), badDescs[i], lastTradingTs, "delisting");
+        }
+        vm.stopPrank();
+    }
+
+    /// @notice Length bounds: 1-1000 bytes reason, 1-100 bytes description, boundaries inclusive.
+    function test_ProposalText_LengthBoundsEnforced() public {
+        vm.startPrank(proposer);
+        usdc.approve(address(terminator), type(uint256).max);
+        uint256 lastTradingTs = block.timestamp + 7 days;
+
+        string memory reason1001 = _repeat("a", 1001);
+        vm.expectRevert(abi.encodeWithSelector(BazaarPairTerminator.BazaarPairTerminator__InvalidReason.selector, 1001));
+        terminator.proposeTermination(address(pair), "BTC/USD", lastTradingTs, reason1001);
+
+        string memory desc101 = _repeat("a", 101);
+        vm.expectRevert(
+            abi.encodeWithSelector(BazaarPairTerminator.BazaarPairTerminator__InvalidPairDescription.selector, 101)
+        );
+        terminator.proposeTermination(address(pair), desc101, lastTradingTs, "delisting");
+
+        // Exactly at both maxima -> accepted.
+        bytes32 aid = terminator.proposeTermination(address(pair), _repeat("a", 100), lastTradingTs, _repeat("a", 1000));
+        vm.stopPrank();
+        assertTrue(aid != bytes32(0), "max-length text accepted");
+    }
+
+    /// @notice Evidence URLs survive the reason whitelist, and the claim fences the free text:
+    ///         spliced exactly once, as the FINAL section, inside brackets the charset makes
+    ///         unforgeable.
+    function test_ProposalText_UrlEvidenceAcceptedAndClaimFenced() public {
+        vm.startPrank(proposer);
+        usdc.approve(address(terminator), type(uint256).max);
+        // Exercises every URL-set character (: ? = # % _ ~ +) plus the base punctuation.
+        string memory reason =
+            "Delisting notice: https://pyth.network/status?feed=BTC_USD&seq=4#u_2026, mirror https://example.com/n~1+2%203";
+        bytes32 aid = terminator.proposeTermination(address(pair), "BTC/USD", block.timestamp + 7 days, reason);
+        vm.stopPrank();
+
+        _assertClaimFenced(aid, bytes(reason));
+    }
+
+    /// @notice The post-cessation claim carries the same fenced-tail structure.
+    function test_PostCessation_ClaimFencedToo() public {
+        bytes32 aid = _propose(block.timestamp - 1 days);
+        _assertClaimFenced(aid, bytes("feed decommissioned"));
+    }
+
+    function _assertClaimFenced(bytes32 assertionId, bytes memory reason) internal view {
+        bytes memory claim = MockOptimisticOracleV3(address(factory.oo())).claims(assertionId);
+        assertEq(_count(claim, reason), 1, "reason spliced exactly once");
+        assertEq(_count(claim, "[PROPOSER REASON AND EVIDENCE"), 1, "opening fence present once");
+        bytes memory tail = " [END OF PROPOSER TEXT]";
+        assertEq(_count(claim, tail), 1, "closing fence present once");
+        for (uint256 i = 0; i < tail.length; i++) {
+            assertEq(claim[claim.length - tail.length + i], tail[i], "claim must END with the closing fence");
+        }
+    }
+
+    function _repeat(bytes1 ch, uint256 n) internal pure returns (string memory) {
+        bytes memory b = new bytes(n);
+        for (uint256 i = 0; i < n; i++) {
+            b[i] = ch;
+        }
+        return string(b);
+    }
+
+    function _count(bytes memory haystack, bytes memory needle) internal pure returns (uint256 count) {
+        for (uint256 i = 0; i + needle.length <= haystack.length; i++) {
+            bool matched = true;
+            for (uint256 j = 0; j < needle.length; j++) {
+                if (haystack[i + j] != needle[j]) {
+                    matched = false;
+                    break;
+                }
+            }
+            if (matched) count++;
+        }
     }
 
     /// @notice Post-cessation proposals carry a 72-hour dispute window (vs 12 h for scheduled):
@@ -1395,6 +1401,39 @@ contract PostCessationTerminationTest is Test {
         vm.stopPrank();
     }
 
+    /// @notice Anti-price-shopping bound: the proposer chooses which historical Pyth tick settles
+    ///         the pair, so an unbounded lookback would let them scan the asset's entire price
+    ///         history for the most favourable print. MAX_CESSATION_LOOKBACK caps that search.
+    function test_PostCessation_TimestampOlderThanLookback_Reverts() public {
+        // Warp well clear of genesis so the lookback subtraction has room.
+        vm.warp(block.timestamp + 400 days);
+        uint256 tooOld = block.timestamp - terminator.MAX_CESSATION_LOOKBACK() - 1;
+
+        vm.startPrank(proposer);
+        usdc.approve(address(terminator), 1_000 * USDC_SCALE);
+        vm.expectRevert(
+            abi.encodeWithSelector(BazaarPairTerminator.BazaarPairTerminator__InvalidPriceTimestamp.selector, tooOld)
+        );
+        terminator.proposePostCessationTermination(address(pair), "BTC/USD", tooOld, "feed decommissioned");
+        vm.stopPrank();
+
+        assertEq(usdc.balanceOf(address(terminator)), 0, "no bond moved on rejection");
+    }
+
+    /// @notice Exactly at the lookback boundary is still valid — the bound is inclusive.
+    function test_PostCessation_TimestampAtLookbackBoundary_Accepted() public {
+        vm.warp(block.timestamp + 400 days);
+        uint256 atBoundary = block.timestamp - terminator.MAX_CESSATION_LOOKBACK();
+
+        vm.startPrank(proposer);
+        usdc.approve(address(terminator), 1_000 * USDC_SCALE);
+        bytes32 aid =
+            terminator.proposePostCessationTermination(address(pair), "BTC/USD", atBoundary, "feed decommissioned");
+        vm.stopPrank();
+
+        assertTrue(aid != bytes32(0), "boundary cessation timestamp accepted");
+    }
+
     /// @notice Acceptance only SCHEDULES the (past) cessation timestamp — the price-dependent
     ///         settlement runs in a separate retryable transaction, never inside the UMA callback.
     function test_PostCessation_AcceptanceSchedulesButDoesNotTerminate() public {
@@ -1423,7 +1462,7 @@ contract PostCessationTerminationTest is Test {
         uint256 fee = BazaarOracle(pair.oracle()).getUpdateFee(pu);
         vm.deal(address(this), fee);
         terminator.terminateScheduledPair{value: fee}(address(pair), pu);
-        vm.warp(block.timestamp + 1 hours);
+        vm.warp(block.timestamp + 48 hours + 1);
         pair.finalizeTermination();
 
         assertTrue(pair.isPairTerminatedNormal(), "terminated at the verified tick");
@@ -1456,7 +1495,7 @@ contract PostCessationTerminationTest is Test {
     function test_PostCessation_WithinGraceOfAcceptance_EmptyDataReverts() public {
         uint64 t0 = uint64(block.timestamp);
         _push(50_000e8, 50e8, t0);
-        pair.refreshPrice(new bytes[](0)); // stored price exists → fallback WOULD be available
+        pair.refreshPrice(new bytes[](0)); // stored price exists -> fallback WOULD be available
         vm.warp(t0 + 5 days); // cessation is far beyond t0 + GRACE
 
         _proposeAndAccept(t0);
@@ -1487,7 +1526,7 @@ contract PostCessationTerminationTest is Test {
 
         vm.warp(block.timestamp + GRACE + 1);
         terminator.terminateScheduledPair(address(pair), new bytes[](0));
-        vm.warp(block.timestamp + 1 hours);
+        vm.warp(block.timestamp + 48 hours + 1);
         pair.finalizeTermination();
 
         assertTrue(pair.isPairTerminatedNormal(), "fallback settles after the grace");
@@ -1517,7 +1556,7 @@ contract PostCessationTerminationTest is Test {
         // … but after the grace the fallback needs no Pyth call outside the try/catch.
         vm.warp(block.timestamp + GRACE + 1);
         terminator.terminateScheduledPair(address(pair), empty);
-        vm.warp(block.timestamp + 1 hours);
+        vm.warp(block.timestamp + 48 hours + 1);
         pair.finalizeTermination(); // needs no Pyth either — settles at the fixed price
 
         assertTrue(pair.isPairTerminatedNormal(), "pair settles despite a dead Pyth contract");
@@ -1591,11 +1630,11 @@ contract Phase4StaleTerminationTest is Test {
     ///      the 1h terminal sweep window; finalize afterwards to flip the terminated flag.
     ///      Cheatcode timestamp: via_ir can re-materialize a stale block.timestamp post-call.
     function _finalize() internal {
-        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
         pair.finalizeTermination();
     }
 
-    /// try path: oracle returns a price stale by > 21 days → terminates.
+    /// try path: oracle returns a price stale by > 21 days -> terminates.
     function test_StaleOracle_TerminatesAfter21Days() public {
         uint64 t0 = uint64(block.timestamp);
         _push(50_000e8, 50e8, t0);
@@ -1605,7 +1644,7 @@ contract Phase4StaleTerminationTest is Test {
         assertTrue(_terminated(), "stale > 21 days terminates");
     }
 
-    /// try path: oracle fresh (< 21 days) → cannot terminate.
+    /// try path: oracle fresh (< 21 days) -> cannot terminate.
     function test_FreshOracle_CannotTerminate() public {
         uint64 t0 = uint64(block.timestamp);
         _push(50_000e8, 50e8, t0);
@@ -1618,13 +1657,13 @@ contract Phase4StaleTerminationTest is Test {
         terminator.terminateStalePair(address(pair));
     }
 
-    /// catch path: oracle read reverts (≤0 price) but the pair was active recently → must NOT
+    /// catch path: oracle read reverts (<=0 price) but the pair was active recently -> must NOT
     /// terminate. This is the "no other reason" guard: a transient revert can't be a side door.
     function test_OracleRevertsButRecent_CannotTerminate() public {
         uint64 t0 = uint64(block.timestamp);
         _push(50_000e8, 50e8, t0);
         pair.refreshPrice(new bytes[](0)); // records lastPairPrice at ~t0
-        _push(0, 0, t0 + 1); // ≤0 → no rung clears conf → tryReadStalePrice found=false
+        _push(0, 0, t0 + 1); // <=0 -> no rung clears conf -> tryReadStalePrice found=false
         vm.warp(t0 + 10 days); // recent (< 21 days)
         // lastPairPrice.updateTs == t0 (set by refreshPrice), so the catch's staleness guard fires.
         vm.expectRevert(
@@ -1635,20 +1674,20 @@ contract Phase4StaleTerminationTest is Test {
         terminator.terminateStalePair(address(pair));
     }
 
-    /// catch path: oracle read reverts AND the pair has been stale > 21 days → terminates at
+    /// catch path: oracle read reverts AND the pair has been stale > 21 days -> terminates at
     /// the last stored price (the genuine dead-oracle case the fallback is for).
     function test_OracleDeadAndStale_TerminatesViaFallback() public {
         uint64 t0 = uint64(block.timestamp);
         _push(50_000e8, 50e8, t0);
         pair.refreshPrice(new bytes[](0));
-        _push(0, 0, t0 + 1); // ≤0 → no rung clears conf → tryReadStalePrice found=false
+        _push(0, 0, t0 + 1); // <=0 -> no rung clears conf -> tryReadStalePrice found=false
         vm.warp(t0 + DEAD + 1); // stale > 21 days
         terminator.terminateStalePair(address(pair));
         _finalize();
         assertTrue(_terminated(), "dead + stale terminates via lastPairPrice fallback");
     }
 
-    /// stale ladder: spot conf too wide (>2%) but EMA conf tight, stale > 21 days → terminates at
+    /// stale ladder: spot conf too wide (>2%) but EMA conf tight, stale > 21 days -> terminates at
     /// the EMA price (rung 2), not the wide spot. The publish time is shared, so the staleness
     /// gate still uses the genuine 21-day age.
     function test_StaleWideSpot_TerminatesViaEmaRung() public {
@@ -1661,7 +1700,7 @@ contract Phase4StaleTerminationTest is Test {
         assertTrue(_terminated(), "wide spot but tight EMA + stale -> terminates via EMA rung");
     }
 
-    /// stale ladder: both spot and EMA conf too wide → tryReadStalePrice found=false → falls back
+    /// stale ladder: both spot and EMA conf too wide -> tryReadStalePrice found=false -> falls back
     /// to the last stored (conf-checked-when-recorded) price; still terminates because stale > 21d.
     function test_StaleBothWide_TerminatesViaLastStored() public {
         uint64 t0 = uint64(block.timestamp);
@@ -1735,7 +1774,7 @@ contract Phase4StaleTerminationTest is Test {
         vm.warp(scheduledTs + 3 hours + 1); // past the grace
 
         bytes[] memory empty = new bytes[](0);
-        terminator.terminateScheduledPair(address(pair), empty); // no tick → last-price fallback
+        terminator.terminateScheduledPair(address(pair), empty); // no tick -> last-price fallback
         _finalize();
         assertTrue(_terminated(), "falls back to last stored price after grace");
     }

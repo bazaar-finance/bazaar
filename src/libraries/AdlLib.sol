@@ -127,11 +127,11 @@ library AdlLib {
     }
 
     /// @dev Collateral used for ADL RANKING only: deposits epoch-tagged to the CURRENT window
-    ///      are subtracted (floored at 1 wei), so the score reflects the book as of the window's
-    ///      start — a mid-auction top-up cannot re-rank the queue. Settlement and liquidation
-    ///      protection use real collateral; only queue position is frozen. A tag from an older
-    ///      window fails the epoch check and subtracts nothing (lazy invalidation — those
-    ///      deposits are ordinary standing collateral by now).
+    ///      are subtracted, so the score reflects the book as of the window's start — a
+    ///      mid-auction top-up cannot re-rank the queue. Settlement and liquidation protection
+    ///      use real collateral; only queue position is frozen. A tag from an older window fails
+    ///      the epoch check and subtracts nothing (lazy invalidation — those deposits are
+    ///      ordinary standing collateral by now).
     function _scoreCollateral(
         uint256 effectiveCollateral,
         address user,
@@ -139,16 +139,22 @@ library AdlLib {
         mapping(address => uint64) storage adlDepositEpoch,
         mapping(address => uint256) storage adlWindowDeposits
     ) private view returns (uint256) {
-        uint256 base = effectiveCollateral;
-        if (adlDepositEpoch[user] == adlEpoch) {
-            uint256 wd = adlWindowDeposits[user];
-            base = base > wd ? base - wd : 0;
-        }
-        // Floor at 1 wei — a zero-(pre-window-)collateral winner is a pure-profit claim and
-        // ranks effectively infinite, FRONT of the queue. (Also the div-by-zero guard: the old
-        // `continue` skip here made withdraw-everything winners ADL-IMMUNE — the exact accounts
-        // ADL most needs to close. Settlement is unaffected: their credit is totalPnl on their
-        // real, possibly zero, collateral.)
+        uint256 wd = adlDepositEpoch[user] == adlEpoch ? adlWindowDeposits[user] : 0;
+        return _scoreCollateral(effectiveCollateral, wd);
+    }
+
+    /// @notice Ranking-collateral core: window deposit subtracted, floored at 1 wei. Shared with
+    ///         BazaarPairLens so off-chain score previews use the exact on-chain arithmetic.
+    /// @dev The 1-wei floor makes a zero-(pre-window-)collateral winner a pure-profit claim that
+    ///      ranks effectively infinite, FRONT of the queue. It doubles as the div-by-zero guard
+    ///      for the score; skipping such accounts instead would make withdraw-everything winners
+    ///      ADL-immune, the exact accounts ADL most needs to close. Settlement is unaffected:
+    ///      their credit is totalPnl on their real, possibly zero, collateral.
+    /// @param effectiveCollateral The bucket's collateral at the ranking snapshot
+    /// @param windowDeposit The already-epoch-checked deposit tagged to the current ADL window
+    /// @return The collateral denominator used in the ADL score
+    function _scoreCollateral(uint256 effectiveCollateral, uint256 windowDeposit) internal pure returns (uint256) {
+        uint256 base = effectiveCollateral > windowDeposit ? effectiveCollateral - windowDeposit : 0;
         return base == 0 ? 1 : base;
     }
 
@@ -237,8 +243,12 @@ library AdlLib {
         for (uint256 i = 0; i < winners.length; i++) {
             if (totalClosed >= requiredSize) break;
 
-            // Every 3 winners closed, check if vault is healthy again
-            if (closedCount > 0 && closedCount % 3 == 0) {
+            // Before every close after the first, stop if the book has already healed: each close
+            // shrinks the pendingLiq exposure (decremented at the bottom of this loop), so health
+            // can be restored mid-batch and any further close would deleverage a winner for
+            // nothing. The first close needs no check — executeAdl's entry health gate just
+            // confirmed the vault unhealthy at the live price.
+            if (closedCount > 0) {
                 VaultHealthLib.LiqExposureResult memory healthResult = VaultHealthLib.checkLiqExposure(
                     pairVault,
                     params.currentPrice,

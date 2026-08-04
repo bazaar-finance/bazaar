@@ -16,7 +16,7 @@ contract ContractSizeTest is Test {
 
     /// @dev Artifact ids for everything DeployBazaar/DeployLibraries put on chain.
     ///      New deployable contract or external library => add it here.
-    function _deployableArtifacts() internal pure returns (string[15] memory a) {
+    function _deployableArtifacts() internal pure returns (string[16] memory a) {
         a = [
             // Core contracts
             "BazaarFactory.sol:BazaarFactory",
@@ -32,6 +32,7 @@ contract ContractSizeTest is Test {
             "InsuranceVaultLib.sol:InsuranceVaultLib",
             "LiquidationLib.sol:LiquidationLib",
             "MatchingEngineLib.sol:MatchingEngineLib",
+            "MetaTxLib.sol:MetaTxLib",
             "OrderManagementLib.sol:OrderManagementLib",
             "RiskParamsLib.sol:RiskParamsLib",
             "TerminationLib.sol:TerminationLib"
@@ -39,7 +40,7 @@ contract ContractSizeTest is Test {
     }
 
     function test_deployableContractsFitEip170() public view {
-        string[15] memory artifacts = _deployableArtifacts();
+        string[16] memory artifacts = _deployableArtifacts();
         for (uint256 i = 0; i < artifacts.length; ++i) {
             uint256 size = vm.getDeployedCode(artifacts[i]).length;
             assertLe(size, EIP170_RUNTIME_LIMIT, artifacts[i]);

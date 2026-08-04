@@ -31,6 +31,6 @@ The vault is not a market maker — it exits as fast as the book allows:
 - **Opposite-side netting** (above).
 - **[Auto-deleveraging](adl.md)** when the book can't absorb it and the fund is threatened.
 
-Vault PnL from these exits is booked as an insurance↔deposits transfer (profits refill the fund; losses drain it, overrun becoming `deficit` — realized bad debt that [terminates the pair](termination.md)).
+Vault PnL from these exits is booked as an insurance↔deposits transfer (profits refill the fund; losses drain it, overrun becoming `deficit` — realized bad debt that [winds the pair down](termination.md)). Note that once a pair's settlement price is fixed, this live liquidation path is off: positions are marked to the frozen price by permissionless settlement instead.
 
 Every liquidation fill also feeds the **liquidation-gap EMA** — the realized distance between exit price and bankruptcy price — which raises IMR in markets that liquidate badly and sizes the insurance-fund target. Bad liquidations make the market automatically more conservative.

@@ -91,7 +91,8 @@ contract RelayerFeeSolvencyTest is IntegrationBase {
         // The fee left the contract as real USDC.
         assertEq(usdcBefore - _pairUsdc(), fee / 1e12, "fee left the contract as USDC");
         assertEq(usdc.balanceOf(relayer), fee / 1e12, "relayer received the fee");
-        // D dropped by exactly the fee (the bug left D unchanged).
+        // D dropped by exactly the fee: leaving D unchanged would hold the ledger above the USDC
+        // actually left in the contract.
         assertEq(dBefore - _totalDeposited(), fee, "D decremented by the fee");
         // The ledger delta matches the USDC delta, so the invariant is preserved.
         assertEq((ledgerBefore - _ledgerBaz()) / 1e12, usdcBefore - _pairUsdc(), "ledger delta == USDC delta");

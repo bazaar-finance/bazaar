@@ -124,8 +124,8 @@ library BucketLib {
     }
 
     /// @notice Emits the PositionBucketUpdated event for off-chain indexers.
-    /// @dev Replaces the prior `recordCheckpoint` — bucket-state checkpoints are no longer
-    ///      recorded since the omission challenge no longer needs solvency proofs.
+    /// @dev Emit-only: no bucket-state checkpoint is written on-chain, because omission challenges
+    ///      do not require solvency proofs (see BazaarSequencer.challengeOmission).
     function emitBucketUpdate(
         address user,
         BazaarTypes.PositionBucket storage bucket,

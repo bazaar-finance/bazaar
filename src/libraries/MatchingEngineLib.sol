@@ -24,9 +24,9 @@ library MatchingEngineLib {
     using EnumerableSet for EnumerableSet.UintSet;
 
     // -------------------- Errors --------------------
-    // NOTE (measured 2026-07-21): trimming this error's args, like trimming PositionModified's
-    // duplicate fields, made the library BIGGER under via_ir (inlining-decision shift): args
-    // dropped at 4 sites = +26B, event fields = +83B. Don't "simplify" these for size.
+    // Do not trim these error args (or PositionModified's duplicate fields) to save code size:
+    // under via_ir it shifts inlining decisions and makes the library BIGGER, not smaller.
+    // Re-measure with `forge build --sizes` before any such change.
     error MatchingEngineLib__OrderCreatedAfterObservation(
         uint256 orderId, uint64 creationBlock, uint64 observationBlock
     );
@@ -477,7 +477,17 @@ library MatchingEngineLib {
         WalkState memory ws,
         BazaarTypes.MatchContext memory ctx
     ) private view returns (bool) {
-        if (h.loaded) return true;
+        // A cached head can be canceled mid-batch by the TP/SL fence: _cancelOversizedTpSl runs
+        // deep inside a fill and cannot reach WalkState, so it cancels in STORAGE while this
+        // memory copy still reads as valid. Re-check the one field that can change under us. On a
+        // hit, drop the cache and fall through — the fresh read below re-loads the same id (the
+        // pointer only advances when a head is consumed), passes the sort check against its own
+        // watermark, and hits the race-skip, which advances the pointer and returns false exactly
+        // as if the order had arrived canceled. Without this, a canceled order can still be filled.
+        if (h.loaded) {
+            if (orders[h.orderId].canceledBlock == 0) return true;
+            h.loaded = false;
+        }
 
         uint256 id = ids[ws.iLimitLong];
         BazaarTypes.Order memory o = orders[id];
@@ -536,7 +546,12 @@ library MatchingEngineLib {
         WalkState memory ws,
         BazaarTypes.MatchContext memory ctx
     ) private view returns (bool) {
-        if (h.loaded) return true;
+        // See _loadHeadLongLimit: revalidate the cached head against storage — the TP/SL fence can
+        // cancel it mid-batch without being able to invalidate this memory copy.
+        if (h.loaded) {
+            if (orders[h.orderId].canceledBlock == 0) return true;
+            h.loaded = false;
+        }
 
         uint256 id = ids[ws.jLimitShort];
         BazaarTypes.Order memory o = orders[id];
@@ -591,7 +606,13 @@ library MatchingEngineLib {
         WalkState memory ws,
         BazaarTypes.MatchContext memory ctx
     ) private view returns (bool) {
-        if (h.loaded) return true;
+        // See _loadHeadLongLimit: the TP/SL fence cancels STOP-LOSS orders too, and those are
+        // oracle-derived so they live in the market lists. Market heads persist across iterations
+        // within a pass, so the same stale-cache window exists here.
+        if (h.loaded) {
+            if (orders[h.orderId].canceledBlock == 0) return true;
+            h.loaded = false;
+        }
 
         uint256 id = ids[ws.iMarketLong];
         BazaarTypes.Order memory o = orders[id];
@@ -646,7 +667,11 @@ library MatchingEngineLib {
         WalkState memory ws,
         BazaarTypes.MatchContext memory ctx
     ) private view returns (bool) {
-        if (h.loaded) return true;
+        // See _loadHeadLongMarket: same stale-cache window for canceled stop-losses.
+        if (h.loaded) {
+            if (orders[h.orderId].canceledBlock == 0) return true;
+            h.loaded = false;
+        }
 
         uint256 id = ids[ws.jMarketShort];
         BazaarTypes.Order memory o = orders[id];
@@ -1061,20 +1086,29 @@ library MatchingEngineLib {
             fillNotional = Math.mulDiv(fillSize, fillPrice, BazaarTypes.BAZAAR_SCALE);
         }
         if (ctx.isOracleStale) {
-            uint256 maxPrice =
-                ctx.cachedPrice * (BazaarTypes.BP_SCALE + BazaarTypes.MAX_STALE_DEVIATION_BP) / BazaarTypes.BP_SCALE;
-            uint256 minPrice =
-                ctx.cachedPrice * (BazaarTypes.BP_SCALE - BazaarTypes.MAX_STALE_DEVIATION_BP) / BazaarTypes.BP_SCALE;
-            if (fillPrice > maxPrice || fillPrice < minPrice) {
-                // Both orders are legitimately skipped for this batch because executing them
-                // would breach the stale price band. Record both in staleSkippedIds so the
-                // omission challenge sees a legitimate skip and rejects (symmetric with the
-                // stale-IMR skip path below) — otherwise a band-voided order looks like an
-                // un-recorded omission and a self-challenge can slash the honest sequencer.
-                _pushStaleSkipped(result, longHead.orderId);
-                _pushStaleSkipped(result, shortHead.orderId);
-                longHead.remaining = 0;
-                shortHead.remaining = 0;
+            if (
+                fillPrice
+                        > ctx.cachedPrice * (BazaarTypes.BP_SCALE + BazaarTypes.MAX_STALE_DEVIATION_BP)
+                            / BazaarTypes.BP_SCALE
+                    || fillPrice
+                        < ctx.cachedPrice * (BazaarTypes.BP_SCALE - BazaarTypes.MAX_STALE_DEVIATION_BP)
+                            / BazaarTypes.BP_SCALE
+            ) {
+                // Only the MAKER breaches the band: fillPrice IS the maker's effective price by
+                // construction (Pass B: the limit side; Pass C: the older orderId). Retire that
+                // leg alone — recorded in staleSkippedIds so challengeOmission sees a legitimate
+                // skip and rejects, symmetric with the stale-IMR path below.
+                //
+                // The counterparty stays LIVE and retries against the next order on the maker's
+                // side (each pass advances its two sides independently on remaining == 0). It
+                // needs no staleSkippedIds entry of its own: the walk never advances past it, so
+                // no worse-priced same-side order can match ahead of it and it can never look
+                // omitted to _isInRange. Recording both legs is not an option anyway —
+                // staleSkippedIds is preallocated to totalIds, so pushing 2 ids while retiring
+                // 1 order per hit can overrun it.
+                Head memory oob = p.makerIsLong ? longHead : shortHead;
+                _pushStaleSkipped(result, oob.orderId);
+                oob.remaining = 0;
                 return true;
             }
         }
@@ -1276,8 +1310,6 @@ library MatchingEngineLib {
         uint256 fillSize,
         uint256 fillPrice
     ) private {
-        // (No separate OrdersMatched event: the two OrderFilled emits carry every field it did,
-        //  with the maker/taker labeling in isMaker — EIP-170 headroom for this library.)
         emit BazaarTypes.OrderFilled(
             ctx.pairId,
             longHead.orderId,
@@ -1501,8 +1533,6 @@ library MatchingEngineLib {
     // MARGIN + APPLY FILL
     // ================================================================
 
-    /// @dev Margin check with explicit imrBp (no internal stale branch — caller passes effective imrBp).
-    ///      Uses MMR for risk-reducing fills (existing behavior preserved).
     /// @notice Margin gate for a candidate fill. Classifies the trade by SIZE (open / add / close /
     ///         flip), realizes PnL on closing portions, and applies a one-sided incipient-loss debit
     ///         on fresh exposure. Returns false (caller auto-cancels or stale-skips) on any of:
@@ -1510,6 +1540,8 @@ library MatchingEngineLib {
     ///           - close/flip: realized loss exceeds collateral (would create bad debt)
     ///           - partial close: post-realization collateral < MMR on the remainder
     ///           - flip: post-close collateral < IMR on residual
+    /// @dev The caller passes the effective imrBp — there is no stale branch inside. Risk-reducing
+    ///      fills are judged against MMR rather than IMR.
     function _checkMargin(
         BazaarTypes.PositionBucket memory bucket,
         BazaarTypes.BucketState memory state,

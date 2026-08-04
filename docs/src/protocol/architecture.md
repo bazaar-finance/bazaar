@@ -28,9 +28,11 @@ One `BazaarPair` clone = one market. Each clone holds its own order book, positi
 
 `BazaarPair` would blow past the EIP-170 24 KB limit many times over, so the logic is split three ways:
 
-- **External DELEGATECALL libraries** — deployed once, linked by address, and executed in the pair's storage context: `MatchingEngineLib`, `OrderManagementLib`, `CollateralLib`, `LiquidationLib`, `AdlLib`, `InsuranceVaultLib`, `RiskParamsLib`, `FundingLib`, `TerminationLib`. Their bytecode does not count toward the pair's limit.
-- **Inlined internal libraries** — small, hot helpers compiled into callers: `BazaarTypes` (structs/constants), `BucketLib` (solvency math), `VaultHealthLib` (ADL/termination triggers), `MmrSampleLib` (lagged-MMR ring buffer), `BazaarMathLib` (fixed-point + effective prices), `MetaTxLib` (EIP-712).
+- **External DELEGATECALL libraries** — deployed once, linked by address, and executed in the pair's storage context: `MatchingEngineLib`, `OrderManagementLib`, `CollateralLib`, `LiquidationLib`, `AdlLib`, `InsuranceVaultLib`, `RiskParamsLib`, `FundingLib`, `TerminationLib`, `MetaTxLib`. Their bytecode does not count toward the pair's limit. All ten carry link references in `BazaarPair` and must be deployed on the target chain and passed as `--libraries` flags before it can be deployed — see [Self-Deployment](../guide/deployment.md).
+- **Inlined internal libraries** — small, hot helpers compiled into callers: `BazaarTypes` (structs/constants), `BucketLib` (solvency math), `VaultHealthLib` (ADL/termination triggers), `MmrSampleLib` (lagged-MMR ring buffer), `BazaarMathLib` (fixed-point + effective prices).
 - **`BazaarPairLens`** — computed views (solvency checks, share prices, ADL thresholds, EIP-712 constants) that never needed to be in the pair.
+
+Even split three ways the budget is tight: `BazaarPair` and `MatchingEngineLib` both exceed EIP-170 at the repo's default `optimizer_runs = 220`, so `foundry.toml` compiles that import chain at 150 runs instead (solc treats it as one unit, so restricting the library pulls the pair and factory down with it). The gas cost is modest — `matchBatch` is storage-dominated, where optimizer runs matter least. The limits are enforced as a test (`test/unit/ContractSizeTest.t.sol`, production contracts only) rather than via `forge build --sizes`, whose gate would also fail on test-only harnesses.
 
 ## Units & conventions
 

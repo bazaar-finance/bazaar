@@ -12,14 +12,57 @@ import {BazaarPairTerminator} from "../src/BazaarPairTerminator.sol";
 import {HelperConfig} from "./HelperConfig.s.sol";
 
 /// @notice Step 2: Deploy core Bazaar contracts.
-///         Requires external libraries to be deployed first (see DeployLibraries.s.sol)
-///         and their addresses configured in foundry.toml [profile.default.libraries].
+///         Requires external libraries to be deployed first (see DeployLibraries.s.sol); their
+///         `--libraries` flags come from `deployments/<chainid>/libraries.args`, which the Makefile
+///         targets splat onto the forge command line.
 contract DeployBazaar is Script {
+    /// @dev The Makefile's live-network targets set `EXPECTED_CHAIN_ID` to the chain the deploy is
+    ///      meant for, and `_assertExpectedChain` refuses to run anywhere else.
+    ///
+    ///      The guard exists because the library link flags are chosen by the make target, not by
+    ///      the chain the RPC actually serves: `deploy-arb-mainnet` always splats
+    ///      `deployments/42161/libraries.args`. If `ARBITRUM_MAINNET_RPC_URL` resolves to a
+    ///      different chain, those addresses hold no code there — and DELEGATECALL into an
+    ///      account with no code succeeds and returns empty data rather than reverting. The
+    ///      factory would deploy cleanly, pass its own wiring checks, and every call routed
+    ///      through a linked library would silently do nothing. Nothing downstream detects that,
+    ///      so the chain has to be pinned before the first broadcast.
+    ///
+    ///      Left unset for anvil, dry runs and the test suite, where the check is skipped.
+    function _assertExpectedChain() internal view {
+        uint256 expected = vm.envOr("EXPECTED_CHAIN_ID", uint256(0));
+        if (expected == 0) return;
+        require(
+            block.chainid == expected,
+            string.concat(
+                "Chain id mismatch: EXPECTED_CHAIN_ID=",
+                vm.toString(expected),
+                " but the RPC serves chain ",
+                vm.toString(block.chainid),
+                " -- the linked library addresses do not exist on that chain."
+            )
+        );
+    }
+
+    /// @dev The genesis UMA identifier. The factory constructor validates it against UMA's LIVE
+    ///      IdentifierWhitelist and reverts if absent — so a wrong value fails at deploy time, not
+    ///      as a bricked protocol later. Mock networks accept any identifier (mock whitelist
+    ///      defaults to supported).
+    ///
+    ///      "ASSERT_TRUTH2" is the live identifier for OOv3 truth assertions on both Arbitrum and
+    ///      mainnet. OOv3's own `defaultIdentifier` constant ("ASSERT_TRUTH") is NOT whitelisted —
+    ///      UMA deprecated the original and whitelisted the successor on the same oracle
+    ///      deployment. That is why the identifier is a governed, whitelist-validated parameter
+    ///      here rather than derived from `oo.defaultIdentifier()`, which points at the dead one.
+    bytes32 public constant UMA_IDENTIFIER = "ASSERT_TRUTH2";
+
     function run() external returns (BazaarFactory factory, HelperConfig helperConfig) {
         return deploy(address(0));
     }
 
     function deploy(address bugBountyAddress) public returns (BazaarFactory factory, HelperConfig helperConfig) {
+        _assertExpectedChain();
+
         helperConfig = new HelperConfig();
         (address pythFeed, address usdcContract, address optimisticOracleV3, string memory networkName) =
             helperConfig.activeNetworkConfig();
@@ -70,7 +113,8 @@ contract DeployBazaar is Script {
             optimisticOracleV3,
             address(pairImplementation),
             address(sequencer),
-            address(pairTerminator)
+            address(pairTerminator),
+            UMA_IDENTIFIER
         );
         require(address(factory) == predictedFactory, "Factory address prediction mismatch");
         console.log("BazaarFactory:           ", address(factory));

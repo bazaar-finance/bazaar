@@ -5,7 +5,8 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 /// @notice An ERC20 that returns `false` on transfer / transferFrom instead of reverting,
 ///         simulating non-standard tokens that the unsafe `(bool ok,) = address(token).call(...)`
-///         pattern would treat as success. Used to regress the Phase 1 SafeERC20 migration.
+///         pattern would treat as success. Lets a test assert that a silent failure surfaces as a
+///         revert instead of being booked as a completed transfer.
 contract MockUSDCSilentFail is ERC20 {
     bool public failTransfer;
     bool public failTransferFrom;

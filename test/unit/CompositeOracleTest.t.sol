@@ -139,9 +139,10 @@ contract CompositeOracleTest is Test {
     }
 
     // ============ tryReadStalePrice bracket math (spot rung) ============
-    // These exercise the same _composeUnsafe bracket math the stale path relies on. Confidence is
-    // tight on every leg, so rung 1 (spot) is selected and `found` is always true. (They formerly
-    // covered readUnsafePrice, which was removed once terminateStalePair switched to this path.)
+    // These exercise the same _composeUnsafe bracket math the stale path relies on, reached through
+    // tryReadStalePrice because that is the only entry point into it — the stale terminator and the
+    // pair both go through it. Confidence is tight on every leg, so rung 1 (spot) is selected and
+    // `found` is always true.
 
     function test_TryReadStale_DividePath() public {
         // 3000 JPY stock, USD/JPY = 150 (inverted) => $20
@@ -362,8 +363,8 @@ contract CompositeOracleTest is Test {
         assertEq(spot, 20e18);
     }
 
-    /// @notice Two legs at 1.2% each pass the per-leg checks but compose to ~2.43% total —
-    ///         the composed-bracket cap rejects what per-leg-only enforcement used to allow.
+    /// @notice Two legs at 1.2% each pass the per-leg checks but compose to ~2.43% total. Per-leg
+    ///         enforcement alone would admit this, so the cap is applied to the composed bracket.
     function test_ComposedCap_EvenSplitOverBudget_Reverts() public {
         bytes32 compositeId = _registerJpyComposite();
         // base conf 36e8 = 1.2% of 3000e8; quote conf 1.8e8 = 1.2% of 150e8.
@@ -507,7 +508,8 @@ contract CompositeFactoryTest is Test {
             )
         );
         assertTrue(_contains(claim, "Base feed ID"));
-        // The old carve-out explicitly allowing leveraged assets must be gone
+        // Leveraged assets get no blanket carve-out: naming them as eligible would contradict the
+        // 1:1-tracker exception above, which turns on whether the underlying has its own Pyth feed.
         assertFalse(_contains(claim, "(e.g. leveraged assets)"));
     }
 

@@ -9,7 +9,7 @@ import {BucketLib} from "../../src/libraries/BucketLib.sol";
 import {MatchingEngineLib} from "../../src/libraries/MatchingEngineLib.sol";
 import {MmrSampleLib} from "../../src/libraries/MmrSampleLib.sol";
 
-// ==================== from CheckMarginHarness.sol ====================
+// ==================== checkMargin harness ====================
 
 /// @notice Thin wrapper exposing MatchingEngineLib._checkMargin for direct unit testing.
 ///         Each branch (open, add, partial close, full close, flip) and the bad-debt /
@@ -33,7 +33,7 @@ contract CheckMarginHarness {
     }
 }
 
-// ==================== from CheckMarginTest.t.sol ====================
+// ==================== checkMargin ====================
 
 /// @notice Unit tests for MatchingEngineLib._checkMargin via CheckMarginHarness.
 ///         Exercises the four classification branches (open / same-side add / close /
@@ -239,7 +239,7 @@ contract CheckMarginTest is Test {
     function testCheckMargin_FullClose_FundingDebtCreatesBadDebt_Rejected() public {
         // Long 1 @ $100 entry, $5 collateral, sells 1 @ $100 (price PnL = 0).
         // Funding owed = $10 > $5 collateral → bad debt → reject (must liquidate).
-        // Pre-fix the gate ignored funding and admitted this fill.
+        // A gate that looked at price PnL alone would admit this fill.
         (BazaarTypes.PositionBucket memory bucket, BazaarTypes.BucketState memory state) =
             _existingBucket(true, 1 * SCALE, 100 * SCALE, 5 * SCALE, ORACLE);
         state.fundingPnl = -10 * int256(SCALE);
@@ -250,7 +250,7 @@ contract CheckMarginTest is Test {
     function testCheckMargin_FullClose_FundingCreditRescuesPriceLoss_Passes() public {
         // Long 1 @ $100 entry, $5 collateral, sells 1 @ $90: price loss $10 > collateral,
         // but $10 of funding is owed TO the trader → combined post-fill = +$5 → passes.
-        // Pre-fix the gate saw only the price loss and rejected a solvent close.
+        // A gate that saw only the price loss would reject a solvent close.
         (BazaarTypes.PositionBucket memory bucket, BazaarTypes.BucketState memory state) =
             _existingBucket(true, 1 * SCALE, 100 * SCALE, 5 * SCALE, ORACLE);
         state.fundingPnl = 10 * int256(SCALE);
@@ -317,7 +317,7 @@ contract CheckMarginTest is Test {
     }
 }
 
-// ==================== from MmrLagTest.t.sol ====================
+// ==================== lagged MMR ====================
 
 /// @notice Exposes MmrSampleLib over a real storage ring buffer for unit testing.
 contract MmrSampleHarness {
@@ -532,7 +532,7 @@ contract MmrLagTest is Test {
     }
 }
 
-// ==================== from FundingIndexTest.t.sol ====================
+// ==================== funding index ====================
 
 /// @notice Harness exposing BazaarPair's internal funding-index machinery so accrual
 ///         can be driven with controlled mark/index prices and timestamps.
@@ -551,10 +551,9 @@ contract FundingIndexHarness is BazaarPair {
     }
 }
 
-/// @notice Regression tests for price-aware funding. The index must accumulate
-///         rate × indexPrice (price units) so that BucketLib's Δindex × size / 1e18
-///         charges funding on notional, not on raw size. Guards against the bug where
-///         a dimensionless index made funding ~price× too weak for assets above $1.
+/// @notice Price-aware funding. The index must accumulate rate × indexPrice (price units) so
+///         that BucketLib's Δindex × size / 1e18 charges funding on notional, not on raw size.
+///         A dimensionless index would make funding ~price× too weak for every asset above $1.
 contract FundingIndexTest is Test {
     uint256 internal constant SCALE = 1e18;
     uint256 internal constant T0 = 1_000_000;
@@ -704,7 +703,8 @@ contract ApplyFillHarness {
 
 /// @notice Funding must cash-settle into collateral when shares close via matching — proportional
 ///         on partial close, in full on close/flip, exactly once per share, with the remainder's
-///         entry index untouched. Pre-fix, funding was silently dropped on every match-driven close.
+///         entry index untouched. Settling price PnL alone here would silently drop funding on
+///         every match-driven close.
 contract ApplyFillFundingTest is Test {
     uint256 internal constant SCALE = 1e18;
     address internal alice = address(0xA11CE);
@@ -717,7 +717,7 @@ contract ApplyFillFundingTest is Test {
 
     function test_fullClose_longPaysFunding() public {
         // Long 1 @ $100 entry, $20 collateral. Index delta +2 → long owes $2.
-        // Close 1 @ $110: collateral = 20 + 10 (price) − 2 (funding) = 28. (Pre-fix: 30.)
+        // Close 1 @ $110: collateral = 20 + 10 (price) − 2 (funding) = 28. (Price alone: 30.)
         h.setBucket(alice, true, 1 * SCALE, 100 * SCALE, 20 * SCALE, 0);
         h.applyFill(alice, false, 1 * SCALE, 110 * SCALE, 110 * SCALE, int256(2 * SCALE));
 
@@ -728,7 +728,7 @@ contract ApplyFillFundingTest is Test {
 
     function test_fullClose_shortReceivesFunding() public {
         // Short 1 @ $100 entry, $20 collateral. Index delta +2 → short is owed $2.
-        // Close 1 @ $100 (price PnL 0): collateral = 22. (Pre-fix: 20 — credit dropped.)
+        // Close 1 @ $100 (price PnL 0): collateral = 22. (Price alone: 20 — the credit vanishes.)
         h.setBucket(alice, false, 1 * SCALE, 100 * SCALE, 20 * SCALE, 0);
         h.applyFill(alice, true, 1 * SCALE, 100 * SCALE, 100 * SCALE, int256(2 * SCALE));
 

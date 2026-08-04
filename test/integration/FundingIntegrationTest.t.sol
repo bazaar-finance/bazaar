@@ -14,7 +14,7 @@ contract FundingIntegrationTest is IntegrationBase {
     /// @dev Push a fresh BTC index price through refreshPrice, paying the Pyth fee.
     function _refreshIndex(uint256 priceUsd) internal {
         bytes[] memory pu = _priceAt(priceUsd);
-        uint256 fee = pair.getPythFee(pu);
+        uint256 fee = oracle.getUpdateFee(pu);
         vm.deal(address(this), fee);
         pair.refreshPrice{value: fee}(pu);
     }

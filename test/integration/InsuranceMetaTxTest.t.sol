@@ -7,10 +7,9 @@ import {BazaarPair} from "../../src/BazaarPair.sol";
 import {MetaTxLib} from "../../src/libraries/MetaTxLib.sol";
 
 /// @title InsuranceMetaTxTest
-/// @notice The relayer (EIP-712) paths of all three insurance functions — previously the entire
-///         insurance meta-tx surface had zero tests. Covers fee routing on each leg (deducted from
-///         deposit, pulled from wallet, deducted from payout), the fee-exceeds-deposit guard, and
-///         nonce replay.
+/// @notice The relayer (EIP-712) paths of all three insurance functions: fee routing on each leg
+///         (deducted from deposit, pulled from wallet, deducted from payout), the
+///         fee-exceeds-deposit guard, and nonce replay.
 contract InsuranceMetaTxTest is IntegrationBase {
     address internal user;
     uint256 internal userPk;
@@ -69,7 +68,7 @@ contract InsuranceMetaTxTest is IntegrationBase {
             _sign(keccak256(abi.encode(MetaTxLib.DEPOSIT_TO_INSURANCE_TYPEHASH, amount, nonce, deadline, fee)));
 
         vm.prank(relayer);
-        vm.expectRevert(abi.encodeWithSelector(BazaarPair.BazaarPair__RelayerFeeExceedsDeposit.selector, fee, amount));
+        vm.expectRevert(BazaarPair.BazaarPair__RelayerFeeExceedsDeposit.selector);
         pair.depositToInsurance(amount, nonce, deadline, fee, sig, "");
     }
 
