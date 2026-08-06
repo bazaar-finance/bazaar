@@ -1,4 +1,6 @@
-/* Bazaar black & yellow — restyles the default (Ayu) theme.
+/* Liberty — Bazaar's black & yellow, and the book's default theme.
+   The picker labels it Liberty, but mdBook's internal id for the theme it is
+   built on is `ayu`, which is what the selectors below and book.toml name.
    Loaded via additional-css; other themes in the picker stay stock. */
 
 html.ayu {
@@ -43,12 +45,31 @@ html.ayu {
     --color-scheme: dark;
 }
 
-/* Brand accents */
-html.ayu .menu-title {
-    color: #f5c518;
-    letter-spacing: 0.02em;
+/* Header wordmark. The menu bar's <h1> keeps its text for screen readers and
+   the document outline; only the glyphs are hidden, and the logo is painted as
+   the element's background. Sizing is height-driven so the mark stays centered
+   in the bar whatever width the flex row hands it. Paths are relative to this
+   stylesheet, which mdBook copies to the book root alongside images/. */
+.menu-title {
+    color: transparent;
+    background-repeat: no-repeat;
+    background-position: center;
+    background-size: auto 3.6rem;
 }
 
+/* Light-background themes take the black mark, dark ones the yellow. */
+html.light .menu-title,
+html.rust .menu-title {
+    background-image: url("images/bazaar-logo-black.png");
+}
+
+html.coal .menu-title,
+html.navy .menu-title,
+html.ayu .menu-title {
+    background-image: url("images/bazaar-logo-yellow.png");
+}
+
+/* Brand accents */
 html.ayu a:hover {
     color: #ffd964;
 }
@@ -63,9 +84,19 @@ html.ayu mark {
     color: #000000;
 }
 
-/* Code blocks: match the near-black page instead of Ayu's blue-gray */
+/* Code blocks: match the near-black page instead of the stock blue-gray */
 html.ayu pre > .hljs {
     background: #111111;
+}
+
+/* Image credit lines. Unscoped so every theme in the picker gets them; deriving
+   the color from --fg keeps the line legible on light and dark backgrounds alike. */
+.img-credit {
+    display: block;
+    margin-top: 0.6em;
+    font-size: 0.75em;
+    color: var(--fg);
+    opacity: 0.45;
 }
 
 /* Part titles in the sidebar (Guide / Protocol / Reference) */
