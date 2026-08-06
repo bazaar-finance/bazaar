@@ -21,7 +21,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      MDBOOK_VERSION: v0.4.40
+      # Keep in step with the version used locally: the sidebar, the theme
+      # picker's markup, and the asset filenames all changed across the 0.4/0.5
+      # boundary, so a mismatch ships a site that differs from what was reviewed.
+      MDBOOK_VERSION: v0.5.4
     steps:
       - uses: actions/checkout@v4
 
