@@ -65,10 +65,10 @@ test/
 ## Security
 
 - **Unaudited and not deployed.** This codebase has not undergone a professional audit, and there is no official deployment on any network.
-- No admin keys: there is nothing to compromise, but also no one who can pause a bad deployment — the [termination paths](#) are the only brakes.
+- No admin keys: there is nothing to compromise, but also no one who can pause a bad deployment — the [termination paths](https://docs.bazaar.finance/protocol/termination.html) are the only brakes.
 - **Reporting a vulnerability:** please use GitHub's private vulnerability reporting — go to the [Security tab](../../security/advisories/new) and select *Report a vulnerability*. Do not open a public issue for security findings.
 - There is no bug-bounty program at this stage. Valid findings are credited to the reporter in the published advisory. A retroactive reward may be considered for significant findings once the project is funded, but none is promised or guaranteed.
-- Full posture: [Security & Status](#) in the book.
+- Full posture: [Security & Status](https://bazaar-finance.github.io/bazaar/security.html) in the book.
 
 ## License
 
