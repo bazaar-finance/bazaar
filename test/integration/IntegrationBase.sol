@@ -327,15 +327,15 @@ abstract contract IntegrationBase is Test {
     }
 
     function _filledSize(uint256 orderId) internal view returns (uint256 s) {
-        (,,,,,, s,,,,,,,) = pair.orders(orderId);
+        (,,,,,, s,,,,,,,,,,,) = pair.orders(orderId);
     }
 
     function _orderSize(uint256 orderId) internal view returns (uint256 s) {
-        (,,,,, s,,,,,,,,) = pair.orders(orderId);
+        (,,,,, s,,,,,,,,,,,,) = pair.orders(orderId);
     }
 
     function _canceledBlock(uint256 orderId) internal view returns (uint64 cb) {
-        (,,,,,,,,,,,, cb,) = pair.orders(orderId);
+        (,,,,,,,,,,,,,, cb,,,) = pair.orders(orderId);
     }
 
     function _position(address user) internal view returns (bool isLong, uint256 size) {

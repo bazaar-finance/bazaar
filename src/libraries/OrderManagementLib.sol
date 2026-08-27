@@ -255,10 +255,14 @@ library OrderManagementLib {
             orderType: params.orderType,
             isLong: params.isLong,
             isPostOnly: params.isPostOnly,
+            isIoc: false,
+            inBook: false,
             creationBlock: cb,
             expiryBlock: expiryBlock,
             canceledBlock: 0,
-            filledBlock: 0
+            filledBlock: 0,
+            prevInBook: 0,
+            nextInBook: 0
         });
 
         if (params.orderType == BazaarTypes.OrderType.TakeProfit) {

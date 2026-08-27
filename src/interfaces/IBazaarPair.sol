@@ -18,10 +18,14 @@ interface IBazaarPair {
             uint8 orderType,
             bool isLong,
             bool isPostOnly,
+            bool isIoc,
+            bool inBook,
             uint64 creationBlock,
             uint64 expiryBlock,
             uint64 canceledBlock,
-            uint64 filledBlock
+            uint64 filledBlock,
+            uint64 prevInBook,
+            uint64 nextInBook
         );
 
     // ---- State getters used by BazaarPairTerminator ----

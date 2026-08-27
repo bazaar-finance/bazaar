@@ -1680,7 +1680,7 @@ contract BazaarPairTest is Test {
         );
 
         // Verify order stored
-        (address creator,,, uint256 lp,, uint256 s,, BazaarTypes.OrderType ot, bool isLong,,,,,) = btcPair.orders(1);
+        (address creator,,, uint256 lp,, uint256 s,, BazaarTypes.OrderType ot, bool isLong,,,,,,,,,) = btcPair.orders(1);
         assertEq(creator, user1);
         assertTrue(ot == BazaarTypes.OrderType.Limit);
         assertEq(lp, limitPrice);
@@ -1715,7 +1715,7 @@ contract BazaarPairTest is Test {
             ""
         );
 
-        (address creator,,,,,, uint256 filledSize,, bool isLong,,,,,) = btcPair.orders(1);
+        (address creator,,,,,, uint256 filledSize,, bool isLong,,,,,,,,,) = btcPair.orders(1);
         assertEq(creator, user1);
         assertFalse(isLong);
         assertEq(filledSize, 0);
@@ -1743,7 +1743,7 @@ contract BazaarPairTest is Test {
             ""
         );
 
-        (,,,,,,,,, bool isPostOnly,,,,) = btcPair.orders(1);
+        (,,,,,,,,, bool isPostOnly,,,,,,,,) = btcPair.orders(1);
         assertTrue(isPostOnly);
     }
 
@@ -1796,7 +1796,7 @@ contract BazaarPairTest is Test {
         );
 
         // Market order stored with triggerPrice = currentPrice, expiryBlock = creationBlock + MARKET_ORDER_LIFETIME_BLOCKS
-        (,, uint256 tp,,,,, BazaarTypes.OrderType ot,,, uint64 creationBlock, uint64 expiryBlock,,) = btcPair.orders(1);
+        (,, uint256 tp,,,,, BazaarTypes.OrderType ot,,,,, uint64 creationBlock, uint64 expiryBlock,,,,) = btcPair.orders(1);
         assertTrue(ot == BazaarTypes.OrderType.Market);
         assertEq(tp, BTC_SPOT_PRICE); // triggerPrice set to current price
         assertEq(expiryBlock, creationBlock + 12); // MARKET_ORDER_LIFETIME_BLOCKS = 12
@@ -1964,7 +1964,7 @@ contract BazaarPairTest is Test {
             ""
         );
 
-        (,, uint256 tp, uint256 lp,,,, BazaarTypes.OrderType ot,,,,,,) = btcPair.orders(1);
+        (,, uint256 tp, uint256 lp,,,, BazaarTypes.OrderType ot,,,,,,,,,,) = btcPair.orders(1);
         assertTrue(ot == BazaarTypes.OrderType.StopLimit);
         assertEq(tp, triggerPrice);
         assertEq(lp, limitPrice);
@@ -2139,7 +2139,7 @@ contract BazaarPairTest is Test {
             ""
         );
 
-        (,,,,, uint256 sz,, BazaarTypes.OrderType ot,,,,,,) = btcPair.orders(1);
+        (,,,,, uint256 sz,, BazaarTypes.OrderType ot,,,,,,,,,,) = btcPair.orders(1);
         assertTrue(ot == BazaarTypes.OrderType.Market, "full-close market order created");
         assertEq(sz, DUST_SIZE, "order covers the whole position");
     }
@@ -2168,7 +2168,7 @@ contract BazaarPairTest is Test {
             ""
         );
 
-        (,,,,, uint256 sz,, BazaarTypes.OrderType ot,,,,,,) = btcPair.orders(1);
+        (,,,,, uint256 sz,, BazaarTypes.OrderType ot,,,,,,,,,,) = btcPair.orders(1);
         assertTrue(ot == BazaarTypes.OrderType.Limit, "full-close limit order created");
         assertEq(sz, DUST_SIZE, "order covers the whole position");
     }
@@ -2298,7 +2298,7 @@ contract BazaarPairTest is Test {
             ""
         );
 
-        (,,,,,,,,,, uint64 creationBlock, uint64 expiryBlock,,) = btcPair.orders(1);
+        (,,,,,,,,,,,, uint64 creationBlock, uint64 expiryBlock,,,,) = btcPair.orders(1);
         assertEq(expiryBlock, creationBlock + 365 * 24 * 60 * 60 * 4); // MAX_ORDER_LIFETIME_BLOCKS
     }
 
@@ -2435,7 +2435,7 @@ contract BazaarPairTest is Test {
         );
 
         // TP order stored
-        (,, uint256 tp, uint256 lp,,,, BazaarTypes.OrderType ot,,,,,,) = btcPair.orders(1);
+        (,, uint256 tp, uint256 lp,,,, BazaarTypes.OrderType ot,,,,,,,,,,) = btcPair.orders(1);
         assertTrue(ot == BazaarTypes.OrderType.TakeProfit);
         assertEq(tp, 0); // no triggerPrice for TP
         assertEq(lp, tpPrice);
@@ -2599,7 +2599,7 @@ contract BazaarPairTest is Test {
             ""
         );
 
-        (,, uint256 tp, uint256 lp, uint256 msBp,,, BazaarTypes.OrderType ot,,,,,,) = btcPair.orders(1);
+        (,, uint256 tp, uint256 lp, uint256 msBp,,, BazaarTypes.OrderType ot,,,,,,,,,,) = btcPair.orders(1);
         assertTrue(ot == BazaarTypes.OrderType.StopLoss);
         assertEq(tp, slTrigger);
         assertEq(lp, 0); // no limit price for SL
@@ -2887,7 +2887,7 @@ contract BazaarPairTest is Test {
         );
 
         // Order created for user1, not relayer
-        (address creator,,,,,,,,,,,,,) = btcPair.orders(1);
+        (address creator,,,,,,,,,,,,,,,,,) = btcPair.orders(1);
         assertEq(creator, user1);
 
         // Relayer fee deducted from user's collateral
@@ -2982,7 +2982,7 @@ contract BazaarPairTest is Test {
             ""
         );
 
-        (, address integrator,,,,,,,,,,,,) = btcPair.orders(1);
+        (, address integrator,,,,,,,,,,,,,,,,) = btcPair.orders(1);
         assertEq(integrator, integratorAddr);
     }
 
@@ -3031,13 +3031,13 @@ contract BazaarPairTest is Test {
         );
 
         // First order is ID 1, second is ID 2
-        (address creator1,,,,,,,,,,,,,) = btcPair.orders(1);
-        (address creator2,,,,,,,,,,,,,) = btcPair.orders(2);
+        (address creator1,,,,,,,,,,,,,,,,,) = btcPair.orders(1);
+        (address creator2,,,,,,,,,,,,,,,,,) = btcPair.orders(2);
         assertEq(creator1, user1);
         assertEq(creator2, user1);
 
         // Order 3 doesn't exist
-        (address creator3,,,,,,,,,,,,,) = btcPair.orders(3);
+        (address creator3,,,,,,,,,,,,,,,,,) = btcPair.orders(3);
         assertEq(creator3, address(0));
     }
 
@@ -3068,12 +3068,12 @@ contract BazaarPairTest is Test {
         uint256 orderId = _createLimitOrder(user1, USER1_PK, true, POSITION_SIZE, BTC_SPOT_PRICE);
 
         // Verify order is active
-        (address creator,,,,,,,,,,,, uint64 canceledBlock,) = btcPair.orders(orderId);
+        (address creator,,,,,,,,,,,,,, uint64 canceledBlock,,,) = btcPair.orders(orderId);
         assertEq(creator, user1);
         assertEq(canceledBlock, 0);
 
         // Read original creationBlock + expiryBlock from storage so the assertion is exact
-        (,,,,,,,,,, uint64 creationBlockStored, uint64 expiryBlockStored,,) = btcPair.orders(orderId);
+        (,,,,,,,,,,,, uint64 creationBlockStored, uint64 expiryBlockStored,,,,) = btcPair.orders(orderId);
 
         // Cancel it
         uint256[] memory ids = new uint256[](1);
@@ -3105,7 +3105,7 @@ contract BazaarPairTest is Test {
         btcPair.cancelOrders(ids, 0, 0, 0, "");
 
         // Verify order is canceled (canceledBlock != 0)
-        (,,,,,,,,,,,, uint64 canceledBlockAfter,) = btcPair.orders(orderId);
+        (,,,,,,,,,,,,,, uint64 canceledBlockAfter,,,) = btcPair.orders(orderId);
         assertTrue(canceledBlockAfter != 0);
     }
 
@@ -3122,8 +3122,8 @@ contract BazaarPairTest is Test {
         btcPair.cancelOrders(ids, 0, 0, 0, "");
 
         // Both orders should be canceled
-        (,,,,,,,,,,,, uint64 cb1,) = btcPair.orders(orderId1);
-        (,,,,,,,,,,,, uint64 cb2,) = btcPair.orders(orderId2);
+        (,,,,,,,,,,,,,, uint64 cb1,,,) = btcPair.orders(orderId1);
+        (,,,,,,,,,,,,,, uint64 cb2,,,) = btcPair.orders(orderId2);
         assertTrue(cb1 != 0);
         assertTrue(cb2 != 0);
     }
@@ -3209,7 +3209,7 @@ contract BazaarPairTest is Test {
         btcPair.cancelOrders(ids, nonce, deadline, relayerFee, sig);
 
         // Order canceled
-        (,,,,,,,,,,,, uint64 canceledBlock,) = btcPair.orders(orderId);
+        (,,,,,,,,,,,,,, uint64 canceledBlock,,,) = btcPair.orders(orderId);
         assertTrue(canceledBlock != 0);
 
         // Relayer received fee

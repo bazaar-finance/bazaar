@@ -31,9 +31,19 @@ library BazaarTypes {
     ///  slot4: maxSlippageBp (32) — kept u256 for forward-compat with future precision
     ///  slot5: size (32)
     ///  slot6: filledSize (32)
-    ///  slot7: orderType(1) + isLong(1) + isPostOnly(1) + creationBlock(8) + expiryBlock(8) + canceledBlock(8) + filledBlock(8) = 35 bytes → splits slot
-    ///         Solidity packs: orderType(1)+isLong(1)+isPostOnly(1)+creationBlock(8)+expiryBlock(8)+canceledBlock(8) = 27 bytes slot7
-    ///         filledBlock(8) = 8 bytes slot8
+    ///  slot7: orderType(1)+isLong(1)+isPostOnly(1)+isIoc(1)+inBook(1)+creationBlock(8)+expiryBlock(8)+canceledBlock(8) = 29 bytes
+    ///  slot8: filledBlock(8)+prevInBook(8)+nextInBook(8) = 24 bytes
+    ///  A full fill stamps filledBlock and clears both links in a single slot-8 write; a cancel
+    ///  stamps canceledBlock and clears inBook in a single slot-7 write.
+    ///
+    ///  prevInBook/nextInBook thread the resting order book through the orders mapping as two
+    ///  doubly-linked lists (bids: limitPrice DESC, orderId ASC; asks: limitPrice ASC, orderId
+    ///  ASC — see OrderBookLib). uint64 links are safe: orderIds come from a per-pair monotonic
+    ///  counter starting at 1, which cannot plausibly reach 2^64. inBook is an explicit
+    ///  membership flag rather than a link sentinel because a singleton head has both links 0 —
+    ///  indistinguishable from a non-member without a head lookup — and the flag makes unlink an
+    ///  unconditionally safe no-op on orders that never rested (untriggered stops, market
+    ///  orders).
     struct Order {
         address creator;
         address integrator;
@@ -45,10 +55,45 @@ library BazaarTypes {
         OrderType orderType;
         bool isLong;
         bool isPostOnly;
+        bool isIoc;
+        bool inBook;
         uint64 creationBlock;
         uint64 expiryBlock;
         uint64 canceledBlock;
         uint64 filledBlock;
+        uint64 prevInBook;
+        uint64 nextInBook;
+    }
+
+    /// @notice Head state of the pair's resting order book: two sorted doubly-linked lists
+    ///         threaded through the orders mapping via Order.prevInBook/nextInBook.
+    /// @dev One slot. bidHead is the best bid (highest limitPrice, oldest orderId at ties);
+    ///      askHead is the best ask (lowest limitPrice, oldest at ties); 0 = empty side. The
+    ///      counts track live nodes per side for lens pagination and traversal invariants.
+    ///      Ordering keys off limitPrice alone — every restable type (Limit, TakeProfit, armed
+    ///      StopLimit) is limit-priced, so list order is oracle-independent and never decays.
+    struct OrderBook {
+        uint64 bidHead;
+        uint64 askHead;
+        uint64 bidCount;
+        uint64 askCount;
+    }
+
+    /// @notice Caller-supplied execution aids for the matching walk and book insertion. Not part
+    ///         of any EIP-712 payload: hints are position predictions, not user intent, so a
+    ///         relayer attaches fresh ones at submission time (like priceUpdate). Every hint is
+    ///         verified against the actual neighbors before linking — a wrong hint can only fail
+    ///         placement, never mis-place an order.
+    /// @dev pred is the orderId the new order should rest directly behind (0 = insert at head);
+    ///      pred2..pred4 are fallback candidates (0 = unused) tried in sequence when earlier ones
+    ///      have left the book. maxSteps caps nodes visited by the matching walk (0 = protocol
+    ///      default MAX_WALK_STEPS).
+    struct MatchHints {
+        uint64 pred;
+        uint64 pred2;
+        uint64 pred3;
+        uint64 pred4;
+        uint32 maxSteps;
     }
 
     struct PositionBucket {
@@ -330,8 +375,14 @@ library BazaarTypes {
     uint64 internal constant MARKET_ORDER_LIFETIME_BLOCKS = 12; // ~3 s
     uint64 internal constant MAX_ORDER_LIFETIME_BLOCKS = 365 * 24 * 60 * 60 * 4; // ~126.1M, ~1 year
 
-    // Per-user active-order caps (prevents calldata-flood DoS)
+    // Per-user active-order caps (bounds the exposure-tally iteration in deposit/withdraw margin
+    // checks and each user's worst-case book footprint)
     uint256 internal constant MAX_ACTIVE_LIMIT_ORDERS_PER_USER = 100; // Limit + StopLimit combined
+
+    // Shared node-visit ceiling for book walks: caps the matching walk (MatchHints.maxSteps is
+    // clamped to it; 0 selects it as the default) and caps OrderBookLib's insert repair walk.
+    // 64 settlements bound the worst-case arrival transaction well inside a block's gas.
+    uint256 internal constant MAX_WALK_STEPS = 64;
 
     // Sentinel: TP/SL orders never expire by block
     uint64 internal constant NEVER_EXPIRE_BLOCK = type(uint64).max;

@@ -590,11 +590,11 @@ contract BazaarSequencer is ReentrancyGuard {
             uint256 size,
             uint256 filledSize,
             uint8 orderType,
-            bool isLong,, // isPostOnly (not relevant to omission challenge)
+            bool isLong,,,, // isPostOnly, isIoc, inBook (not relevant to omission challenge)
             uint64 creationBlock,
             uint64 expiryBlock,
             uint64 canceledBlock,
-            uint64 filledBlock
+            uint64 filledBlock,, // prevInBook, nextInBook (book linkage, not relevant here)
         ) = pair.orders(orderId);
 
         o.creator = creator;

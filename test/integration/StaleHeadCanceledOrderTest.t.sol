@@ -12,7 +12,7 @@ import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 ///         against storage before reusing it, so the fence's cancel sticks and the order never fills.
 contract StaleHeadCanceledOrderTest is IntegrationBase {
     function _filledBlock(uint256 orderId) internal view returns (uint64 fb) {
-        (,,,,,,,,,,,,, fb) = pair.orders(orderId);
+        (,,,,,,,,,,,,,,, fb,,) = pair.orders(orderId);
     }
 
     function test_CanceledTpIsNeverFilled() public {

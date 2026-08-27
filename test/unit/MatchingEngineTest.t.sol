@@ -416,7 +416,7 @@ contract MatchingEngineTest is Test {
 
     /// @dev Read the filled size of an order.
     function _filledSize(uint256 orderId) internal view returns (uint256) {
-        (,,,,,, uint256 filledSize,,,,,,,) = pair.orders(orderId);
+        (,,,,,, uint256 filledSize,,,,,,,,,,,) = pair.orders(orderId);
         return filledSize;
     }
 
@@ -425,19 +425,19 @@ contract MatchingEngineTest is Test {
 
     /// @dev Read order size.
     function _size(uint256 orderId) internal view returns (uint256) {
-        (,,,,, uint256 size,,,,,,,,) = pair.orders(orderId);
+        (,,,,, uint256 size,,,,,,,,,,,,) = pair.orders(orderId);
         return size;
     }
 
     /// @dev Read canceledBlock — non-zero means auto-canceled.
     function _canceledBlock(uint256 orderId) internal view returns (uint64) {
-        (,,,,,,,,,,,, uint64 cb,) = pair.orders(orderId);
+        (,,,,,,,,,,,,,, uint64 cb,,,) = pair.orders(orderId);
         return cb;
     }
 
     /// @dev Read filledBlock — non-zero means fully filled.
     function _filledBlock(uint256 orderId) internal view returns (uint64) {
-        (,,,,,,,,,,,,, uint64 fb) = pair.orders(orderId);
+        (,,,,,,,,,,,,,,, uint64 fb,,) = pair.orders(orderId);
         return fb;
     }
 
@@ -2320,7 +2320,7 @@ contract MatchingEngineTest is Test {
     }
 
     function _aaplOrderFilledSize(uint256 orderId) internal view returns (uint256) {
-        (,,,,,, uint256 filledSize,,,,,,,) = aaplPair.orders(orderId);
+        (,,,,,, uint256 filledSize,,,,,,,,,,,) = aaplPair.orders(orderId);
         return filledSize;
     }
 
