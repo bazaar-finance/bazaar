@@ -243,6 +243,14 @@ library AdlLib {
         for (uint256 i = 0; i < winners.length; i++) {
             if (totalClosed >= requiredSize) break;
 
+            // executeAdl's entry health check routes a pre-existing deficit into termination
+            // and never reaches this loop, so a non-zero value here means an earlier close in
+            // THIS batch exhausted the fund and went partly unpaid. Every further close would
+            // seize a winner's position for zero credit; stop instead — the post-batch health
+            // check terminates the pair, and the settlement waterfall shares the recorded
+            // shortfall pro-rata rather than concentrating it on whoever the batch reached next.
+            if (pairVault.deficit > 0) break;
+
             // Before every close after the first, stop if the book has already healed: each close
             // shrinks the pendingLiq exposure (decremented at the bottom of this loop), so health
             // can be restored mid-batch and any further close would deleverage a winner for
@@ -372,19 +380,26 @@ library AdlLib {
 
     /// @notice Funds an ADL'd winner's realized PnL from insurance and tracks it as collateral.
     /// @dev The winner's counterparty is the vault, whose backing is the bankrupt side's seized
-    ///      collateral held in insuranceFundBalance. The credit is CAPPED at the available
-    ///      insurance: we debit `min(pnl, insurance)` and credit totalCollateralDeposited by the
-    ///      same amount, so both `insurance + totalCollateralDeposited` and
-    ///      `totalCollateralDeposited == Σ bucket.collateral` stay exact — the books remain
-    ///      solvent and no emergency termination is triggered. In the insolvency tail (bad debt
-    ///      exceeds the fund) the winner is haircut to what insurance can pay; the position is
-    ///      still fully closed regardless. Winners are processed in ADL-score order, so when
-    ///      insurance runs out mid-batch the haircut falls on the lowest-score winners.
+    ///      collateral held in insuranceFundBalance. The credit is booked as an I → D transfer —
+    ///      debit `min(pnl, insurance)`, credit totalCollateralDeposited by the same amount — so
+    ///      `insurance + totalCollateralDeposited` and `totalCollateralDeposited ==
+    ///      Σ bucket.collateral` both stay exact for the funded portion. The winner's position is
+    ///      closed for its full size regardless, so any part of the credit the fund cannot cover
+    ///      is a realized claim with no backing left: it is recorded as deficit, the insolvency
+    ///      signal the post-batch isVaultHealthy in executeAdl terminates the pair on, routing
+    ///      the shortfall into the settlement waterfall's pro-rata sharing. Dropping it instead
+    ///      would erase a solvent trader's claim while every ledger check still balanced, leaving
+    ///      the pair trading on an empty fund.
+    /// @param pairVault The pair's vault accounting
+    /// @param pnl The winner's full realized PnL owed at the settlement price
     /// @return funded The amount actually credited to the winner's bucket.collateral.
     function _fundWinnerPnl(BazaarTypes.Vault storage pairVault, uint256 pnl) internal returns (uint256) {
         uint256 funded = pnl < pairVault.insuranceFundBalance ? pnl : pairVault.insuranceFundBalance;
         pairVault.insuranceFundBalance -= funded;
         pairVault.totalCollateralDeposited += funded;
+        if (pnl > funded) {
+            pairVault.deficit += pnl - funded;
+        }
         return funded;
     }
 

@@ -106,9 +106,9 @@ contract CheckMarginTest is Test {
 
     function testCheckMargin_OpenLongAtAbovOracle_RejectedWhenIncipientLossDepletesBuffer() public {
         // 1 BTC long, $21 collateral, fillPrice = $105, oracle = $100
-        // IMR = 0.2 × 105 = $21 → passes IMR alone
+        // IMR = 0.2 × 100 = $20 (notional sized at the oracle) → passes IMR alone
         // Incipient loss = 1 × $5 = $5 → effective collateral = $16
-        // 16 < 21 → reject
+        // 16 < 20 → reject
         (BazaarTypes.PositionBucket memory bucket, BazaarTypes.BucketState memory state) = _emptyBucket(21 * SCALE);
         assertFalse(harness.checkMargin(bucket, state, true, 1 * SCALE, 105 * SCALE, 0, ORACLE, IMR_BP, MMR_BP, 0));
     }
@@ -121,26 +121,32 @@ contract CheckMarginTest is Test {
 
     function testCheckMargin_OpenLongBelowOracle_NoCreditForGain() public {
         // fillPrice = $95 < oracle $100. Long entering favorably (gain).
-        // IMR = 0.2 × 95 = $19. Collateral = $19 → just passes (no credit makes this exact)
-        (BazaarTypes.PositionBucket memory bucket, BazaarTypes.BucketState memory state) = _emptyBucket(19 * SCALE);
+        // Fresh exposure is sized at the oracle, so IMR = 0.2 × 100 = $20 whatever the fill price.
+        (BazaarTypes.PositionBucket memory bucket, BazaarTypes.BucketState memory state) = _emptyBucket(20 * SCALE);
         assertTrue(harness.checkMargin(bucket, state, true, 1 * SCALE, 95 * SCALE, 0, ORACLE, IMR_BP, MMR_BP, 0));
-        // With $18 collateral, fails (no credit pulls headroom up)
-        (bucket, state) = _emptyBucket(18 * SCALE);
+        // $19 fails: crediting the $5 incipient gain would have made this 24 >= 20 and passed,
+        // so this assertion is what pins the debit as one-sided.
+        (bucket, state) = _emptyBucket(19 * SCALE);
         assertFalse(harness.checkMargin(bucket, state, true, 1 * SCALE, 95 * SCALE, 0, ORACLE, IMR_BP, MMR_BP, 0));
     }
 
     function testCheckMargin_OpenShortBelowOracle_RejectedWhenIncipientLoss() public {
         // 1 BTC short, fillPrice = $95 < oracle = $100 → short selling at low = loss
-        // IMR = 0.2 × 95 = $19. Collateral = $20. Incipient loss = 1 × 5 = $5 → effective $15. Reject.
+        // IMR = 0.2 × 100 = $20 (notional sized at the oracle). Collateral = $20.
+        // Incipient loss = 1 × 5 = $5 → effective $15 < 20. Reject.
         (BazaarTypes.PositionBucket memory bucket, BazaarTypes.BucketState memory state) = _emptyBucket(20 * SCALE);
         assertFalse(harness.checkMargin(bucket, state, false, 1 * SCALE, 95 * SCALE, 0, ORACLE, IMR_BP, MMR_BP, 0));
     }
 
     function testCheckMargin_OpenShortAboveOracle_NoCreditForGain() public {
         // fillPrice = $105 > oracle = $100 → short selling high = gain. No credit applied.
-        // IMR = 0.2 × 105 = $21. Collateral = $21 → exactly passes.
-        (BazaarTypes.PositionBucket memory bucket, BazaarTypes.BucketState memory state) = _emptyBucket(21 * SCALE);
+        // Fresh exposure is sized at the oracle, so IMR = 0.2 × 100 = $20 whatever the fill price.
+        (BazaarTypes.PositionBucket memory bucket, BazaarTypes.BucketState memory state) = _emptyBucket(20 * SCALE);
         assertTrue(harness.checkMargin(bucket, state, false, 1 * SCALE, 105 * SCALE, 0, ORACLE, IMR_BP, MMR_BP, 0));
+        // Mirror of the long case: $19 fails only because the $5 gain is discarded rather than
+        // credited (crediting it would give 24 >= 20). Without this the test cannot see a credit.
+        (bucket, state) = _emptyBucket(19 * SCALE);
+        assertFalse(harness.checkMargin(bucket, state, false, 1 * SCALE, 105 * SCALE, 0, ORACLE, IMR_BP, MMR_BP, 0));
     }
 
     // ============================================================

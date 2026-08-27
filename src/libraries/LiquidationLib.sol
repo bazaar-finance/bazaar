@@ -92,9 +92,21 @@ library LiquidationLib {
                     : 0;
             }
 
-            // Add collateral to insurance fund immediately
-            pairVault.insuranceFundBalance += collateralToSeize;
-            pairVault.totalCollateralDeposited -= collateralToSeize;
+            // Credit insurance with the seized book collateral, capped at the deposits
+            // ledger. Winners realize gains into their buckets without touching the ledger
+            // and withdraw them from it later, so a loser's book collateral can legitimately
+            // exceed the entire remaining ledger; an uncapped debit would panic there,
+            // leaving exactly the deepest-underwater position unliquidatable. The
+            // unattributable excess is dropped rather than booked as deficit: the estate
+            // settles at its entry basis through insurance transfers that are already
+            // clamped, so a genuine shortfall still surfaces as deficit (and terminates the
+            // pair) only if insurance cannot fund settlement — a pair whose books remain
+            // covered heals, with insurance absorbing the gap.
+            uint256 seized = collateralToSeize < pairVault.totalCollateralDeposited
+                ? collateralToSeize
+                : pairVault.totalCollateralDeposited;
+            pairVault.insuranceFundBalance += seized;
+            pairVault.totalCollateralDeposited -= seized;
 
             // Reset the user's bucket
             _resetBucket(
@@ -159,7 +171,7 @@ library LiquidationLib {
                 isLong,
                 bankruptcyPrice,
                 params.currentPrice,
-                collateralToSeize,
+                seized,
                 block.timestamp
             );
 

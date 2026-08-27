@@ -379,7 +379,8 @@ library InsuranceVaultLib {
             uint256 totalOINotional = Math.mulDiv(totalOISize, currentPrice, BAZAAR_SCALE);
             if (totalOINotional > 0) {
                 uint256 currentRatioBp = (vault.insuranceFundBalance * BP_SCALE) / totalOINotional;
-                uint256 targetRatioBp = RiskParamsLib.getTargetInsuranceRatio(params.emaVarianceBp, params.emaGapBp);
+                uint256 targetRatioBp =
+                    RiskParamsLib.getTargetInsuranceRatio(params.emaVarianceBp, params.emaGapBp, params.reopenGapBp);
 
                 // Reset period tracker if period has elapsed
                 if (block.timestamp >= rateLimitState.periodStart + INSURANCE_WITHDRAWAL_RATE_LIMIT_PERIOD) {

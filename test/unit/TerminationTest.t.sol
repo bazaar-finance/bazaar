@@ -256,7 +256,8 @@ contract Phase2TerminationPnlTest is Test {
     function test_R2_EstateFundingLeg_Settled() public {
         // Long estate: size 10, entryNotional 1000 ($100/unit), settle at PRICE=$100 -> price leg 0.
         // Funding index moved +5 (per unit, xsize 10 / SCALE) -> fundingLeg = 50. Long pays it, so
-        // estate value change = 0 - 0 - 50 = -50 -> I -= 50, D += 50.
+        // estate value change = 0 - 0 - 50 = -50 -> I -= 50; D untouched (the counterparties'
+        // funding wins are surplus-paid claims, not deposits).
         harness.setVault(2_000 * SCALE, 500 * SCALE, 10 * SCALE, 1_000 * SCALE, 1_000 * SCALE, 0, true);
         harness.setClaims(0, 0);
         usdc.mint(address(harness), 2_500 * USDC_SCALE);
@@ -266,7 +267,70 @@ contract Phase2TerminationPnlTest is Test {
         harness.execTerm(p);
 
         assertEq(harness.insurance(), 450 * SCALE, "estate funding obligation charged to insurance");
-        assertEq(harness.collateral(), 2_050 * SCALE, "counterparties' funding backing moved into D");
+        assertEq(harness.collateral(), 2_000 * SCALE, "principal ledger untouched by the estate leg");
+    }
+
+    /// @notice Estate loss with registered winner claims: charged to insurance ONLY, principal
+    ///         ledger untouched. Winners are paid from the cash surplus (cash - D - I); if the
+    ///         loss were also credited to D, the D inflation would cancel the I deflation in
+    ///         that derivation exactly — zeroing every winner while the cash sat in D owned by
+    ///         no bucket.
+    function test_EstateLoss_InsuranceOnly_WinnerClaimsStayFunded() public {
+        // Two-party book after the sweep: winner's principal D = 20; I = 20 (the liquidated
+        // loser's seized collateral); short estate entered at $100, settled at $118 -> -18.
+        // The winner's +18 is a registered claim. Cash 40.
+        harness.setVault(20 * SCALE, 20 * SCALE, 1 * SCALE, 100 * SCALE, 100 * SCALE, 0, false);
+        harness.setClaims(18 * SCALE, 0);
+        usdc.mint(address(harness), 40 * USDC_SCALE);
+
+        BazaarTypes.TerminationParams memory p = _params();
+        p.terminationPrice = 118 * SCALE;
+        BazaarTypes.TerminationResult memory r = harness.execTerm(p);
+
+        assertEq(harness.insurance(), 2 * SCALE, "estate loss charged to insurance");
+        assertEq(harness.collateral(), 20 * SCALE, "principal ledger untouched");
+        assertEq(r.winnersPayoutRatioBp, 10_000, "surplus 18 covers claims 18 in full");
+        assertEq(harness.profitReserve(), 18 * SCALE, "full claims reserved");
+    }
+
+    /// @notice Estate gain credits insurance ONLY. The counterparties' losses were already
+    ///         released from D by the sweep; debiting D again for the same money would push it
+    ///         below the principal still owed, and the final withdrawals would underflow the
+    ///         deposits ledger and revert forever.
+    function test_EstateGain_PrincipalLedgerNotDebited() public {
+        // Post-sweep book: loser's remaining principal D = 10 (their -10 already released),
+        // I = 20; short estate entered at $100, settled at $90 -> +10. Cash 40.
+        harness.setVault(10 * SCALE, 20 * SCALE, 1 * SCALE, 100 * SCALE, 100 * SCALE, 0, false);
+        harness.setClaims(0, 0);
+        usdc.mint(address(harness), 40 * USDC_SCALE);
+
+        BazaarTypes.TerminationParams memory p = _params();
+        p.terminationPrice = 90 * SCALE;
+        harness.execTerm(p);
+
+        assertEq(harness.insurance(), 30 * SCALE, "estate gain inherited by insurance");
+        assertEq(harness.collateral(), 10 * SCALE, "principal ledger untouched");
+        // Books equal cash: every unit of D is withdrawable without underflow.
+        assertEq(harness.collateral() + harness.insurance(), 40 * SCALE, "D + I == cash");
+    }
+
+    /// @notice Estate loss beyond the insurance balance: I drains to zero, D stays untouched,
+    ///         and the uncovered remainder surfaces as a pro-rata profit ratio (claims exceed
+    ///         the remaining cash surplus) rather than as any unbacked ledger credit.
+    function test_EstateLoss_UncoveredRemainder_FlowsIntoRatio() public {
+        // D = 20, I = 10, short estate entered at $100, settled at $118 -> -18 (> I).
+        // Cash 30, claims 18. After: I = 0, surplus = 30 - 20 = 10 -> ratio 10/18.
+        harness.setVault(20 * SCALE, 10 * SCALE, 1 * SCALE, 100 * SCALE, 100 * SCALE, 0, false);
+        harness.setClaims(18 * SCALE, 0);
+        usdc.mint(address(harness), 30 * USDC_SCALE);
+
+        BazaarTypes.TerminationParams memory p = _params();
+        p.terminationPrice = 118 * SCALE;
+        BazaarTypes.TerminationResult memory r = harness.execTerm(p);
+
+        assertEq(harness.insurance(), 0, "insurance fully consumed");
+        assertEq(harness.collateral(), 20 * SCALE, "principal ledger untouched");
+        assertEq(r.winnersPayoutRatioBp, 5_555, "ratio = surplus/claims = 10/18");
     }
 
     /// @notice No claims registered (nobody settled, or no winners) -> ratio 100% trivially,
@@ -647,11 +711,11 @@ contract Phase2InsurerVoteTest is Test {
         assertFalse(pair.isPairTerminatedNormal(), "stale consensus must not terminate on settlement");
     }
 
-    /// @notice creditInsuranceFromTerminator is gated by onlyUma — direct calls revert.
+    /// @notice creditInsurance is gated to the terminator/sequencer — direct calls revert.
     function test_R2_2_CreditFunction_OnlyUmaGuard() public {
         vm.prank(attacker);
-        vm.expectRevert(); // BazaarPair__OnlyUma
-        pair.creditInsuranceFromTerminator(1_000 * BAZAAR_SCALE);
+        vm.expectRevert(BazaarPair.BazaarPair__UnauthorizedInsuranceCreditor.selector);
+        pair.creditInsurance(1_000 * BAZAAR_SCALE);
     }
 
     /// @notice Maturity: shares deposited within 7 days of a proposal cannot vote on it.
@@ -1565,10 +1629,12 @@ contract PostCessationTerminationTest is Test {
 }
 
 /// @notice terminateStalePair must terminate ONLY for a >21-day-stale oracle — never for any
-///         other reason. It reads via tryReadStalePrice (spot if conf <=2%, else EMA); when no
-///         rung clears the cap (found=false) or the oracle read reverts, it falls back to the
-///         pair's last stored price but STILL requires 21-day staleness — so a transient
-///         wide-conf / reverting read on a recently-active pair cannot be used to terminate it.
+///         other reason. tryReadStalePrice (spot if conf <=2%, else EMA) serves as the liveness
+///         probe: any rung resolving a tick newer than 21 days blocks termination outright. When
+///         no rung clears the cap (found=false) or the oracle read reverts, the 21-day requirement
+///         is instead enforced against the pair's own stored price — so a transient wide-conf /
+///         reverting read on a recently-active pair cannot be used to terminate it. Settlement
+///         always uses that stored price, never a tick read from the oracle's cache.
 contract Phase4StaleTerminationTest is Test {
     bytes32 constant BTC_USD_FEED_ID = 0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43;
     int32 constant BTC_EXPO = -8;
@@ -1634,14 +1700,25 @@ contract Phase4StaleTerminationTest is Test {
         pair.finalizeTermination();
     }
 
-    /// try path: oracle returns a price stale by > 21 days -> terminates.
+    /// try path: oracle returns a price stale by > 21 days -> terminates at the pair's stored price.
     function test_StaleOracle_TerminatesAfter21Days() public {
         uint64 t0 = uint64(block.timestamp);
         _push(50_000e8, 50e8, t0);
+        pair.refreshPrice(new bytes[](0)); // records lastPairPrice at ~t0 — the settlement source
         vm.warp(t0 + DEAD + 1);
         terminator.terminateStalePair(address(pair));
         _finalize();
         assertTrue(_terminated(), "stale > 21 days terminates");
+    }
+
+    /// A pair that never recorded a price has no settlement source, so even a provably dead oracle
+    /// cannot terminate it here: the oracle's cached tick is never used as the settlement price.
+    function test_StaleOracle_NoStoredPrice_Reverts() public {
+        uint64 t0 = uint64(block.timestamp);
+        _push(50_000e8, 50e8, t0);
+        vm.warp(t0 + DEAD + 1);
+        vm.expectRevert(BazaarPairTerminator.BazaarPairTerminator__NoStoredPrice.selector);
+        terminator.terminateStalePair(address(pair));
     }
 
     /// try path: oracle fresh (< 21 days) -> cannot terminate.
@@ -1687,17 +1764,21 @@ contract Phase4StaleTerminationTest is Test {
         assertTrue(_terminated(), "dead + stale terminates via lastPairPrice fallback");
     }
 
-    /// stale ladder: spot conf too wide (>2%) but EMA conf tight, stale > 21 days -> terminates at
-    /// the EMA price (rung 2), not the wide spot. The publish time is shared, so the staleness
-    /// gate still uses the genuine 21-day age.
+    /// stale ladder: spot conf too wide (>2%) but EMA conf tight, so the EMA rung (rung 2) is what
+    /// resolves the publish time the 21-day liveness gate is judged against — the wide spot alone
+    /// would leave found=false. Past that age the pair terminates, settling at its own stored price
+    /// rather than at either oracle rung. Warping to DEAD + 2 clears the gate against the rung's
+    /// t0 + 1 publish time, not just against the stored price's t0.
     function test_StaleWideSpot_TerminatesViaEmaRung() public {
         uint64 t0 = uint64(block.timestamp);
+        _push(50_000e8, 50e8, t0); // tight -> refreshPrice records lastPairPrice at ~t0
+        pair.refreshPrice(new bytes[](0));
         // spot: 50k +/- 5k (10% conf, wide); EMA: 48k +/- 48 (0.1% conf, tight)
-        _pushSpotEma(50_000e8, 5_000e8, 48_000e8, 48e8, t0);
-        vm.warp(t0 + DEAD + 1);
+        _pushSpotEma(50_000e8, 5_000e8, 48_000e8, 48e8, t0 + 1);
+        vm.warp(t0 + DEAD + 2);
         terminator.terminateStalePair(address(pair));
         _finalize();
-        assertTrue(_terminated(), "wide spot but tight EMA + stale -> terminates via EMA rung");
+        assertTrue(_terminated(), "wide spot but tight EMA + stale -> terminates");
     }
 
     /// stale ladder: both spot and EMA conf too wide -> tryReadStalePrice found=false -> falls back

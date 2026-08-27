@@ -35,16 +35,17 @@ All constants live in `src/libraries/BazaarTypes.sol`, `src/libraries/RiskParams
 | Parameter | Value |
 |---|---|
 | `BASE_IMR_BP` | 300 (3%) |
-| Multipliers | volatility, liquidation-gap, insurance — each 1×→3× |
-| Non-continuous multiplier | 1.5× |
+| Multipliers | volatility 1×→6× (through 3× at 100% ann. vol, capped at ~157%); liquidation-gap and insurance each 1×→3× |
+| Non-continuous multiplier | 2× |
+| Reopen-gap leg | non-continuous IMR = 2 × max(vol curve, reopen-gap EMA). The EMA is a peak-hold of \|reopen return\| across ≥ 1 h price gaps (closures, halts, trading breaks; `REOPEN_GAP_MIN_STALENESS`), harmonic decay τ = 180 d (`REOPEN_GAP_EMA_TAU`), capped at 40% (`REOPEN_GAP_EMA_CAP_BP`) — so MMR covers the full demonstrated reopen, and a cap-sized gap doubles to exactly the 80% IMR clamp |
 | IMR clamp | 4% … 80% (25× … 1.25× leverage) |
-| Warmup floor | 20% IMR (30% for non-continuously traded pairs) for 5 days *and* 50,000 price updates |
+| Warmup floor | 20% IMR (40% for non-continuously traded pairs) for 5 days *and* 50,000 price updates |
 | MMR | IMR / 2 |
 | MMR grace | 24 h lag, 25 hourly samples |
-| `STALE_MARGIN_MULTIPLIER` | 2× on new fills under stale oracle |
 | `MAX_STALE_DEVIATION_BP` | 1000 (±10% stale-fill band) |
+| Stale withdrawal gate | a position holder's withdrawal requires a fresh price (reverts on the stale fallback); flat and order-only accounts are exempt, deposits unaffected |
 | `MIN_COLLATERAL_AMOUNT` | $5 minimum collateral deposit |
-| Retained-collateral floor | a position-holding account must keep `max(0.5% of notional, $5)` in collateral (`MIN_RETAINED_COLLATERAL_BP` = 50). Proportional because fees are: it guarantees the fee that closes the position is always payable |
+| Retained-collateral floor | a position-holding account must keep margin in collateral proper (cash, not equity): `mmrBp` of current notional on continuously traded pairs, `imrBp` on session-bound pairs. Guarantees the fee that closes the position is always payable, and keeps margin in money that survives a reversal — paper profit evaporates in the same move it would need to buffer, and across a reopen gap no liquidation can interpose |
 
 ## Funding
 
@@ -66,7 +67,7 @@ All constants live in `src/libraries/BazaarTypes.sol`, `src/libraries/RiskParams
 | ADL auction | 25× score → ~0, quadratic, 10 min; ≤ 25 winners per call |
 | ADL timeout | 24 h → settlement window opens at the live price |
 | ADL executor reward | 0.1% of averted bad debt |
-| Insurance target | 2% … 10% of OI (vol-scaled, ≥ 3× gap EMA) |
+| Insurance target | 2% … 10% of OI — max(vol-scaled, 3× liquidation-gap EMA, ½ × reopen-gap EMA on non-continuous pairs) |
 | Insurance LP | min $5 deposit; 20-day cooldown + 3-day window; rate limits 0.5% OI / 6 h (below target), max(1% OI, 10% fund) (above) |
 | Maker insurance fee | 0.5 bp flat |
 | Taker insurance fee | base 0.5 bp … 2 bp (scales with target ratio); below target × (1 + 49·deficit²), 45 bp hard cap; discounted toward 0 above target |
@@ -76,7 +77,7 @@ All constants live in `src/libraries/BazaarTypes.sol`, `src/libraries/RiskParams
 
 | Parameter | Value |
 |---|---|
-| `MAX_PRICE_STALENESS` / user tier | 2 s / 10 s |
+| `MAX_PRICE_STALENESS` | 2 s, every submission path |
 | `MAX_CONFIDENCE_BP` | 200 (2% confidence cap) |
 
 ## Meta-transactions

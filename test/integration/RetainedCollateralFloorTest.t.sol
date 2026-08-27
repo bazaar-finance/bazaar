@@ -8,18 +8,20 @@ import {CollateralLib} from "../../src/libraries/CollateralLib.sol";
 
 /// @notice The withdrawal margin check is EQUITY-based (collateral + unrealized PnL), so without a
 ///         retention floor a deeply profitable position could withdraw 100% of its deposit and keep
-///         the position open on profit alone. That is a trap, because every fee is charged against
-///         `bucket.collateral`: MatchingEngineLib._checkMargin rejects a fill whose fee exceeds
-///         collateral and the caller then AUTO-CANCELS the order, and _chargeRelayerFee reverts — so
-///         the holder could not close through the book (their orders would silently vanish) until
-///         they re-deposited. Slicing offers no way out either: a partial close leaves a remainder
-///         that must meet IMR out of collateral.
-///         A position-holding account must therefore retain max(0.5% of notional, $5). The floor is
-///         proportional because the fees it must cover are proportional.
+///         the position open on paper profit alone. That state fails two ways: every fee is charged
+///         against `bucket.collateral` (MatchingEngineLib._checkMargin rejects a fill whose fee
+///         exceeds collateral and the caller then AUTO-CANCELS the order, and _chargeRelayerFee
+///         reverts), and paper profit evaporates in the same adverse move it would need to buffer.
+///         A position-holding account must therefore retain real cash: mmrBp of current notional
+///         on a continuously traded pair (liquidation can interpose at the maintenance line), and
+///         imrBp on a session-bound pair (a reopen jumps liquidation entirely). This suite runs on
+///         the BTC pair and covers the continuous branch; the session-bound branch is covered in
+///         BazaarPairTest on the AAPL pair.
 contract RetainedCollateralFloorTest is IntegrationBase {
     /// @dev IntegrationBase seeds only a 5,000 USDC sequencer bond = 70,000 of volume capacity,
     ///      which the opening match nearly exhausts. Without this top-up the walk hits the capacity
-    ///      cap and these tests would measure that instead of the fee constraint they are about.
+    ///      cap and these tests would measure that instead of the retention constraint they are
+    ///      about.
     function setUp() public override {
         super.setUp();
         vm.startPrank(seq);
@@ -28,17 +30,19 @@ contract RetainedCollateralFloorTest is IntegrationBase {
         vm.stopPrank();
     }
 
-    /// @dev Long positions are valued at the conservative (low) edge of the confidence band, which
-    ///      _priceUpdateFor sets 0.1% below spot.
-    function _floorForLong(uint256 sizeBtc, uint256 spotUsd) internal pure returns (uint256) {
-        uint256 notional = sizeBtc * (spotUsd - (spotUsd / 1000)) * BAZAAR_SCALE;
-        uint256 proportional = notional * 50 / 10_000; // 0.5%
-        return proportional < 5 * BAZAAR_SCALE ? 5 * BAZAAR_SCALE : proportional;
+    /// @dev The floor the withdrawal path enforces for a long on this continuously traded pair:
+    ///      mmrBp of notional, with the position valued at the conservative (low) edge of the
+    ///      confidence band, which _priceUpdateFor sets 0.1% below spot.
+    function _floorForLong(uint256 sizeWad, uint256 spotUsd) internal view returns (uint256) {
+        uint256 lowPrice = (spotUsd - spotUsd / 1000) * BAZAAR_SCALE;
+        uint256 notional = sizeWad * lowPrice / BAZAAR_SCALE;
+        (, uint256 mmrBp,,) = pair.marginRequirements();
+        return notional * mmrBp / BazaarTypes.BP_SCALE;
     }
 
-    /// Step 1: the floor blocks the withdrawal that would create the trap, and it scales with
-    ///         notional.
-    function test_cannotWithdrawBelowProportionalFloor() public {
+    /// Step 1: the floor blocks any withdrawal that would leave less than maintenance-level cash,
+    ///         and it scales with notional.
+    function test_cannotWithdrawBelowMmrFloor() public {
         _openPosition(alice, bob, true, 1 * BAZAAR_SCALE); // alice long 1 BTC
 
         // Price doubles: unrealized profit alone would satisfy the equity-based margin check.
@@ -46,7 +50,7 @@ contract RetainedCollateralFloorTest is IntegrationBase {
         bytes[] memory pu = _priceUpdate(100_000, uint64(vm.getBlockTimestamp()));
 
         uint256 col = _posCollateral(alice);
-        uint256 floorAmt = _floorForLong(1, 100_000); // ~0.5% of ~$99,900 = ~$499.50
+        uint256 floorAmt = _floorForLong(1 * BAZAAR_SCALE, 100_000);
 
         // Withdrawing everything is rejected...
         vm.prank(alice);
@@ -55,8 +59,7 @@ contract RetainedCollateralFloorTest is IntegrationBase {
         );
         pair.withdrawCollateral(col, pu, 0, 0, 0, "");
 
-        // ...and so is leaving only a flat $5, which is nowhere near enough on $100k of notional —
-        // exactly the residual gap the flat floor left open.
+        // ...and so is keeping a fee-scale remnant: $5 of cash cannot maintain $100k of notional.
         vm.prank(alice);
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -65,16 +68,16 @@ contract RetainedCollateralFloorTest is IntegrationBase {
         );
         pair.withdrawCollateral(col - (5 * BAZAAR_SCALE), pu, 0, 0, 0, "");
 
-        // Withdrawing down TO the floor is allowed.
+        // Withdrawing down TO the floor is allowed: the profit stays in the position, the
+        // maintenance margin stays in cash.
         vm.prank(alice);
         pair.withdrawCollateral(col - floorAmt, pu, 0, 0, 0, "");
-        assertEq(_posCollateral(alice), floorAmt, "keeps exactly the proportional floor");
-        assertGt(floorAmt, 400 * BAZAAR_SCALE, "floor really is ~$500 on $100k notional");
+        assertEq(_posCollateral(alice), floorAmt, "keeps exactly maintenance-level cash");
+        assertGt(floorAmt, 1_000 * BAZAAR_SCALE, "the floor is maintenance-scale, not fee-scale");
     }
 
-    /// Step 2: at the floor, a large position closes in one order. A flat $5 floor would leave too
-    ///         little collateral to cover this close's fee, so the fill would be rejected and the
-    ///         order auto-canceled with zero fill.
+    /// Step 2: at the floor, a large position closes in one order — the retained cash covers the
+    ///         closing fee with maintenance-level headroom.
     function test_atTheFloor_largePositionCloses() public {
         _openPosition(alice, bob, true, 1 * BAZAAR_SCALE);
         _deposit(carol, 200_000 * BAZAAR_SCALE); // counterparty with plenty of margin
@@ -82,8 +85,9 @@ contract RetainedCollateralFloorTest is IntegrationBase {
         vm.warp(vm.getBlockTimestamp() + 3);
         bytes[] memory pu = _priceUpdate(100_000, uint64(vm.getBlockTimestamp()));
         uint256 col = _posCollateral(alice);
+        uint256 floorAmt = _floorForLong(1 * BAZAAR_SCALE, 100_000);
         vm.prank(alice);
-        pair.withdrawCollateral(col - _floorForLong(1, 100_000), pu, 0, 0, 0, "");
+        pair.withdrawCollateral(col - floorAmt, pu, 0, 0, 0, "");
 
         uint256 aliceClose = _placeLimit(alice, false, 1 * BAZAAR_SCALE, 90_000 * BAZAAR_SCALE);
         uint256 carolBuy = _placeLimit(carol, true, 1 * BAZAAR_SCALE, 110_000 * BAZAAR_SCALE);
@@ -94,13 +98,14 @@ contract RetainedCollateralFloorTest is IntegrationBase {
         assertGt(_filledSize(aliceClose), 0, "and it fills");
     }
 
-    /// Step 3: small positions are governed by the $5 absolute minimum, and still close fine.
+    /// Step 3: the floor is purely proportional, so a small position retains proportionally small
+    ///         cash — and still closes fine, because the fees it must cover are proportional too.
     function test_atTheFloor_smallPositionCloses() public {
         _deposit(alice, 2_000 * BAZAAR_SCALE);
         _deposit(bob, 2_000 * BAZAAR_SCALE);
         _deposit(carol, 20_000 * BAZAAR_SCALE);
 
-        // 0.002 BTC: ~$200 notional at $100k -> 0.5% = $1, so the $5 minimum governs.
+        // 0.002 BTC: ~$200 notional at $100k.
         uint256 aOpen = _placeLimit(alice, true, BAZAAR_SCALE / 500, 51_000 * BAZAAR_SCALE);
         uint256 bOpen = _placeLimit(bob, false, BAZAAR_SCALE / 500, 49_000 * BAZAAR_SCALE);
         _roll(2);
@@ -108,10 +113,11 @@ contract RetainedCollateralFloorTest is IntegrationBase {
 
         vm.warp(vm.getBlockTimestamp() + 3);
         bytes[] memory pu = _priceUpdate(100_000, uint64(vm.getBlockTimestamp()));
+        uint256 floorAmt = _floorForLong(BAZAAR_SCALE / 500, 100_000);
         uint256 col = _posCollateral(alice);
         vm.prank(alice);
-        pair.withdrawCollateral(col - (5 * BAZAAR_SCALE), pu, 0, 0, 0, "");
-        assertEq(_posCollateral(alice), 5 * BAZAAR_SCALE, "the $5 minimum governs small positions");
+        pair.withdrawCollateral(col - floorAmt, pu, 0, 0, 0, "");
+        assertEq(_posCollateral(alice), floorAmt, "retains mmrBp of a small notional");
 
         uint256 aliceClose = _placeLimit(alice, false, BAZAAR_SCALE / 500, 90_000 * BAZAAR_SCALE);
         uint256 carolBuy = _placeLimit(carol, true, BAZAAR_SCALE / 500, 110_000 * BAZAAR_SCALE);

@@ -17,8 +17,9 @@ import {BucketLib} from "./BucketLib.sol";
 /// Key invariants:
 ///  • Limits are sorted by limitPrice (DESC longs, ASC shorts), tiebreak orderId ASC.
 ///  • Markets are sorted by maxSlippageBp DESC, tiebreak orderId ASC.
-///  • Margin checks always use normal IMR (against fresh-oracle price). Failure → auto-cancel.
-///    During stale, additionally check 2× IMR; failure-only-under-stale → skip + push to staleSkippedIds.
+///  • Margin checks always use normal IMR (against the batch's cached price). Failure → auto-cancel.
+///    During stale, a fill must also price inside MAX_STALE_DEVIATION_BP of the cached price;
+///    the maker of an out-of-band fill is skipped + pushed to staleSkippedIds (not canceled).
 ///  • maxMatches caps total successful matches across all passes (gas-safety circuit breaker).
 library MatchingEngineLib {
     using EnumerableSet for EnumerableSet.UintSet;
@@ -122,6 +123,9 @@ library MatchingEngineLib {
         BazaarTypes.BatchResult memory result
     ) private {
         _initBuffers(ctx, lists, result);
+        // Fees settle against the deposits ledger in _finalize; every charged fill draws
+        // this budget down so the batch's total fee debit can never exceed the ledger.
+        result.feeBudget = pairVault.totalCollateralDeposited;
         WalkState memory ws = _initWalkState(lists);
 
         if (pairVault.pendingLiqSize != 0) {
@@ -787,16 +791,29 @@ library MatchingEngineLib {
             data.makerTotalFee = data.makerSeqFee + data.makerIntFee + data.makerInsFee;
         }
 
+        // All-or-nothing fee waiver against the deposits-ledger budget: collecting a fee
+        // the budget cannot fund would either wrap the ledger debit in _finalize or push
+        // the shortfall onto insurance, and rejecting the fill instead would freeze the
+        // book exactly when the ledger is drained. The fill proceeds; the maker is
+        // charged nothing and the fee payees receive nothing for it.
+        if (data.makerTotalFee > result.feeBudget) {
+            data.makerSeqFee = 0;
+            data.makerIntFee = 0;
+            data.makerInsFee = 0;
+            data.makerTotalFee = 0;
+        } else {
+            unchecked {
+                result.feeBudget -= data.makerTotalFee;
+            }
+        }
+
         if (!_vaultMarginCheck(orders, positionBuckets, userActiveLimitOrders, makerHead, ctx, result, data)) {
             return true; // margin-fail consumed the head; outer loop will advance
         }
 
         BazaarTypes.PositionBucket memory makerBucket = positionBuckets[makerHead.order.creator];
-        // Existing-portion valuation at the bracket: long bucket → low, short bucket → high.
-        // New fill notional still uses fillPrice inside _checkMargin.
-        BazaarTypes.BucketState memory makerState = BucketLib.calculateState(
-            makerBucket, makerBucket.isLong ? ctx.cachedLow : ctx.cachedHigh, ctx.cachedFundingIdx, ctx.marginReqs
-        );
+        BazaarTypes.BucketState memory makerState =
+            BucketLib.calculateState(makerBucket, ctx.cachedPrice, ctx.cachedFundingIdx, ctx.marginReqs);
 
         _persistFill(orders, positionBuckets, userActiveLimitOrders, makerHead, data.fillSize, ctx.currentBlock);
         BazaarTypes.FillResult memory mr = _applyFillWithState(
@@ -848,9 +865,8 @@ library MatchingEngineLib {
         VaultMatchData memory data
     ) private returns (bool) {
         BazaarTypes.PositionBucket memory makerBucket = positionBuckets[makerHead.order.creator];
-        BazaarTypes.BucketState memory makerState = BucketLib.calculateState(
-            makerBucket, makerBucket.isLong ? ctx.cachedLow : ctx.cachedHigh, ctx.cachedFundingIdx, ctx.marginReqs
-        );
+        BazaarTypes.BucketState memory makerState =
+            BucketLib.calculateState(makerBucket, ctx.cachedPrice, ctx.cachedFundingIdx, ctx.marginReqs);
 
         if (!_checkMargin(
                 makerBucket,
@@ -867,25 +883,6 @@ library MatchingEngineLib {
             _autoCancelOrder(orders, positionBuckets, userActiveLimitOrders, makerHead, ctx);
             makerHead.remaining = 0;
             return false;
-        }
-        if (ctx.isOracleStale) {
-            uint256 staleImrBp = ctx.marginReqs.imrBp * BazaarTypes.STALE_MARGIN_MULTIPLIER;
-            if (!_checkMargin(
-                    makerBucket,
-                    makerState,
-                    makerHead.order.isLong,
-                    data.fillSize,
-                    data.execPrice,
-                    data.makerTotalFee,
-                    ctx.cachedPrice,
-                    staleImrBp,
-                    ctx.marginReqs.mmrBp,
-                    ctx.marginReqs.laggedMmrBp
-                )) {
-                _pushStaleSkipped(result, makerHead.orderId);
-                makerHead.remaining = 0;
-                return false;
-            }
         }
         return true;
     }
@@ -1054,11 +1051,17 @@ library MatchingEngineLib {
         return madeProgress;
     }
 
-    /// @dev Bundle of per-match parameters to keep _matchUserPair's call sites within stack depth.
+    /// @dev Bundle of per-match parameters and mid-match products, structured to keep
+    ///      _matchUserPair and the settle tail within stack depth: everything the tail needs
+    ///      rides behind this one pointer instead of holding its own stack slot across the
+    ///      persist/apply/aggregate/emit calls.
     struct UserMatchParams {
         uint256 fillSize;
         uint256 fillPrice;
         bool makerIsLong;
+        PairFees fees; // written by _matchUserPair after the fee computation
+        BazaarTypes.BucketState longState; // written by _matchUserPair from the long creator's bucket
+        BazaarTypes.BucketState shortState; // written by _matchUserPair from the short creator's bucket
     }
 
     /// @dev Core user-vs-user match (used by Pass B and Pass C). Both heads must be loaded.
@@ -1097,7 +1100,7 @@ library MatchingEngineLib {
                 // Only the MAKER breaches the band: fillPrice IS the maker's effective price by
                 // construction (Pass B: the limit side; Pass C: the older orderId). Retire that
                 // leg alone — recorded in staleSkippedIds so challengeOmission sees a legitimate
-                // skip and rejects, symmetric with the stale-IMR path below.
+                // skip and rejects the challenge.
                 //
                 // The counterparty stays LIVE and retries against the next order on the maker's
                 // side (each pass advances its two sides independently on remaining == 0). It
@@ -1114,36 +1117,45 @@ library MatchingEngineLib {
         }
 
         BazaarTypes.PositionBucket memory longBucketMem = positionBuckets[longHead.order.creator];
-        // Long bucket valued at low (worst-case mark for the long); short bucket at high.
-        BazaarTypes.BucketState memory longState =
-            BucketLib.calculateState(longBucketMem, ctx.cachedLow, ctx.cachedFundingIdx, ctx.marginReqs);
+        p.longState = BucketLib.calculateState(longBucketMem, ctx.cachedPrice, ctx.cachedFundingIdx, ctx.marginReqs);
         BazaarTypes.PositionBucket memory shortBucketMem = positionBuckets[shortHead.order.creator];
-        BazaarTypes.BucketState memory shortState =
-            BucketLib.calculateState(shortBucketMem, ctx.cachedHigh, ctx.cachedFundingIdx, ctx.marginReqs);
+        p.shortState = BucketLib.calculateState(shortBucketMem, ctx.cachedPrice, ctx.cachedFundingIdx, ctx.marginReqs);
 
         // Fees
-        PairFees memory fees = _computePairFees(
+        p.fees = _computePairFees(
             fillSize,
             fillNotional,
             fillPrice,
             p.makerIsLong,
-            longState,
-            shortState,
+            p.longState,
+            p.shortState,
             longBucketMem,
             shortBucketMem,
-            longHead.order.integrator != address(0),
-            shortHead.order.integrator != address(0),
+            longHead,
+            shortHead,
             ctx
         );
+
+        // All-or-nothing fee waiver against the deposits-ledger budget (both sides waived
+        // together so charge == payout holds per fill; rationale in _matchVault).
+        unchecked {
+            uint256 fillFees = p.fees.longTotalFee + p.fees.shortTotalFee;
+            if (fillFees > result.feeBudget) {
+                PairFees memory waived;
+                p.fees = waived;
+            } else {
+                result.feeBudget -= fillFees;
+            }
+        }
 
         // === Margin check both sides — fail under normal → auto-cancel that side, return ===
         if (!_checkMargin(
                 longBucketMem,
-                longState,
+                p.longState,
                 true,
                 fillSize,
                 fillPrice,
-                fees.longTotalFee,
+                p.fees.longTotalFee,
                 ctx.cachedPrice,
                 ctx.marginReqs.imrBp,
                 ctx.marginReqs.mmrBp,
@@ -1155,11 +1167,11 @@ library MatchingEngineLib {
         }
         if (!_checkMargin(
                 shortBucketMem,
-                shortState,
+                p.shortState,
                 false,
                 fillSize,
                 fillPrice,
-                fees.shortTotalFee,
+                p.fees.shortTotalFee,
                 ctx.cachedPrice,
                 ctx.marginReqs.imrBp,
                 ctx.marginReqs.mmrBp,
@@ -1169,79 +1181,65 @@ library MatchingEngineLib {
             shortHead.remaining = 0;
             return true;
         }
-        // === Stale-only failure → skip + push to staleSkippedIds ===
-        if (ctx.isOracleStale) {
-            uint256 staleImrBp = ctx.marginReqs.imrBp * BazaarTypes.STALE_MARGIN_MULTIPLIER;
-            if (!_checkMargin(
-                    longBucketMem,
-                    longState,
-                    true,
-                    fillSize,
-                    fillPrice,
-                    fees.longTotalFee,
-                    ctx.cachedPrice,
-                    staleImrBp,
-                    ctx.marginReqs.mmrBp,
-                    ctx.marginReqs.laggedMmrBp
-                )) {
-                _pushStaleSkipped(result, longHead.orderId);
-                longHead.remaining = 0;
-                return true;
-            }
-            if (!_checkMargin(
-                    shortBucketMem,
-                    shortState,
-                    false,
-                    fillSize,
-                    fillPrice,
-                    fees.shortTotalFee,
-                    ctx.cachedPrice,
-                    staleImrBp,
-                    ctx.marginReqs.mmrBp,
-                    ctx.marginReqs.laggedMmrBp
-                )) {
-                _pushStaleSkipped(result, shortHead.orderId);
-                shortHead.remaining = 0;
-                return true;
-            }
-        }
 
-        // Persist + apply fills
+        _settleUserPair(orders, positionBuckets, userActiveLimitOrders, longHead, shortHead, p, ctx, result, fillSize);
+        return true;
+    }
+
+    /// @dev Persist + apply a crossed user/user fill and fold it into the batch aggregates.
+    ///      Split from _matchUserPair so the match path's frame stays shallow enough for the
+    ///      Yul stack scheduler: the settle tail keeps every struct alive at once, so it reads
+    ///      the fee/state products through `p` rather than holding each as its own stack slot.
+    ///      `fillSize` is passed explicitly (not read from `p`) because the capacity clamp in
+    ///      _matchUserPair may have reduced it below p.fillSize. `fillNotional` is recomputed
+    ///      here rather than passed: it is a pure function of (fillSize, p.fillPrice), so the
+    ///      value is identical.
+    function _settleUserPair(
+        mapping(uint256 => BazaarTypes.Order) storage orders,
+        mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
+        mapping(address => EnumerableSet.UintSet) storage userActiveLimitOrders,
+        Head memory longHead,
+        Head memory shortHead,
+        UserMatchParams memory p,
+        BazaarTypes.MatchContext memory ctx,
+        BazaarTypes.BatchResult memory result,
+        uint256 fillSize
+    ) private {
+        uint256 fillNotional = Math.mulDiv(fillSize, p.fillPrice, BazaarTypes.BAZAAR_SCALE);
         _persistFill(orders, positionBuckets, userActiveLimitOrders, longHead, fillSize, ctx.currentBlock);
         _persistFill(orders, positionBuckets, userActiveLimitOrders, shortHead, fillSize, ctx.currentBlock);
 
         BazaarTypes.FillResult memory longResult = _applyFillWithState(
             longHead.order.creator,
-            longState,
+            p.longState,
             true,
             fillSize,
-            fillPrice,
-            fees.longTotalFee,
+            p.fillPrice,
+            p.fees.longTotalFee,
             ctx,
             orders,
             positionBuckets
         );
         BazaarTypes.FillResult memory shortResult = _applyFillWithState(
             shortHead.order.creator,
-            shortState,
+            p.shortState,
             false,
             fillSize,
-            fillPrice,
-            fees.shortTotalFee,
+            p.fillPrice,
+            p.fees.shortTotalFee,
             ctx,
             orders,
             positionBuckets
         );
 
-        _aggregateUserMatch(result, longResult, shortResult, fees, fillSize, fillNotional, longHead, shortHead);
+        _aggregateUserMatch(result, longResult, shortResult, p.fees, fillSize, fillNotional, longHead, shortHead);
 
         _updateAggregateForOrder(result, longHead.order.orderType, true, longHead.effectivePrice, longHead.orderId);
         _updateAggregateForOrder(result, shortHead.order.orderType, false, shortHead.effectivePrice, shortHead.orderId);
 
-        _accumulateUserPairIntegratorFees(result, longHead, shortHead, fees);
+        _accumulateUserPairIntegratorFees(result, longHead, shortHead, p.fees);
 
-        _emitUserPairEvents(ctx, longHead, shortHead, p, fees, longResult, shortResult, fillSize, fillPrice);
-        return true;
+        _emitUserPairEvents(ctx, longHead, shortHead, p, p.fees, longResult, shortResult, fillSize, p.fillPrice);
     }
 
     function _aggregateUserMatch(
@@ -1376,8 +1374,8 @@ library MatchingEngineLib {
         BazaarTypes.BucketState memory shortState,
         BazaarTypes.PositionBucket memory longBucket,
         BazaarTypes.PositionBucket memory shortBucket,
-        bool longHasIntegrator,
-        bool shortHasIntegrator,
+        Head memory longHead,
+        Head memory shortHead,
         BazaarTypes.MatchContext memory ctx
     ) private pure returns (PairFees memory fees) {
         unchecked {
@@ -1435,8 +1433,8 @@ library MatchingEngineLib {
                 fees.longIntegratorFee = takerIntFee;
                 fees.longInsuranceFee = takerInsFee;
             }
-            if (!longHasIntegrator) fees.longIntegratorFee = 0;
-            if (!shortHasIntegrator) fees.shortIntegratorFee = 0;
+            if (longHead.order.integrator == address(0)) fees.longIntegratorFee = 0;
+            if (shortHead.order.integrator == address(0)) fees.shortIntegratorFee = 0;
             fees.longTotalFee = fees.longSeqFee + fees.longIntegratorFee + fees.longInsuranceFee;
             fees.shortTotalFee = fees.shortSeqFee + fees.shortIntegratorFee + fees.shortInsuranceFee;
         }
@@ -1537,6 +1535,7 @@ library MatchingEngineLib {
     ///         flip), realizes PnL on closing portions, and applies a one-sided incipient-loss debit
     ///         on fresh exposure. Returns false (caller auto-cancels or stale-skips) on any of:
     ///           - open/add: post-debit collateral < required IMR
+    ///           - fresh exposure: incipient loss exceeds collateral (would open insolvent at the mark)
     ///           - close/flip: realized loss exceeds collateral (would create bad debt)
     ///           - partial close: post-realization collateral < MMR on the remainder
     ///           - flip: post-close collateral < IMR on residual
@@ -1563,18 +1562,26 @@ library MatchingEngineLib {
         uint256 collateralAfterFee = state.effectiveCollateral - fee;
 
         uint256 newExposureSize; // size of fresh exposure (drives incipient-loss debit)
-        uint256 newTotalNotional; // notional driving IMR/MMR requirement
+        // Notional driving the IMR/MMR requirement. Fresh exposure is valued at the oracle price,
+        // never at the price the fill crossed at: the execution price sets the position's cost basis
+        // (entryValue), while the requirement must cover what the position is worth now — which is
+        // what calculateState, liquidation and withdrawal all measure it against one block later.
+        // Pricing it at the fill would let a cross far below the mark open a large position against
+        // a near-zero requirement, and would admit positions already past maintenance margin the
+        // moment they exist. For fresh exposure the execution price enters only through the
+        // incipient-loss debit below, which charges the fill-vs-mark gap exactly once.
+        uint256 newTotalNotional;
         uint256 effectiveBp;
 
         if (bucket.size == 0) {
             // Open from flat
             newExposureSize = fillSize;
-            newTotalNotional = Math.mulDiv(fillSize, executionPrice, BazaarTypes.BAZAAR_SCALE);
+            newTotalNotional = Math.mulDiv(fillSize, cachedPrice, BazaarTypes.BAZAAR_SCALE);
             effectiveBp = imrBp;
         } else if (bucket.isLong == isLong) {
             // Same-side add
             newExposureSize = fillSize;
-            newTotalNotional = state.currentNotional + Math.mulDiv(fillSize, executionPrice, BazaarTypes.BAZAAR_SCALE);
+            newTotalNotional = state.currentNotional + Math.mulDiv(fillSize, cachedPrice, BazaarTypes.BAZAAR_SCALE);
             effectiveBp = imrBp;
         } else if (fillSize <= bucket.size) {
             // Partial / full close — apply realized PnL up front, reject if it underwaters collateral
@@ -1610,19 +1617,25 @@ library MatchingEngineLib {
             collateralAfterFee = uint256(postCloseCol);
 
             newExposureSize = fillSize - bucket.size;
-            newTotalNotional = Math.mulDiv(newExposureSize, executionPrice, BazaarTypes.BAZAAR_SCALE);
+            newTotalNotional = Math.mulDiv(newExposureSize, cachedPrice, BazaarTypes.BAZAAR_SCALE);
             effectiveBp = imrBp;
         }
 
-        // One-sided incipient PnL on fresh exposure: debit losses, ignore gains
+        // One-sided incipient PnL on fresh exposure: debit losses, ignore gains. The debit must be
+        // fully coverable by collateral. Flooring it at 0 would admit a fill whose fresh exposure is
+        // already underwater by more than the account holds — the position opens insolvent at the
+        // oracle mark, seizable for far less than it owes, while the gap between execution price and
+        // mark accrues to the counterparty as profit drawn from totalCollateralDeposited. Reject
+        // instead, matching the realized-loss gates on the close and flip branches.
         if (newExposureSize > 0) {
+            uint256 loss;
             if (isLong && executionPrice > cachedPrice) {
-                uint256 loss = Math.mulDiv(newExposureSize, executionPrice - cachedPrice, BazaarTypes.BAZAAR_SCALE);
-                collateralAfterFee = collateralAfterFee > loss ? collateralAfterFee - loss : 0;
+                loss = Math.mulDiv(newExposureSize, executionPrice - cachedPrice, BazaarTypes.BAZAAR_SCALE);
             } else if (!isLong && cachedPrice > executionPrice) {
-                uint256 loss = Math.mulDiv(newExposureSize, cachedPrice - executionPrice, BazaarTypes.BAZAAR_SCALE);
-                collateralAfterFee = collateralAfterFee > loss ? collateralAfterFee - loss : 0;
+                loss = Math.mulDiv(newExposureSize, cachedPrice - executionPrice, BazaarTypes.BAZAAR_SCALE);
             }
+            if (loss > collateralAfterFee) return false;
+            collateralAfterFee -= loss;
         }
 
         uint256 requiredMargin = Math.mulDiv(effectiveBp, newTotalNotional, BazaarTypes.BP_SCALE);
@@ -1947,10 +1960,11 @@ library MatchingEngineLib {
             result.deltaShortWeightedEntry
         );
 
-        unchecked {
-            pairVault.totalCollateralDeposited -= result.totalUserSeqFees + result.totalIntegratorFees
-            + result.totalInsuranceFees;
-        }
+        // Bounded by the walk's fee budget (seeded from this ledger), so this cannot
+        // underflow; checked arithmetic makes a budget regression revert loudly instead of
+        // wrapping the ledger to ~2^256 and poisoning every downstream solvency check.
+        pairVault.totalCollateralDeposited -= result.totalUserSeqFees + result.totalIntegratorFees
+        + result.totalInsuranceFees;
 
         // Apply Pass A vault PnL through insurance
         if (result.totalVaultPnl > 0) {

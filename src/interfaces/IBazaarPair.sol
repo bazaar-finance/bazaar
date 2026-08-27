@@ -51,15 +51,10 @@ interface IBazaarPair {
     ///         book at this price once the window elapses.
     function fixSettlementPrice(uint256 settlementPrice) external;
 
-    /// @notice Credits a forfeited insurer-termination bond into the insurance fund.
-    /// @dev Called by BazaarPairTerminator after it has already `safeTransfer`'d the USDC
-    ///      bond to this pair. Updates the bookkeeping so the contract's USDC balance
-    ///      and the insurance fund accounting stay in sync.
-    function creditInsuranceFromTerminator(uint256 amountBazaarPrecision) external;
-
-    /// @notice Credits a stale-batch-challenge slash share into the insurance fund.
-    /// @dev Called by BazaarSequencer after it has already `safeTransfer`'d the USDC share to this
-    ///      pair. Restricted to the registered sequencer; keeps USDC balance and insurance
-    ///      accounting in sync.
-    function creditInsuranceFromSequencer(uint256 amountBazaarPrecision) external;
+    /// @notice Credits already-transferred USDC into the insurance fund bookkeeping.
+    /// @dev Called by BazaarPairTerminator (forfeited insurer-termination bonds) or
+    ///      BazaarSequencer (stale-batch-challenge slash shares) after the caller has already
+    ///      `safeTransfer`'d the matching USDC to the pair, keeping the contract's USDC balance
+    ///      and the insurance accounting in sync.
+    function creditInsurance(uint256 amountBazaarPrecision) external;
 }

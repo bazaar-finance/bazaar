@@ -5,6 +5,7 @@ libs = ["lib"]
 via_ir = true
 optimizer = true
 optimizer_runs = 150
+dynamic_test_linking = true
 solc_version = "0.8.34"
 evm_version = "cancun"
 remappings = [
@@ -20,6 +21,15 @@ fs_permissions = [{ access = "read-write", path = "./deployments" }]
 # would compile those two differently from everything else, so a green size gate would say nothing
 # about the bytecode actually deployed. The runtime cost is modest: the hot paths (matchBatch,
 # liquidation, settlement) are storage-dominated, where optimizer_runs matters least.
+
+# dynamic_test_linking makes test contracts resolve library addresses at deploy time inside the test
+# EVM rather than at compile time. BazaarPair links the ten external libraries that
+# DeployLibraries.s.sol deploys, and most of the suite reaches BazaarPair transitively, so this is
+# what keeps a one-line edit to any library body from re-running the IR pipeline over nearly the
+# whole dependency graph. That is the dominant build cost: via_ir is mandatory here — BazaarPair
+# exceeds the stack limit under legacy codegen — and the IR pipeline is bounded by solc's peak
+# memory rather than by CPU. Deployed bytecode is byte-identical with the setting on or off, so
+# ContractSizeTest still gates the artifact that ships.
 
 [invariant]
 runs = 64
@@ -42,12 +52,10 @@ ignore = ["test/**", "script/**"]
 [rpc_endpoints]
 arbitrum_mainnet = "${ARBITRUM_MAINNET_RPC_URL}"
 arbitrum_sepolia = "${ARBITRUM_SEPOLIA_RPC_URL}"
-base_sepolia = "${BASE_SEPOLIA_RPC_URL}"
 
 [etherscan]
 arbitrum_mainnet = { key = "${ARBISCAN_API_KEY}", url = "https://api.arbiscan.io/api" }
 arbitrum_sepolia = { key = "${ARBISCAN_API_KEY}", url = "https://api-sepolia.arbiscan.io/api" }
-base_sepolia = { key = "${BASESCAN_API_KEY}", url = "https://api-sepolia.basescan.org/api" }
 
 # External library linking is NOT configured here. `libraries` is a single global key with no
 # per-network scoping, so one pasted list would be reused by every deploy target — linking, say, a

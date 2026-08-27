@@ -15,7 +15,7 @@ Each function takes a trailing `(nonce, deadline, relayerFee, signature)` tuple:
 | Nonces | strictly sequential per user |
 | Deadline | must not be passed, and at most **30 s** in the future — a signature cannot be warehoused |
 | Relayer fee | ≤ **$1** per action — deducted from the payout on withdrawals, pulled from the user's wallet alongside deposits (and for insurance-withdrawal requests), or charged to bucket collateral for order create/cancel |
-| Price staleness | relayed calls use the strict 2 s tier, not the 10 s user tier — relayers are bots |
+| Price staleness | the same 2 s bound as every other path — but `priceUpdate` sits outside the signed payload, so the relayer attaches a fresh price at submission and an earlier signature still lands on it |
 
 Typed structs exist for `depositCollateral`, `withdrawCollateral`, `createOrder`, `cancelOrders`, `depositToInsurance`, `requestInsuranceWithdrawal`, `executeInsuranceWithdrawal`. `BazaarPairLens.getEip712Constants()` and `getTypehashes()` expose everything an integrator needs to build signatures.
 

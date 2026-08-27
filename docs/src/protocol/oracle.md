@@ -2,14 +2,14 @@
 
 `BazaarOracle` is a **stateless Pyth adapter** shared by all pairs. It never stores prices — each pair caches its own last price — and it is entirely permissionless: anyone can push Pyth updates (paying Pyth's fee in ETH) or register composite feeds.
 
-## Freshness tiers
+## Freshness
 
-| Path | Staleness bound |
-|---|---|
-| Bots & meta-transactions (sequencer batches, liquidations, relayed user actions) | **2 s** (`MAX_PRICE_STALENESS`) |
-| Direct user transactions | **10 s** (`MAX_PRICE_STALENESS_USER`) |
+A supplied Pyth price must be at most **2 s** old (`MAX_PRICE_STALENESS`) on every price-resolving entry point — sequencer batches, liquidations, ADL, order creation, collateral withdrawal, insurance withdrawal — no matter who submits the transaction.
 
-Every price-touching entry point accepts a `priceUpdate` byte array so callers can atomically refresh Pyth and act on the fresh price in one transaction.
+Each of those entry points accepts a `priceUpdate` byte array so callers can atomically refresh Pyth and act on the fresh price in one transaction. Two seconds is a bot's budget, not a human's: the update travels as calldata, so it is fixed at signing time, and wallet-confirmation latency alone normally exceeds the window. A caller who cannot submit that fast has two routes:
+
+- **Send an empty `priceUpdate`** and let the call resolve against the pair's on-chain Pyth cache, which is checked against the same 2 s bound at execution time. On an actively matched pair the sequencer's own batches keep the cache inside it; on a quiet pair they do not, and the call reverts.
+- **Sign a meta-transaction** and let a relayer submit it. `priceUpdate` is not part of any EIP-712 payload, so the relayer attaches a fresh price at submission time and a signature minted earlier still lands on it. See [Meta-transactions](meta-transactions.md).
 
 ## Confidence brackets
 
@@ -24,10 +24,12 @@ Non-positive prices revert unconditionally on every path — operating on a zero
 
 Equities and FX stop ticking when their venues close, and a perp on them cannot simply halt — funding, margin, and liquidations still need a price. Pairs listed as *not continuously traded* keep operating on the last price under tightened rules:
 
-- New fills require **2× initial margin** (`STALE_MARGIN_MULTIPLIER`).
-- Fill prices are confined to ±10% of the last stored price (`MAX_STALE_DEVIATION_BP`).
+- Fill prices are confined to ±10% of the last stored price (`MAX_STALE_DEVIATION_BP`); the maker of an out-of-band fill is skipped and witnessed (`staleSkippedIds`), not canceled.
 - Market orders are rejected at creation, and Pass B (markets × limits) is skipped in batches.
-- Orders that pass normal margin but fail the stale 2× check are skipped and witnessed (`staleSkippedIds`), not canceled.
+- Margin carries **no stale surcharge**: closure-gap risk is priced into the pair's always-on IMR instead — the larger of 2× its vol curve and its own observed reopen gap (see [Margin](margin.md)) — so a fill needs the same IMR whether the batch is fresh or stale.
+- **Position holders cannot withdraw collateral against the stale fallback.** Around a closure, off-chain venues (pre-market, 24/7 books) print the reopen hours before the oracle can, so releasing equity at the frozen mark would let a holder who is already dead at the real price withdraw down to an IMR computed at the stale one — converting their loss into vault deficit that a termination passes to the winning side. No margin *rate* closes that channel (a rate can't price information the oracle hasn't seen); withholding release does. While stale, the vault accepts deposits but releases no position-holder equity; flat and order-only accounts are unaffected, and withdrawals resume with the first fresh print.
+
+Every reopen also teaches the margin curve: the first stored price after a ≥ 1 h gap — a closure, a trading halt, or a market break — is compared against the last price before it, and the |return| feeds the reopen-gap floor.
 
 When no fresh price is available, reads fall down a **confidence ladder**: any-age spot if its confidence still qualifies → Pyth's EMA price if *its* confidence qualifies → the pair's last stored price. Each rung is gated, so garbage never silently becomes the settlement price.
 

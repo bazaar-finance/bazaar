@@ -12,7 +12,7 @@ Losses beyond the fund become `deficit` — realized bad debt — which [winds t
 
 ## Target sizing
 
-The fund's target is **2%–10% of open interest**, interpolated on the same volatility EMA that drives margin, and floored at 3× the realized liquidation-gap EMA. The taker insurance fee then steers the fund toward target: sharply higher when underfunded, discounted to zero when at 2× target. Risk-*reducing* fills pay at most the base closing fee (keeping any surplus discount) — deleveraging is never punished.
+The fund's target is **2%–10% of open interest**, the largest of three legs: interpolated on the same volatility EMA that drives margin; floored at 3× the realized liquidation-gap EMA; and — for non-continuously traded pairs — floored at **half the learned reopen gap** (a reopen of that size against one side of a balanced book creates bad debt of at most gap/2 of total OI, so the backstop tracks the same demonstrated tail the IMR floor prices, *before* losses realize rather than after). The taker insurance fee then steers the fund toward target: sharply higher when underfunded, discounted to zero when at 2× target. Risk-*reducing* fills pay at most the base closing fee (keeping any surplus discount) — deleveraging is never punished.
 
 ## LP mechanics
 

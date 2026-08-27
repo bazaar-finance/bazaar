@@ -23,7 +23,7 @@ assertionResolvedCallback / settleDeploymentProposal
 The assertion text embeds seven objective criteria:
 
 1. **Feed validity** — `baseFeedId` exists in Pyth's registry and matches the description.
-2. **Trading-schedule flag** — `isContinuouslyTraded = true` only for genuinely 24/7 assets (crypto). Stocks, FX, and anything with market hours must be `false` (they get a 1.5× margin multiplier and the stale-oracle regime). Composites must be `false`.
+2. **Trading-schedule flag** — `isContinuouslyTraded = true` only for genuinely 24/7 assets (crypto). Stocks, FX, and anything with market hours must be `false` (their IMR is 2× the larger of the vol curve and the pair's observed reopen gap, and they get the stale-oracle regime). Composites must be `false`.
 3. **Eligible asset** — an actual tradeable asset or broad market index, USD-denominated.
 4. **Composite quote leg** — non-USD quotes only through approved fiat legs (EUR, GBP, JPY, CHF, CAD, AUD, NZD, SEK, NOK, DKK, SGD, HKD, CNH).
 5. **Linear, non-expiring spot exposure** — the test is: *could someone hold this asset indefinitely and experience exactly its price change?* Futures, options, bonds, leveraged/inverse products, volatility indices, rate products, pegged/rebased assets, and prediction markets are excluded.

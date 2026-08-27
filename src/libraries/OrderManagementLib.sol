@@ -165,9 +165,14 @@ library OrderManagementLib {
             if (params.orderType == BazaarTypes.OrderType.Limit) {
                 executionPrice = orderLimitPrice;
             } else if (params.orderType == BazaarTypes.OrderType.Market) {
-                executionPrice = params.isLong
-                    ? currentPrice * (BazaarTypes.BP_SCALE + orderMaxSlippageBp) / BazaarTypes.BP_SCALE
-                    : currentPrice * (BazaarTypes.BP_SCALE - orderMaxSlippageBp) / BazaarTypes.BP_SCALE;
+                // Both sides margin at the upper slippage bound. The fill price is the maker's, so
+                // it isn't known here — maxSlippageBp only states how far from currentPrice the
+                // order will execute, and it doubles as the market-order priority key in the
+                // matching walk, where a wider tolerance sorts ahead. Pricing a short at
+                // currentPrice * (BP_SCALE - slip) would let maximum slippage buy that queue
+                // position for less required margin than a tight tolerance; charging the upper
+                // bound on both sides keeps a wider tolerance strictly more expensive.
+                executionPrice = currentPrice * (BazaarTypes.BP_SCALE + orderMaxSlippageBp) / BazaarTypes.BP_SCALE;
             } else {
                 executionPrice = orderTriggerPrice > orderLimitPrice ? orderTriggerPrice : orderLimitPrice;
             }
@@ -206,11 +211,7 @@ library OrderManagementLib {
             }
 
             if (newTotalNotional > currentState.currentNotional || bucket.size == 0) {
-                uint256 effectiveImrBp = params.marginReqs.imrBp;
-                if (params.isOracleStale) {
-                    effectiveImrBp = effectiveImrBp * BazaarTypes.STALE_MARGIN_MULTIPLIER;
-                }
-                uint256 requiredMargin = Math.mulDiv(effectiveImrBp, newTotalNotional, BazaarTypes.BP_SCALE);
+                uint256 requiredMargin = Math.mulDiv(params.marginReqs.imrBp, newTotalNotional, BazaarTypes.BP_SCALE);
 
                 if (currentState.effectiveCollateral < requiredMargin) {
                     revert OrderManagementLib__InsufficientMarginAfterOrder(

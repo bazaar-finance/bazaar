@@ -2350,13 +2350,15 @@ contract MatchingEngineTest is Test {
         assertEq(_aaplOrderFilledSize(shortId), size);
     }
 
-    /// @notice Order that passes normal IMR but fails 2× IMR during stale → pushed to
-    ///         staleSkippedIds and NOT filled. Counterparty also not filled.
-    function testStale_UndermarginedLimit_GoesToStaleSkippedIds() public {
-        // AAPL is non-continuously-traded → IMR has a 1.5× multiplier (30% effective).
-        // For 1 share @ ~$200: normal IMR ≈ $60.60; stale 2× IMR ≈ $121.20.
-        // Give alice $80 — passes creation + normal match IMR, fails stale 2× IMR.
-        _depositAapl(alice, 80 * BAZAAR_SCALE);
+    /// @notice Stale batches carry no margin surcharge: an order margined for exactly the normal
+    ///         IMR (plus fees) fills during stale on the same terms as a fresh batch — the pair's
+    ///         gap risk is already priced into the IMR itself (non-continuous 2x multiplier +
+    ///         reopen-gap floor), so staleness gates fills only through the deviation band.
+    function testStale_ThinButImrMarginedLimit_StillFills() public {
+        // AAPL is non-continuously-traded → warmup IMR is 40% (2000bp x 2). For 1 share filling
+        // at the maker's $202 limit: IMR ≈ $80.80. Give alice $100 — comfortably above IMR+fees
+        // but far below any 2x surcharge, which would demand ~$161.60.
+        _depositAapl(alice, 100 * BAZAAR_SCALE);
         _depositAapl(bob, 20_000 * BAZAAR_SCALE);
 
         uint256 size = 1 * BAZAAR_SCALE;
@@ -2366,13 +2368,13 @@ contract MatchingEngineTest is Test {
         vm.warp(block.timestamp + 30);
         vm.roll(block.number + 2);
 
+        vm.recordLogs();
         uint256 success = _matchAaplStale(_lists(_one(longId), _one(shortId), _empty(), _empty()), 10);
 
-        assertEq(success, 0, "stale-skipped: no fill happens");
-        assertEq(_aaplOrderFilledSize(longId), 0, "long not filled");
-        // Importantly: the long is NOT auto-canceled. It survives for a future fresh batch.
-        (,,,,,,,,,,,, uint64 cb,) = aaplPair.orders(longId);
-        assertEq(cb, 0, "long not auto-canceled - preserved for fresh batches");
+        assertEq(success, 1, "IMR-margined order fills during stale without surcharge");
+        assertEq(_aaplOrderFilledSize(longId), size, "long filled in full");
+        uint256[] memory skipped = _staleSkippedFromLogs();
+        assertEq(skipped.length, 0, "no stale-skip entries: the band is the only skip path");
     }
 
     /// @notice Market orders are silently skipped at head-load during a stale batch.
@@ -3098,11 +3100,11 @@ contract MatchingEngineTest is Test {
     // ║   STALE-CHALLENGE INSURANCE CREDIT (sequencer → pair fund)   ║
     // ╚══════════════════════════════════════════════════════════════╝
 
-    /// @notice Only the registered sequencer may credit the insurance fund.
+    /// @notice Only the terminator or the registered sequencer may credit the insurance fund.
     function testCreditInsuranceFromSequencer_OnlySequencer() public {
         vm.prank(makeAddr("notSequencer"));
-        vm.expectRevert(BazaarPair.BazaarPair__OnlySequencer.selector);
-        pair.creditInsuranceFromSequencer(1 * BAZAAR_SCALE);
+        vm.expectRevert(BazaarPair.BazaarPair__UnauthorizedInsuranceCreditor.selector);
+        pair.creditInsurance(1 * BAZAAR_SCALE);
     }
 
     /// @notice The sequencer's half of a stale-batch slash lands in the pair's insurance fund,
@@ -3117,7 +3119,7 @@ contract MatchingEngineTest is Test {
         usdc.mint(address(sequencer), amountUsdc);
         vm.startPrank(address(sequencer));
         usdc.transfer(address(pair), amountUsdc);
-        pair.creditInsuranceFromSequencer(amount);
+        pair.creditInsurance(amount);
         vm.stopPrank();
 
         (,,,,, uint256 insAfter,,,,,,) = pair.pairVault();

@@ -17,7 +17,7 @@ Stops are trigger-gated against the **batch's settlement oracle price**, not a s
 ## Creation rules
 
 - Minimum order notional **$5**, with one exemption: an exact full-close of your position is always allowed.
-- Initial-margin check at creation covers **worst-case exposure**: your position plus all resting orders in whichever direction is worse — including the flip case. Under a stale oracle the requirement doubles.
+- Initial-margin check at creation covers **worst-case exposure**: your position plus all resting orders in whichever direction is worse — including the flip case. The requirement is the same under a stale oracle — gap risk lives in non-24/7 markets' always-on margin, not in a stale-mode rate.
 - Anti-DoS caps: ≤ **100** active Limit+StopLimit orders per user, **1** active Market order, 1 TakeProfit + 1 StopLoss per position. These bound both the sequencer's calldata and the exposure-tally iteration cost.
 - Lifetimes are stamped in Arbitrum L2 blocks: minimum ~3 s (12 blocks), maximum ~1 year; market orders always ~3 s; TP/SL never expire.
 - Every order can carry an `integrator` address that earns a [referral fee](fees.md) on fills.

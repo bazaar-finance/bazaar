@@ -147,4 +147,76 @@ contract HaltGuardMatrixTest is IntegrationBase {
         vm.expectRevert(BazaarPair.BazaarPair__OnlyUma.selector);
         pair.fixSettlementPrice(50_000 * BAZAAR_SCALE);
     }
+
+    // ==================== sweep-window entry guards ====================
+
+    /// @notice Fixing the settlement price pulls a still-future scheduled cutoff back to the fix
+    ///         time, so the cutoff-keyed trading guards engage the moment the window opens rather
+    ///         than at the original cutoff — a live market must never coexist with a frozen
+    ///         settlement price.
+    function test_fixSettlement_futureCutoff_pulledBackToFixTime() public {
+        _stdstore.target(address(pair)).sig("scheduledTerminationTs()").checked_write(vm.getBlockTimestamp() + 3 days);
+
+        vm.prank(pair.umaContract());
+        pair.fixSettlementPrice(50_000 * BAZAAR_SCALE);
+        assertEq(pair.scheduledTerminationTs(), vm.getBlockTimestamp(), "cutoff clamped to the fix time");
+
+        uint64 obs = uint64(vm.getBlockNumber()) - 1;
+        vm.prank(seq);
+        vm.expectRevert(BazaarPair.BazaarPair__PairScheduledForTermination.selector);
+        pair.matchBatch(_emptyLists(), 1, emptyPu, obs);
+    }
+
+    /// @notice A cutoff already in the past is preserved by the fix: on the scheduled path
+    ///         lastTradingTs anchors the settlement-tick window and the price-storage freeze, so
+    ///         the fix must not move it.
+    function test_fixSettlement_pastCutoff_preserved() public {
+        uint256 cutoff = vm.getBlockTimestamp() - 1;
+        _stdstore.target(address(pair)).sig("scheduledTerminationTs()").checked_write(cutoff);
+
+        vm.prank(pair.umaContract());
+        pair.fixSettlementPrice(50_000 * BAZAAR_SCALE);
+        assertEq(pair.scheduledTerminationTs(), cutoff, "past cutoff untouched");
+    }
+
+    /// @notice The sweep guards key on the settlement latch itself: with settlementPriceFixedTs
+    ///         set and no cutoff stamped at all, matching, orders and both deposit paths still
+    ///         halt. The freeze must not depend on the cutoff bookkeeping of whichever path fixed
+    ///         the price.
+    function test_sweepWindow_haltsEntryPoints_withoutCutoffStamp() public {
+        _stdstore.target(address(pair)).sig("settlementPriceFixedTs()").checked_write(uint256(1));
+        assertEq(pair.scheduledTerminationTs(), 0, "no cutoff stamped");
+
+        uint64 obs = uint64(vm.getBlockNumber()) - 1;
+        vm.prank(seq);
+        vm.expectRevert(BazaarPair.BazaarPair__SweepWindowActive.selector);
+        pair.matchBatch(_emptyLists(), 1, emptyPu, obs);
+
+        vm.prank(alice);
+        vm.expectRevert(BazaarPair.BazaarPair__SweepWindowActive.selector);
+        pair.createOrder(
+            BazaarTypes.OrderType.Limit,
+            0,
+            49_000 * BAZAAR_SCALE,
+            0,
+            BAZAAR_SCALE / 10,
+            true,
+            false,
+            uint64(vm.getBlockNumber() + 500_000),
+            address(0),
+            emptyPu,
+            0,
+            0,
+            0,
+            ""
+        );
+
+        vm.startPrank(alice);
+        usdc.approve(address(pair), 20 * USDC_SCALE);
+        vm.expectRevert(BazaarPair.BazaarPair__SweepWindowActive.selector);
+        pair.depositCollateral(1 * BAZAAR_SCALE, 0, 0, 0, "", "");
+        vm.expectRevert(BazaarPair.BazaarPair__SweepWindowActive.selector);
+        pair.depositToInsurance(10 * BAZAAR_SCALE, 0, 0, 0, "", "");
+        vm.stopPrank();
+    }
 }

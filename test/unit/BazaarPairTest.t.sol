@@ -885,7 +885,7 @@ contract BazaarPairTest is Test {
         _depositCollateral(btcPair, user1, 15_000 * BAZAAR_SCALE);
         _simulateOpenPosition(user1);
 
-        // Price published 40 seconds ago — exceeds MAX_PRICE_STALENESS_USER (30s) for direct user calls
+        // Price published 40 seconds ago — far beyond MAX_PRICE_STALENESS
         bytes[] memory staleUpdate = _createBtcPriceUpdate(uint64(block.timestamp - 40));
 
         vm.prank(user1);
@@ -968,20 +968,17 @@ contract BazaarPairTest is Test {
 
     // ==================== Helper: Simulate Emergency Termination ====================
 
-    // Storage layout constants (from `forge inspect BazaarPair storage-layout`)
-    // All slots after pairVault are +1 vs the original because the Vault struct gained a
-    // trailing `deficit` field (realized-bad-debt accumulator), growing it by one slot.
+    // Storage layout constants — these target internal vars with no getter, so they are read
+    // straight out of storage. Verify any change against `forge inspect BazaarPair
+    // storage-layout`: adding or resizing a state variable declared earlier in BazaarPair shifts
+    // every slot below it. The helpers assert a public getter afterward where one exists, so a
+    // stale slot fails loudly rather than silently writing an unrelated word.
     // Slot 29: adlLongs (byte 0) | isPairTerminatedEmergency (byte 1) | isPairTerminatedNormal (byte 2)
     uint256 constant SLOT_TERMINATION_FLAGS = 29;
     uint256 constant SLOT_SCHEDULED_TERMINATION_TS = 30;
-    // Bumped +3 from original (59/60/61) for the three insurance-maturity mappings, then +1
-    // for the Vault `deficit` field.
-    // Bumped +1 (from 63/64/65/66) for the MarginRequirements.laggedMmrBp field, which grew the
-    // `marginRequirements` storage struct (declared before these vars) by one slot.
-    uint256 constant SLOT_NORMAL_TERMINATION_PRICE = 64;
-    uint256 constant SLOT_EMERGENCY_HAIRCUT_BP = 65;
-    // (the winners-payout slot was deleted pre-deployment; profit ratio lives in terminalState)
-    uint256 constant SLOT_NORMAL_COLLATERAL_RATIO = 66; // normalTerminalCollateralRatioBp (black-swan backstop)
+    uint256 constant SLOT_NORMAL_TERMINATION_PRICE = 65;
+    uint256 constant SLOT_EMERGENCY_HAIRCUT_BP = 66; // emergencyTerminalCollateralWithdrawalRatioBp
+    uint256 constant SLOT_NORMAL_COLLATERAL_RATIO = 67; // normalTerminalCollateralRatioBp (black-swan backstop)
 
     /// @dev Set isPairTerminatedEmergency = true in the packed slot 29 and write haircut bp.
     function _simulateEmergencyTermination(BazaarPair pair, uint256 haircutBp) internal {
@@ -1230,14 +1227,18 @@ contract BazaarPairTest is Test {
         btcPair.withdrawCollateral(depositAmount, emptyPriceUpdate, 0, 0, 0, "");
     }
 
-    // ==================== withdrawCollateral: Meta-tx isMetaTx Staleness Tests ====================
+    // ==================== withdrawCollateral: Price Staleness Tests ====================
 
-    function testWithdrawCollateral_MetaTxZeroFee_Uses3sStaleness() public {
+    /// @dev MAX_PRICE_STALENESS applies to the supplied update whoever submits it, so the same
+    ///      over-age price is rejected on the relayed path and the direct one alike. A zero-fee
+    ///      relay is covered explicitly because it is the cheapest way to reach the meta-tx
+    ///      branch, and nothing about the fee should move the freshness gate.
+    function testWithdrawCollateral_MetaTxZeroFee_RejectsStalePrice() public {
         // Deposit and open position
         _depositCollateral(btcPair, user1, 15_000 * BAZAAR_SCALE);
         _simulateOpenPosition(user1);
 
-        // Price published 5 seconds ago — passes 30s user staleness but fails 3s meta-tx staleness
+        // Price published 5 seconds ago — beyond MAX_PRICE_STALENESS
         bytes[] memory staleUpdate = _createBtcPriceUpdate(uint64(block.timestamp - 5));
 
         uint256 nonce = 0;
@@ -1246,21 +1247,35 @@ contract BazaarPairTest is Test {
 
         bytes memory sig = _signWithdrawCollateral(btcPair, USER1_PK, 1_000 * BAZAAR_SCALE, nonce, deadline, relayerFee);
 
-        // Relayer submits with zero fee — should use 3s staleness and revert
         vm.prank(relayer);
         vm.expectRevert(); // stale price
         btcPair.withdrawCollateral(1_000 * BAZAAR_SCALE, staleUpdate, nonce, deadline, relayerFee, sig);
     }
 
-    function testWithdrawCollateral_DirectCall_Uses30sStaleness() public {
+    function testWithdrawCollateral_DirectCall_RejectsStalePrice() public {
         // Deposit and open position
         _depositCollateral(btcPair, user1, 15_000 * BAZAAR_SCALE);
         _simulateOpenPosition(user1);
 
-        // Price published 5 seconds ago — passes 30s user staleness
-        bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp - 5));
+        // Price published 5 seconds ago — beyond MAX_PRICE_STALENESS
+        bytes[] memory staleUpdate = _createBtcPriceUpdate(uint64(block.timestamp - 5));
 
-        // Direct call — should use 30s staleness and succeed
+        vm.prank(user1);
+        vm.expectRevert(); // stale price
+        btcPair.withdrawCollateral(1_000 * BAZAAR_SCALE, staleUpdate, 0, 0, 0, "");
+    }
+
+    /// @dev Pins the accepting edge of the window: Pyth admits an update whose age equals the
+    ///      bound, so 2s old must still settle a direct withdrawal. Without this the reverting
+    ///      cases above would also pass if the gate had collapsed to "only a same-second price".
+    function testWithdrawCollateral_DirectCall_AcceptsPriceAtStalenessBound() public {
+        // Deposit and open position
+        _depositCollateral(btcPair, user1, 15_000 * BAZAAR_SCALE);
+        _simulateOpenPosition(user1);
+
+        // Price published exactly MAX_PRICE_STALENESS ago — the oldest update still admissible
+        bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp - 2));
+
         vm.prank(user1);
         btcPair.withdrawCollateral(1_000 * BAZAAR_SCALE, priceUpdate, 0, 0, 0, "");
 
@@ -1382,6 +1397,81 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert();
         btcPair.withdrawCollateral(5_001 * BAZAAR_SCALE, priceUpdate, 0, 0, 0, "");
+    }
+
+    /// @dev Mirror of _simulateOpenPosition for the AAPL pair: bucket fields straight into
+    ///      storage plus the vault OI aggregates the health checks read.
+    function _simulateAaplLong(address user, uint256 size, uint256 entryValue) internal {
+        _stdstore.target(address(aaplPair)).sig("positionBuckets(address)").with_key(user).depth(0).checked_write(true); // isLong
+        _stdstore.target(address(aaplPair)).sig("positionBuckets(address)").with_key(user).depth(1).checked_write(size);
+        _stdstore.target(address(aaplPair)).sig("positionBuckets(address)").with_key(user).depth(2).checked_write(
+            entryValue
+        );
+
+        bytes32 currentLongOI = vm.load(address(aaplPair), bytes32(SLOT_PAIR_VAULT_TOTAL_LONG_OI));
+        vm.store(address(aaplPair), bytes32(SLOT_PAIR_VAULT_TOTAL_LONG_OI), bytes32(uint256(currentLongOI) + size));
+        bytes32 currentEntrySum = vm.load(address(aaplPair), bytes32(SLOT_PAIR_VAULT_LONG_WEIGHTED_ENTRY_SUM));
+        vm.store(
+            address(aaplPair),
+            bytes32(SLOT_PAIR_VAULT_LONG_WEIGHTED_ENTRY_SUM),
+            bytes32(uint256(currentEntrySum) + entryValue)
+        );
+    }
+
+    /// @dev Build a MockPyth price update for AAPL at an arbitrary price (expo -8, 0.1% conf).
+    function _createAaplPriceUpdateAtPrice(uint256 priceUsd, uint64 publishTime)
+        internal
+        view
+        returns (bytes[] memory priceUpdate)
+    {
+        int64 pythPrice = int64(int256(priceUsd * 1e8));
+        uint64 conf = uint64(priceUsd * 1e8 / 1000);
+        bytes memory priceData = mockPyth.createPriceFeedUpdateData(
+            AAPL_USD_FEED_ID,
+            pythPrice,
+            conf,
+            BTC_PYTH_EXPO,
+            pythPrice,
+            conf,
+            publishTime,
+            publishTime > 0 ? publishTime - 1 : 0
+        );
+        priceUpdate = new bytes[](1);
+        priceUpdate[0] = priceData;
+    }
+
+    /// @notice A session-bound pair retains INITIAL margin in cash: unrealized profit cannot
+    ///         substitute for any of it, because a reopen gap can erase the profit in the same
+    ///         jump that needs the buffer, with no chance for liquidation to interpose.
+    ///         (Continuously traded pairs retain maintenance-level cash instead — the
+    ///         RetainedCollateralFloorTest suite covers that branch on the BTC pair.)
+    function testWithdrawCollateral_NonContinuous_RetainsImrInCash() public {
+        uint256 deposit = 1_000 * BAZAAR_SCALE;
+        _depositCollateral(aaplPair, user2, deposit);
+        _simulateAaplLong(user2, 1 * BAZAAR_SCALE, 200 * BAZAAR_SCALE); // 1 AAPL @ $200 entry
+
+        // Price triples to $600: unrealized profit (~$400) alone covers the IMR requirement.
+        bytes[] memory priceUpdate = _createAaplPriceUpdateAtPrice(600, uint64(block.timestamp));
+
+        (uint256 imrBp, uint256 mmrBp,,) = aaplPair.marginRequirements();
+        uint256 lowPrice = 600 * BAZAAR_SCALE - (600 * BAZAAR_SCALE / 1000); // long bracket: spot - 0.1% conf
+        uint256 floorAmt = imrBp * lowPrice / 10_000; // 1-unit position: notional == lowPrice
+        assertGt(floorAmt, mmrBp * lowPrice / 10_000, "imr floor strictly above the continuous pairs' mmr floor");
+
+        // Withdrawing the whole deposit is blocked by the IMR-cash floor — not by equity, which
+        // profit alone keeps far above the requirement.
+        vm.prank(user2);
+        vm.expectRevert(
+            abi.encodeWithSelector(CollateralLib.CollateralLib__MustRetainMinimumCollateral.selector, 0, floorAmt)
+        );
+        aaplPair.withdrawCollateral(deposit, priceUpdate, 0, 0, 0, "");
+
+        // Withdrawing down TO the floor clears every gate.
+        priceUpdate = _createAaplPriceUpdateAtPrice(600, uint64(block.timestamp));
+        vm.prank(user2);
+        aaplPair.withdrawCollateral(deposit - floorAmt, priceUpdate, 0, 0, 0, "");
+        (,,, uint256 remaining,,,,,,) = aaplPair.positionBuckets(user2);
+        assertEq(remaining, floorAmt, "retains exactly initial margin in cash");
     }
 
     // ==================== withdrawCollateral: Order Exposure Tests ====================
@@ -1782,6 +1872,68 @@ contract BazaarPairTest is Test {
             0,
             ""
         );
+    }
+
+    /// @dev `maxSlippageBp` doubles as the market-order priority key in the matching walk, where a
+    ///      wider tolerance sorts ahead. A market order's required margin is therefore
+    ///      side-independent and strictly increasing in slippage, so queue position can never be
+    ///      bought for less margin than a tight tolerance costs.
+    function testCreateOrder_MarketOrder_WiderSlippageCostsMoreMarginOnBothSides() public {
+        // Deliberately far below any requirement, so every attempt reverts and reports its own
+        // requiredMargin rather than opening a position that would shift later attempts' baseline.
+        _depositCollateral(btcPair, user1, 5 * BAZAAR_SCALE);
+
+        uint256 longTight = _marketOrderRequiredMargin(true, POSITION_SIZE, 1);
+        uint256 longWide = _marketOrderRequiredMargin(true, POSITION_SIZE, 500);
+        uint256 shortTight = _marketOrderRequiredMargin(false, POSITION_SIZE, 1);
+        uint256 shortWide = _marketOrderRequiredMargin(false, POSITION_SIZE, 500);
+
+        assertGt(longWide, longTight, "long: wider slippage must cost more margin");
+        assertGt(shortWide, shortTight, "short: wider slippage must cost more margin");
+        assertEq(shortTight, longTight, "tight slippage must cost the same on both sides");
+        assertEq(shortWide, longWide, "wide slippage must cost the same on both sides");
+    }
+
+    /// @dev Attempts a market order that cannot be margined and returns the `requiredMargin` the
+    ///      revert reports. Reverts the test if the order is admitted or fails for another reason.
+    function _marketOrderRequiredMargin(bool isLong, uint256 size, uint256 maxSlippageBp)
+        internal
+        returns (uint256 requiredMargin)
+    {
+        bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
+
+        vm.prank(user1);
+        try btcPair.createOrder(
+            BazaarTypes.OrderType.Market,
+            0,
+            0,
+            maxSlippageBp,
+            size,
+            isLong,
+            false,
+            0,
+            address(0),
+            priceUpdate,
+            0,
+            0,
+            0,
+            ""
+        ) {
+            revert("expected InsufficientMarginAfterOrder");
+        } catch (bytes memory err) {
+            // Revert payload is selector + (effectiveCollateral, requiredMargin); read the second.
+            require(err.length == 68, "unexpected revert payload");
+            bytes4 sel;
+            assembly {
+                sel := mload(add(err, 0x20))
+                requiredMargin := mload(add(err, 0x44))
+            }
+            assertEq(
+                sel,
+                OrderManagementLib.OrderManagementLib__InsufficientMarginAfterOrder.selector,
+                "wrong revert selector"
+            );
+        }
     }
 
     // ==================== createOrder: StopLimit Order Tests ====================

@@ -5,7 +5,7 @@ A practical guide to trading on Bazaar. Plain language first; every section link
 ## Getting in
 
 1. **Fund**: hold USDC on Arbitrum. That's the only collateral — no ETH needed if you use a [gasless relayer](../protocol/meta-transactions.md), and even the USDC approval can ride a permit signature.
-2. **Deposit**: `depositCollateral` into the specific market you want to trade (min $5). Collateral is per-market; a blowup in one market cannot touch your balance in another. While you hold a position you must keep `max(0.5% of notional, $5)` in collateral — $5 on a $100 position, $500 on a $100k one. Fees come out of your balance, so this guarantees you can always pay the one that closes your position; without it, a position deep enough in profit could withdraw its whole deposit and then find its closing orders silently canceled.
+2. **Deposit**: `depositCollateral` into the specific market you want to trade (min $5). Collateral is per-market; a blowup in one market cannot touch your balance in another. While you hold a position you must keep real money behind it — unrealized profit doesn't count toward this floor. On 24/7 markets the floor is your maintenance margin (`mmrBp` of notional); on markets with trading hours it is your full initial margin (`imrBp`), because an overnight gap can erase paper profit in the same jump that needs the buffer, with no chance for liquidation to step in between. Fees come out of your balance too, so the floor also guarantees you can always pay the one that closes your position.
 3. **Trade**: place orders. You hold **one net position per market** — buying 2 ETH long then selling 3 flips you to 1 short.
 
 ## Order types, practically
@@ -22,7 +22,7 @@ Minimum order: **$5** notional (closing your whole position is always allowed). 
 
 ## Leverage & staying solvent
 
-- Your maximum leverage is dynamic — up to **25×** in calm, well-capitalized markets, less in volatile ones, at most 5× in a market's first days, and a third less on stocks/FX (non-24/7 markets carry a 1.5× margin multiplier). The current requirement is on-chain (`BazaarPairLens.checkBucketSolvency`).
+- Your maximum leverage is dynamic — up to **25×** in calm, well-capitalized markets, less in volatile ones, at most 2.5× in a stock/FX market's first days, and half on stocks/FX generally (non-24/7 markets post 2× the larger of the vol requirement and the market's own observed overnight-gap size). The current requirement is on-chain (`BazaarPairLens.checkBucketSolvency`).
 - **Initial margin** gates new orders and withdrawals, counted against your worst case (position + everything resting). **Maintenance margin is half of initial** — below it, anyone may liquidate you.
 - Rising margin requirements give existing positions a **24-hour grace**; falling ones help you immediately. See [Margin & Leverage](../protocol/margin.md).
 - **Funding** accrues continuously, capped at ±0.5%/hour: longs pay shorts when the market trades above index, and vice versa. It settles when you close. See [Funding](../protocol/funding.md).
@@ -42,7 +42,7 @@ Roughly: **fractions of a basis point plus $0.03 per side**. Makers pay ~1 bp al
 
 ## Stocks & FX after hours
 
-Non-24/7 markets keep trading on the last price when their venue closes: margin requirement doubles for new fills, prices are boxed to ±10% of the last print, and market orders are disabled until the venue reopens. See [Price Oracle](../protocol/oracle.md#the-stale-price-regime-market-hours).
+Non-24/7 markets keep trading on the last price when their venue closes: prices are boxed to ±10% of the last print and market orders are disabled until the venue reopens. Margin is unchanged — closure-gap risk is already priced into these markets' always-on requirement (the 2× multiplier and the reopen-gap floor) — but **position collateral cannot be withdrawn while the venue's price is frozen**: deposits stay open, flat accounts are unaffected, and withdrawals resume with the first fresh print at the reopen. Plan position-collateral withdrawals during market hours. See [Price Oracle](../protocol/oracle.md#the-stale-price-regime-market-hours).
 
 ## Getting out
 

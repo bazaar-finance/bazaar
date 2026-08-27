@@ -25,7 +25,7 @@ forge build
 forge test
 ```
 
-The test suite is 844 tests across 74 suites. CI pins Foundry to v1.4.3 and runs `forge fmt --check`, build, and the full suite on every push; EIP-170 size limits are enforced as a test (`test/unit/ContractSizeTest.t.sol`) over production contracts.
+The test suite is 869 tests across 76 suites. CI pins Foundry to v1.4.3 and runs `forge fmt --check`, build, and the full suite on every push; EIP-170 size limits are enforced as a test (`test/unit/ContractSizeTest.t.sol`) over production contracts.
 
 For the full local stack on Anvil — mocked Pyth/UMA/USDC, listing a pair, pushing prices, placing orders — see [Local Development](https://docs.bazaar.finance/guide/quick-start.html) in the book; `make help` lists every target. Deploying the protocol to a real network is covered in [Self-Deployment](https://docs.bazaar.finance/guide/deployment.html).
 
@@ -58,8 +58,8 @@ src/
     └── BazaarTypes.sol         # Structs, enums, protocol constants
 script/                         # DeployLibraries + DeployBazaar + network config
 test/
-├── unit/                       # 28 test files: per-library and per-mechanism
-└── integration/                # 32 test files: end-to-end, incl. zero-sum invariant
+├── unit/                       # 27 test files: per-library and per-mechanism
+└── integration/                # 34 test files: end-to-end, incl. zero-sum invariant
 ```
 
 ## Security
@@ -68,7 +68,7 @@ test/
 - No admin keys: there is nothing to compromise, but also no one who can pause a bad deployment — the [termination paths](https://docs.bazaar.finance/protocol/termination.html) are the only brakes.
 - **Reporting a vulnerability:** please use GitHub's private vulnerability reporting — go to the [Security tab](../../security/advisories/new) and select *Report a vulnerability*. Do not open a public issue for security findings.
 - There is no bug-bounty program at this stage. Valid findings are credited to the reporter in the published advisory. A retroactive reward may be considered for significant findings once the project is funded, but none is promised or guaranteed.
-- Full posture: [Security & Status](https://bazaar-finance.github.io/bazaar/security.html) in the book.
+- What is in and out of scope, and the posture a report should assume: [SECURITY.md](SECURITY.md). Full posture and testing detail: [Security & Status](https://docs.bazaar.finance/security.html) in the book.
 
 ## License
 

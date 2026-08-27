@@ -11,19 +11,9 @@ import {BucketLib} from "./BucketLib.sol";
 library CollateralLib {
     // -------------------- Constants --------------------
 
-    /// @notice Minimum collateral deposit, and the absolute floor a position-holding account must
-    ///         retain on withdrawal. Matches the insurance-fund minimum so both entry points speak
-    ///         the same "$5 minimum" rule.
+    /// @notice Minimum collateral deposit. Matches the insurance-fund minimum so both entry points
+    ///         speak the same "$5 minimum" rule.
     uint256 internal constant MIN_COLLATERAL_AMOUNT = 5 * BazaarTypes.BAZAAR_SCALE;
-
-    /// @notice Notional-proportional component of the retained-collateral floor: a position-holding
-    ///         account must keep at least max(MIN_RETAINED_COLLATERAL_BP of notional,
-    ///         MIN_COLLATERAL_AMOUNT). Fees scale with notional, so a flat floor alone leaves large
-    ///         positions unable to pay the fee that closes them; 50 bp covers the worst-case
-    ///         closing fee (the taker insurance fee tops out at 50 bp only when the fund is far
-    ///         below target, and is typically a small fraction of that) with room to spare.
-    uint256 internal constant MIN_RETAINED_COLLATERAL_BP = 50; // 0.5%
-    uint256 internal constant STALE_MARGIN_MULTIPLIER = BazaarTypes.STALE_MARGIN_MULTIPLIER;
 
     // -------------------- Errors --------------------
 
@@ -38,6 +28,7 @@ library CollateralLib {
     error CollateralLib__InsufficientMarginAfterWithdrawal(uint256 amount, uint256 available);
     error CollateralLib__NoPriceUpdateDataProvided();
     error CollateralLib__MustRetainMinimumCollateral(uint256 remaining, uint256 minimum);
+    error CollateralLib__WithdrawalRequiresFreshPrice();
 
     // ================================================================
     //                         Deposit Logic
@@ -481,6 +472,20 @@ library CollateralLib {
                 revert CollateralLib__NoPriceUpdateDataProvided();
             }
 
+            // Position-holder equity is released only against a price the oracle can currently
+            // attest. Around a market closure, off-chain venues (pre-market, 24/7 books) print
+            // the reopen hours before this contract can, so a holder who is already dead at the
+            // real price could otherwise withdraw down to an IMR computed at the frozen mark —
+            // converting their own loss into vault deficit that the termination waterfall passes
+            // to the winning side. No margin rate closes that channel (a rate cannot price
+            // information the oracle has not seen); withholding release does. Deposits stay open
+            // while stale — adding collateral is always safe for the vault — and order-only
+            // accounts keep the flat path below: they hold no position whose frozen mark could
+            // hide a loss, and their resting exposure keeps its order-IMR reserve.
+            if (params.isOracleStale) {
+                revert CollateralLib__WithdrawalRequiresFreshPrice();
+            }
+
             // Defensive backstop: if isVaultHealthy reported an unhealthy result this tx, block a
             // normal-operation withdrawal from slipping through. Reason 2 (ADL timeout)
             // normal-terminates and reason 3 (USDC shortfall) emergency-terminates — both set a
@@ -490,11 +495,14 @@ library CollateralLib {
                 revert CollateralLib__WithdrawalBlockedDueToEmergencyTermination();
             }
 
-            // Reason 1 = the ADL window is open — possibly opened by the isVaultHealthy call
-            // in THIS tx, after the pair-level freeze guard was already evaluated (it reads
-            // isAdlPending before the health check can set it). Blocking here closes the
-            // one-withdrawal gap in the window-opening transaction. Flat users are exempt by
-            // placement: this branch only runs when the caller holds a position.
+            // Reason 1 = liquidation exposure exceeds insurance. The ADL window is then either
+            // open — possibly opened by the isVaultHealthy call in THIS tx, after the pair-level
+            // freeze guard was already evaluated (it reads isAdlPending before the health check
+            // can set it) — or withheld because the price was too stale to open one against.
+            // Gating on the reason rather than on the latch closes the one-withdrawal gap in the
+            // window-opening transaction, and keeps a vault that is already over its insurance
+            // from being exited on a mark the protocol declined to act on. Flat users are exempt
+            // by placement: this branch only runs when the caller holds a position.
             if (!params.isVaultHealthy && params.vaultHealthReason == 1) {
                 revert CollateralLib__WithdrawalsFrozenAdlPending();
             }
@@ -515,36 +523,46 @@ library CollateralLib {
                 revert CollateralLib__InsufficientCollateral(params.amount, currentState.effectiveCollateral);
             }
 
-            // An account holding a position must retain max(0.5% of notional, $5) of COLLATERAL.
-            // The margin check below is EQUITY-based (collateral + unrealized PnL), so a profitable
-            // position could otherwise withdraw its entire deposit and carry the margin on profit
-            // alone — leaving zero collateral. That state is a trap: every fee in the protocol is
-            // charged against bucket collateral, so MatchingEngineLib._checkMargin rejects any fill
-            // whose fee exceeds it and the caller AUTO-CANCELS the order, and _chargeRelayerFee
-            // reverts. The holder could not close through the book (nor use meta-transactions)
-            // until they re-deposited, with their orders silently vanishing.
-            // The floor is notional-PROPORTIONAL because fees are: a flat minimum is ample for a
-            // $100 position but nowhere near the fee on a $100k one, which would leave exactly the
-            // large positions stuck (a partial close does not help either — the remainder must
-            // still meet IMR out of collateral, so only a full close escapes, and that needs the
-            // whole fee up front).
+            // An account holding a position must retain margin in COLLATERAL proper — cash, not
+            // equity. The margin check below is EQUITY-based (collateral + unrealized PnL), so
+            // without a cash floor a profitable position could withdraw its entire deposit and
+            // carry the margin on paper profit alone. That state fails two ways:
+            // - Every fee in the protocol is charged against bucket collateral:
+            //   MatchingEngineLib._checkMargin rejects any fill whose fee exceeds it and the
+            //   caller AUTO-CANCELS the order, and _chargeRelayerFee reverts — the holder could
+            //   not close through the book (nor use meta-transactions) until they re-deposited.
+            //   Either floor rate covers the worst-case closing fee with multiples to spare
+            //   (mmrBp never sits below 4x the taker insurance fee's hard cap).
+            // - Paper profit is only as good as the mark, and it evaporates in the same adverse
+            //   move it would need to buffer.
+            // The retained rate follows how the pair can move against that buffer:
+            // - Continuously traded pairs retain mmrBp: price walks, liquidation can interpose
+            //   at the maintenance line, so cash beyond it buys little.
+            // - Non-continuously traded pairs retain imrBp: price jumps the session gap where no
+            //   liquidation can interpose and the mark the profit is measured at is frozen, so
+            //   the cash must carry the position through a reopen on its own. imrBp — at least
+            //   twice the demonstrated reopen gap — does that with the full IMR-MMR band to
+            //   spare, with no help from the profit the same gap may have erased.
+            // The pair's CURRENT rates apply, not the per-position lagged effectiveMmr: the lag
+            // exists so a rising requirement cannot liquidate a position that predates it; a
+            // withdrawal is a new voluntary release of equity and prices the requirement as it
+            // stands. An account whose collateral already sits below the floor (the rate
+            // ratcheted since an earlier withdrawal) can withdraw nothing further until it
+            // deposits, partially closes (which realizes PnL into collateral and shrinks the
+            // floor), or goes flat — the flat path below has no floor.
             {
-                uint256 minRetained =
-                    Math.mulDiv(MIN_RETAINED_COLLATERAL_BP, currentState.currentNotional, BazaarTypes.BP_SCALE);
-                if (minRetained < MIN_COLLATERAL_AMOUNT) minRetained = MIN_COLLATERAL_AMOUNT;
+                uint256 floorRateBp =
+                    params.isContinuouslyTraded ? params.marginReqs.mmrBp : params.marginReqs.imrBp;
+                uint256 minRetained = Math.mulDiv(floorRateBp, currentState.currentNotional, BazaarTypes.BP_SCALE);
                 uint256 remaining = currentState.effectiveCollateral - params.amount;
                 if (remaining < minRetained) {
                     revert CollateralLib__MustRetainMinimumCollateral(remaining, minRetained);
                 }
             }
 
-            // Check IMR requirement (2x during stale oracle periods)
-            uint256 effectiveImrBp = params.marginReqs.imrBp;
-            if (params.isOracleStale) {
-                effectiveImrBp = effectiveImrBp * STALE_MARGIN_MULTIPLIER;
-            }
+            // Check IMR requirement
             uint256 imrRequirement = Math.mulDiv(
-                effectiveImrBp,
+                params.marginReqs.imrBp,
                 _worstCaseNotional(
                     bucket.isLong,
                     currentState.currentNotional,
@@ -589,11 +607,7 @@ library CollateralLib {
                 ? params.outstandingLongOrderExposure
                 : params.outstandingShortOrderExposure;
             if (maxOrderExposure > 0) {
-                uint256 effectiveImrBp = params.marginReqs.imrBp;
-                if (params.isOracleStale) {
-                    effectiveImrBp = effectiveImrBp * STALE_MARGIN_MULTIPLIER;
-                }
-                uint256 orderImrReq = Math.mulDiv(effectiveImrBp, maxOrderExposure, BazaarTypes.BP_SCALE);
+                uint256 orderImrReq = Math.mulDiv(params.marginReqs.imrBp, maxOrderExposure, BazaarTypes.BP_SCALE);
                 if (bucket.collateral - params.amount < orderImrReq) {
                     revert CollateralLib__InsufficientMarginAfterWithdrawal(params.amount, orderImrReq);
                 }

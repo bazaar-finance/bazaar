@@ -31,11 +31,19 @@ contract FeeCurveHarness {
     }
 
     function closingFeeEbp() external view returns (uint256) {
-        return RiskParamsLib.getClosingFeeEbp(lastPairPrice, liquidationGapEma);
+        return RiskParamsLib.getClosingFeeEbp(lastPairPrice, liquidationGapEma, 0);
+    }
+
+    function closingFeeEbpWithReopen(uint256 rg) external view returns (uint256) {
+        return RiskParamsLib.getClosingFeeEbp(lastPairPrice, liquidationGapEma, rg);
     }
 
     function takerFeeEbp(uint256 p) external view returns (uint256) {
-        return RiskParamsLib.getTakerInsuranceFeeEbp(pairVault, lastPairPrice, liquidationGapEma, p);
+        return RiskParamsLib.getTakerInsuranceFeeEbp(pairVault, lastPairPrice, liquidationGapEma, p, 0);
+    }
+
+    function takerFeeEbpWithReopen(uint256 p, uint256 rg) external view returns (uint256) {
+        return RiskParamsLib.getTakerInsuranceFeeEbp(pairVault, lastPairPrice, liquidationGapEma, p, rg);
     }
 
     function oiRatio(uint256 p) external view returns (uint256, uint256, uint256) {
@@ -102,6 +110,29 @@ contract RiskParamsFeeCurveTest is Test {
         h.setVariance(0); // target 2% (200bp), fBase = 50
         h.setInsurance(30_000 * SCALE); // 3% ratio = 1.5x target
         assertEq(h.takerFeeEbp(PRICE), 25, "half-surplus halves the base fee");
+    }
+
+    // ==================== reopen-gap leg: the fund target tracks the demonstrated tail ====================
+
+    /// @notice A learned reopen gap raises the target through the closing-fee base: reopen 900
+    ///         -> target 450bp (gap/2) -> base fee 50 + 250x150/800 = 96 EBP. The zero input
+    ///         (continuous pairs) keeps the 50 EBP baseline pinned by the tests above.
+    function test_closingFee_reopenGapRaisesTarget() public {
+        h.setVariance(0);
+        h.setGap(0);
+        assertEq(h.closingFeeEbpWithReopen(900), 96, "reopen-driven target 4.5% -> interpolated base");
+    }
+
+    /// @notice The same fund flips from surplus to deficit once the pair demonstrates a tail:
+    ///         at 300bp coverage the calm 200bp target reads 1.5x surplus (fee 25 EBP), but a
+    ///         900bp learned reopen lifts the target to 450bp -> 33% deficit -> the quadratic
+    ///         surcharge lands the fee at 618 EBP. Entry flow starts pre-funding the tail
+    ///         before any losses realize.
+    function test_takerFee_reopenGapFlipsSurplusToDeficit() public {
+        h.setVariance(0);
+        h.setInsurance(30_000 * SCALE); // 300bp coverage
+        assertEq(h.takerFeeEbp(PRICE), 25, "baseline: 1.5x surplus of the calm target");
+        assertEq(h.takerFeeEbpWithReopen(PRICE, 900), 618, "deficit vs the reopen-raised target");
     }
 
     // ==================== getInsuranceFundToOIRatio triples ====================

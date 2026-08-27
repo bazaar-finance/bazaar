@@ -36,7 +36,7 @@ Volume is tracked in 30 one-minute circular buckets per sequencer plus a global 
 
 **Slash: 1% of batch notional, minimum $20 — split 50/50 challenger / insurance fund.**
 
-Why it matters: stale batches run under a laxer regime (no market orders, wider margin) — a sequencer who *pretends* the oracle is stale could selectively suppress market flow. This challenge makes the stale flag itself accountable.
+Why it matters: stale batches run under a restricted regime (no market orders, fills banded to ±10% of the last print) — a sequencer who *pretends* the oracle is stale could selectively suppress market flow. This challenge makes the stale flag itself accountable.
 
 ## What the design intentionally does not punish
 

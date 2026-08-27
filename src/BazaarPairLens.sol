@@ -34,6 +34,7 @@ interface IBazaarPairLens {
         view
         returns (uint256 imrBp, uint256 mmrBp, uint256 lastUpdateTs, uint256 laggedMmrBp);
     function getLaggedMmrBp() external view returns (uint256);
+    function isContinuouslyTraded() external view returns (bool);
     function pairId() external view returns (bytes32);
     function insuranceShares(address user) external view returns (uint256);
     function totalInsuranceShares() external view returns (uint256);
@@ -248,17 +249,20 @@ contract BazaarPairLens {
 
     /// @notice The largest collateral withdrawal that would succeed for `user` right now, under
     ///         the same checks the normal-operation withdrawal path enforces.
-    /// @dev Normal operation only: returns 0 while withdrawals are frozen or rerouted — terminal
+    /// @dev Previews the FRESH-price path. While the pair's price is stale, a position holder's
+    ///      withdrawal reverts outright (CollateralLib__WithdrawalRequiresFreshPrice) regardless
+    ///      of the bound returned here; flat and order-only accounts are unaffected.
+    ///      Normal operation only: returns 0 while withdrawals are frozen or rerouted — terminal
     ///      settlement mode (price fixed; post-termination entitlements are the
     ///      getTerminalEntitlement / emergency-ratio domain), emergency termination, ADL pending
     ///      for a position holder, or an insolvent position. For a position holder the bound is
-    ///      the tightest of: raw collateral, the retained-collateral floor
-    ///      (max(MIN_RETAINED_COLLATERAL_BP of notional, MIN_COLLATERAL_AMOUNT)), and the equity
+    ///      the tightest of: raw collateral, the retained-collateral floor (position notional x
+    ///      mmrBp for continuously traded pairs / imrBp for session-bound pairs, held in
+    ///      collateral proper), and the equity
     ///      the IMR leaves free, where worst-case notional folds in resting-order exposure
-    ///      (CollateralLib._worstCaseNotional) and `oracleStale` doubles the IMR — each exactly
-    ///      as the on-chain check applies it. A flat user is bounded by collateral less the
-    ///      order-IMR reserve on their larger resting side. Evaluated at the pair's stored
-    ///      funding index.
+    ///      (CollateralLib._worstCaseNotional) — each exactly as the on-chain check applies it.
+    ///      A flat user is bounded by collateral less the order-IMR reserve on their larger
+    ///      resting side. Evaluated at the pair's stored funding index.
     /// @param pair The BazaarPair to read
     /// @param user The account to query
     /// @param currentPrice The price to evaluate at (BAZAAR 1e18). Pass the CONSERVATIVE bracket
@@ -266,10 +270,8 @@ contract BazaarPairLens {
     ///        for a short (a flat user's order check uses spot, and this parameter is ignored).
     ///        Passing plain spot for a position holder overstates the bound by the confidence
     ///        band and the on-chain check will reject the difference.
-    /// @param oracleStale Whether the pair would treat its oracle as stale right now
-    ///        (STALE_MARGIN_MULTIPLIER x IMR)
     /// @return maxAmount The largest amount `withdrawCollateral` would accept, in BAZAAR (1e18)
-    function getMaxWithdrawable(address pair, address user, uint256 currentPrice, bool oracleStale)
+    function getMaxWithdrawable(address pair, address user, uint256 currentPrice)
         external
         view
         returns (uint256 maxAmount)
@@ -295,14 +297,12 @@ contract BazaarPairLens {
         BazaarTypes.MarginRequirements memory marginReqs;
         (marginReqs.imrBp, marginReqs.mmrBp, marginReqs.lastUpdateTs,) = IBazaarPairLens(pair).marginRequirements();
         marginReqs.laggedMmrBp = IBazaarPairLens(pair).getLaggedMmrBp();
-        uint256 effectiveImrBp = marginReqs.imrBp;
-        if (oracleStale) effectiveImrBp *= BazaarTypes.STALE_MARGIN_MULTIPLIER;
 
         if (bucket.size == 0) {
             // Flat: collateral less the order-IMR reserve on the larger resting side
             // (zero position notional reduces _worstCaseNotional to exactly that max).
             uint256 orderImrReq = Math.mulDiv(
-                effectiveImrBp,
+                marginReqs.imrBp,
                 CollateralLib._worstCaseNotional(true, 0, longExposure, shortExposure),
                 BazaarTypes.BP_SCALE
             );
@@ -318,16 +318,18 @@ contract BazaarPairLens {
         // Ceiling 1: raw collateral.
         maxAmount = state.effectiveCollateral;
 
-        // Ceiling 2: the retained-collateral floor.
-        uint256 minRetained =
-            Math.mulDiv(CollateralLib.MIN_RETAINED_COLLATERAL_BP, state.currentNotional, BazaarTypes.BP_SCALE);
-        if (minRetained < CollateralLib.MIN_COLLATERAL_AMOUNT) minRetained = CollateralLib.MIN_COLLATERAL_AMOUNT;
+        // Ceiling 2: the retained-collateral floor (margin held as cash — maintenance-level for
+        // continuously traded pairs, initial-level for session-bound pairs, whose reopen jumps
+        // liquidation cannot interpose against).
+        uint256 floorRateBp =
+            IBazaarPairLens(pair).isContinuouslyTraded() ? marginReqs.mmrBp : marginReqs.imrBp;
+        uint256 minRetained = Math.mulDiv(floorRateBp, state.currentNotional, BazaarTypes.BP_SCALE);
         uint256 aboveFloor = state.effectiveCollateral > minRetained ? state.effectiveCollateral - minRetained : 0;
         if (aboveFloor < maxAmount) maxAmount = aboveFloor;
 
         // Ceiling 3: the equity the IMR leaves free.
         uint256 imrRequirement = Math.mulDiv(
-            effectiveImrBp,
+            marginReqs.imrBp,
             CollateralLib._worstCaseNotional(bucket.isLong, state.currentNotional, longExposure, shortExposure),
             BazaarTypes.BP_SCALE
         );

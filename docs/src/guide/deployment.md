@@ -38,11 +38,11 @@ The sequencer and terminator are pre-deployed against the predicted address beca
 
 | Variable | Used by |
 |---|---|
-| `ARBITRUM_MAINNET_RPC_URL`, `ARBITRUM_SEPOLIA_RPC_URL`, `BASE_SEPOLIA_RPC_URL` | `foundry.toml` RPC endpoints |
+| `ARBITRUM_MAINNET_RPC_URL`, `ARBITRUM_SEPOLIA_RPC_URL` | `foundry.toml` RPC endpoints |
 | `ACCOUNT`, `SENDER` | keystore account for `forge script` |
-| `ARBISCAN_API_KEY`, `BASESCAN_API_KEY` | contract verification |
+| `ARBISCAN_API_KEY` | contract verification |
 | `ANVIL_RPC_URL`, `ANVIL_PRIVATE_KEY`, `ANVIL_WALLET` | local Makefile targets |
 
 ## Network support
 
-See [Networks](../reference/networks.md) for chain IDs and external-contract addresses. Note that `BazaarPair` reads Arbitrum's `ArbSys` precompile (`0x64`) for L2 block numbers — the protocol runs only on Arbitrum chains. The Base Sepolia configuration exists solely to exercise the real UMA OOv3 dispute flow, which has no official Arbitrum Sepolia deployment.
+See [Networks](../reference/networks.md) for chain IDs and external-contract addresses. Note that `BazaarPair` reads Arbitrum's `ArbSys` precompile (`0x64`) for L2 block numbers — the protocol runs only on Arbitrum chains. UMA has no official OOv3 deployment on Arbitrum Sepolia, so the testnet configuration deploys a mock; the real UMA dispute flow can only be exercised on a chain with an official OOv3 deployment.

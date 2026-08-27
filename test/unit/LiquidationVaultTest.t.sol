@@ -32,9 +32,23 @@ contract LiqRewardHarness {
         b.collateral = collateral;
     }
 
-    /// @dev Seed totalCollateralDeposited so the per-position seizure (`-= collateral`) doesn't underflow.
+    /// @dev Seed totalCollateralDeposited. The seizure is capped at the deposits ledger, so
+    ///      tests asserting a FULL seizure must seed at least the summed bucket collateral;
+    ///      seeding less exercises the cap itself.
     function seedCollateral(uint256 amount) external {
         vault.totalCollateralDeposited = amount;
+    }
+
+    function deposits() external view returns (uint256) {
+        return vault.totalCollateralDeposited;
+    }
+
+    function insurance() external view returns (uint256) {
+        return vault.insuranceFundBalance;
+    }
+
+    function deficit() external view returns (uint256) {
+        return vault.deficit;
     }
 
     function liquidate(address[] calldata users, uint256 price) external returns (BazaarTypes.LiquidateResult memory) {
@@ -159,6 +173,100 @@ contract LiquidatorRewardTest is Test {
 
     function dave() internal returns (address) {
         return makeAddr("dave");
+    }
+}
+
+// ==================== seizure ledger cap ====================
+
+/// @notice The liquidation seizure credits insurance with the liquidatee's book collateral
+///         capped at totalCollateralDeposited. Winners realize gains into buckets without
+///         touching the deposits ledger and withdraw them from it later, so a loser's book
+///         collateral can legitimately exceed the entire remaining ledger — an uncapped
+///         seizure would panic there and make the position unliquidatable.
+contract SeizureLedgerClampTest is Test {
+    uint256 internal constant PRICE = 50_000e18;
+
+    LiqRewardHarness internal harness;
+    address internal loser;
+    address internal loser2;
+
+    function setUp() public {
+        harness = new LiqRewardHarness();
+        loser = makeAddr("loser");
+        loser2 = makeAddr("loser2");
+    }
+
+    /// @dev A long that is insolvent at PRICE: entry $65k on 1 unit → $15k loss against
+    ///      `collateral` of book value.
+    function _underwaterLong(address user, uint256 collateral) internal {
+        harness.setBucket(user, true, 1e18, 65_000e18, collateral);
+    }
+
+    function _liq(address user) internal returns (BazaarTypes.LiquidateResult memory) {
+        address[] memory users = new address[](1);
+        users[0] = user;
+        return harness.liquidate(users, PRICE);
+    }
+
+    /// @notice Book collateral above the whole ledger: liquidation succeeds, insurance is
+    ///         credited exactly the ledger balance, the ledger floors at zero, and no
+    ///         deficit is booked — settlement of the inherited estate decides solvency.
+    function test_bucketAboveLedger_seizureCapsAndSucceeds() public {
+        _underwaterLong(loser, 10_000e18);
+        harness.seedCollateral(9_200e18);
+
+        BazaarTypes.LiquidateResult memory r = _liq(loser);
+
+        assertEq(r.liquidatedCount, 1, "liquidation must not revert on a thin ledger");
+        assertEq(harness.insurance(), 9_200e18, "insurance receives the capped amount");
+        assertEq(harness.deposits(), 0, "ledger floors at zero");
+        assertEq(harness.deficit(), 0, "no deficit at seizure time");
+        assertEq(harness.pendingLiqSize(), 1e18, "estate carries the full position");
+    }
+
+    /// @notice Ledger fully covers the book: the cap is inactive and the full collateral
+    ///         moves to insurance.
+    function test_ledgerCoversBook_fullSeizure() public {
+        _underwaterLong(loser, 10_000e18);
+        harness.seedCollateral(30_000e18);
+
+        _liq(loser);
+
+        assertEq(harness.insurance(), 10_000e18, "full book value seized");
+        assertEq(harness.deposits(), 20_000e18);
+        assertEq(harness.deficit(), 0);
+    }
+
+    /// @notice A batch whose summed books exceed the ledger, though each position fits
+    ///         alone: the first seizure takes its full book, the second is capped at the
+    ///         remainder, and both liquidations commit.
+    function test_batchCascade_capsAtRemainder() public {
+        _underwaterLong(loser, 6_000e18);
+        _underwaterLong(loser2, 6_000e18);
+        harness.seedCollateral(9_000e18);
+
+        address[] memory users = new address[](2);
+        users[0] = loser;
+        users[1] = loser2;
+        BazaarTypes.LiquidateResult memory r = harness.liquidate(users, PRICE);
+
+        assertEq(r.liquidatedCount, 2, "the aggregate cap must not revert the batch");
+        assertEq(harness.insurance(), 9_000e18, "6,000 full + 3,000 capped");
+        assertEq(harness.deposits(), 0);
+        assertEq(harness.pendingLiqSize(), 2e18, "both estates on the books");
+    }
+
+    /// @notice An empty ledger seizes nothing but the liquidation still commits and the
+    ///         estate is still recorded.
+    function test_emptyLedger_liquidationStillCommits() public {
+        _underwaterLong(loser, 10_000e18);
+        harness.seedCollateral(0);
+
+        BazaarTypes.LiquidateResult memory r = _liq(loser);
+
+        assertEq(r.liquidatedCount, 1);
+        assertEq(harness.insurance(), 0, "nothing attributable, nothing credited");
+        assertEq(harness.pendingLiqSize(), 1e18);
     }
 }
 

@@ -15,7 +15,7 @@ contract MaxWithdrawableTest is IntegrationBase {
     function test_maxWithdrawable_isExactBoundary() public {
         _openPosition(alice, bob, true, BAZAAR_SCALE); // 1 BTC long, ~$50k entry, $20k collateral
 
-        uint256 maxW = lens.getMaxWithdrawable(address(pair), alice, 49_950 * BAZAAR_SCALE, false);
+        uint256 maxW = lens.getMaxWithdrawable(address(pair), alice, 49_950 * BAZAAR_SCALE);
         assertGt(maxW, 0, "healthy position has withdrawable slack");
 
         // One dollar past the preview trips whichever gate binds.
@@ -36,7 +36,7 @@ contract MaxWithdrawableTest is IntegrationBase {
     function test_maxWithdrawable_flatUser_fullBalance() public {
         _deposit(alice, 1_000 * BAZAAR_SCALE);
         assertEq(
-            lens.getMaxWithdrawable(address(pair), alice, 0, false),
+            lens.getMaxWithdrawable(address(pair), alice, 0),
             1_000 * BAZAAR_SCALE,
             "no position, no orders: everything is free"
         );
@@ -49,7 +49,7 @@ contract MaxWithdrawableTest is IntegrationBase {
         _deposit(alice, 10_000 * BAZAAR_SCALE);
         _placeLimit(alice, true, BAZAAR_SCALE / 10, 40_000 * BAZAAR_SCALE); // resting, won't cross
 
-        uint256 maxW = lens.getMaxWithdrawable(address(pair), alice, 50_000 * BAZAAR_SCALE, false);
+        uint256 maxW = lens.getMaxWithdrawable(address(pair), alice, 50_000 * BAZAAR_SCALE);
         assertLt(maxW, 10_000 * BAZAAR_SCALE, "resting order reserves margin");
 
         (uint256 longExp, uint256 shortExp) = pair.outstandingOrderExposure(alice);

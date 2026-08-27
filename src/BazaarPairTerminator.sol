@@ -599,27 +599,29 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
         BazaarOracle oracleContract = BazaarOracle(p.oracle());
         bytes32 feedId = p.baseFeedId();
 
-        // Try the oracle first. tryReadStalePrice returns the latest confidence-cleared price
-        // (spot when every leg is within the 2% cap, else the smoothed EMA) regardless of age.
-        // It returns found=false when no rung clears the cap, and reverts only if the oracle
-        // contract itself is dead/migrated. In both the "no confident price" and "revert" cases
-        // we fall back to the pair's last stored price — but always still requiring 21-day
-        // staleness, so this method can only ever terminate a genuinely dead oracle.
+        // The oracle read is a liveness probe, not a price source. tryReadStalePrice returns the
+        // latest confidence-cleared tick (spot when every leg is within the 2% cap, else the
+        // smoothed EMA) regardless of age; it returns found=false when no rung clears the cap, and
+        // reverts only if the oracle contract itself is dead/migrated. Its publishTime is the
+        // strictest available proof that the feed is dead, because Pyth's cache can never be older
+        // than the pair's own stored price — recording one requires reading a fresh tick through
+        // Pyth first. Any tick newer than ORACLE_DEAD_THRESHOLD therefore blocks termination
+        // outright, so this method can only ever terminate a genuinely dead oracle.
+        //
+        // Settlement itself always uses the pair's last stored price. Pyth's cache is
+        // permissionlessly writable to any published tick, so settling at it would let whoever
+        // calls this pick the book-wide settlement price out of the ticks published before the
+        // feed went quiet. lastPairPrice can only ever hold a mark that cleared both the freshness
+        // gate and the confidence cap at the moment it was recorded.
         try oracleContract.tryReadStalePrice(feedId) returns (
-            bool found, uint256 spotPrice, uint256, uint256, uint256 publishTime
+            bool found, uint256, uint256, uint256, uint256 publishTime
         ) {
-            if (found) {
-                if (block.timestamp - publishTime <= ORACLE_DEAD_THRESHOLD) {
-                    revert BazaarPairTerminator__OracleNotStaleEnough(publishTime, ORACLE_DEAD_THRESHOLD);
-                }
-                emit StalePairTerminated(pair, spotPrice, publishTime);
-                _fixSettlement(p, pair, spotPrice);
-                return;
+            if (found && block.timestamp - publishTime <= ORACLE_DEAD_THRESHOLD) {
+                revert BazaarPairTerminator__OracleNotStaleEnough(publishTime, ORACLE_DEAD_THRESHOLD);
             }
-            // No rung cleared the confidence cap → settle at the last stored price.
             _terminateAtLastStoredPrice(pair, p);
         } catch {
-            // Oracle read reverted (dead/migrated Pyth contract). Same last-stored-price fallback.
+            // Oracle read reverted (dead/migrated Pyth contract). Same stored-price settlement.
             _terminateAtLastStoredPrice(pair, p);
         }
     }
@@ -924,7 +926,7 @@ contract BazaarPairTerminator is IOptimisticOracleV3CallbackRecipient, Reentranc
 
         IERC20(address(_bondToken())).safeTransfer(pair, INSURER_TERMINATION_BOND_USDC);
         uint256 bondBazaar = INSURER_TERMINATION_BOND_USDC * (BazaarTypes.BAZAAR_SCALE / 1e6);
-        IBazaarPair(pair).creditInsuranceFromTerminator(bondBazaar);
+        IBazaarPair(pair).creditInsurance(bondBazaar);
         if (refundProposer) {
             emit InsurerTerminationBondRefundFailed(pair, proposer, INSURER_TERMINATION_BOND_USDC);
         }

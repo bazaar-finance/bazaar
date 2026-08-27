@@ -17,6 +17,7 @@ contract MockPairForLens {
     uint256 public insuranceFundBalance;
     mapping(address => uint256) public insuranceShares;
     bool public isAdlPending;
+    bool public isContinuouslyTraded = true;
     uint256 public adlPendingSince;
     uint256 internal pLiqSize;
     uint256 internal pLiqEntry;
@@ -82,6 +83,10 @@ contract MockPairForLens {
 
     function setEmergencyTerminated(bool v) external {
         isPairTerminatedEmergency = v;
+    }
+
+    function setContinuouslyTraded(bool v) external {
+        isContinuouslyTraded = v;
     }
 
     function setMarginReqs(uint256 imrBp, uint256 mmrBp, uint256 laggedMmrBp) external {
@@ -411,7 +416,7 @@ contract BazaarPairLensTest is Test {
 
     function test_getMaxWithdrawable_flatNoOrders_fullCollateral() public {
         pair.setBucket(WINNER, false, 0, 0, 100 * SCALE);
-        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 0, false), 100 * SCALE);
+        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 0), 100 * SCALE);
     }
 
     function test_getMaxWithdrawable_flatWithOrders_reservesOrderImr() public {
@@ -419,14 +424,9 @@ contract BazaarPairLensTest is Test {
         pair.setMarginReqs(1_000, 500, 500); // IMR 10%
         pair.setOrderExposure(50 * SCALE, 200 * SCALE); // larger side: $200 short
         assertEq(
-            lens.getMaxWithdrawable(address(pair), WINNER, 0, false),
+            lens.getMaxWithdrawable(address(pair), WINNER, 0),
             80 * SCALE,
             "collateral less 10% of the larger resting side"
-        );
-        assertEq(
-            lens.getMaxWithdrawable(address(pair), WINNER, 0, true),
-            60 * SCALE,
-            "stale oracle doubles the order-IMR reserve"
         );
     }
 
@@ -434,16 +434,33 @@ contract BazaarPairLensTest is Test {
         pair.setMarginReqs(1_000, 500, 500); // IMR 10%
         // Long 1 unit at $100 entry, price $100: equity = collateral = $20.
         pair.setBucket(WINNER, true, 1 * SCALE, 100 * SCALE, 20 * SCALE);
-        // Ceilings: collateral 20; floor max(0.5%x100, $5)=$5 -> 15; IMR slack 20 - 10%x100 = 10.
-        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 100 * SCALE, false), 10 * SCALE);
+        // Ceilings: collateral 20; floor mmr 5% x 100 = $5 -> 15; IMR slack 20 - 10%x100 = 10.
+        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 100 * SCALE), 10 * SCALE);
     }
 
     function test_getMaxWithdrawable_position_retentionFloorBinds() public {
         pair.setMarginReqs(1_000, 500, 500);
-        // Long 1 unit at $100 entry, price $1000: equity $920 dwarfs the $100 IMR requirement.
+        // Long 1 unit at $100 entry, price $300: equity $220 dwarfs the $30 IMR requirement.
         pair.setBucket(WINNER, true, 1 * SCALE, 100 * SCALE, 20 * SCALE);
-        // Ceilings: collateral 20; floor max(0.5%x1000, $5)=$5 -> 15; IMR slack 820.
-        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 1_000 * SCALE, false), 15 * SCALE);
+        // Ceilings: collateral 20; floor mmr 5% x 300 = $15 -> 5; IMR slack 220 - 30 = 190.
+        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 300 * SCALE), 5 * SCALE);
+
+        // Deeper in profit the floor exceeds the cash on hand: nothing is withdrawable.
+        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 1_000 * SCALE), 0);
+    }
+
+    function test_getMaxWithdrawable_position_nonContinuous_imrCashFloor() public {
+        pair.setMarginReqs(1_000, 500, 500);
+        pair.setContinuouslyTraded(false);
+        // Long 1 unit at $100 entry, price $300: session-bound pairs retain imrBp in cash, so the
+        // floor is 10% x 300 = $30 — above the $20 of collateral, nothing is withdrawable even
+        // though equity ($220) dwarfs the IMR requirement ($30).
+        pair.setBucket(WINNER, true, 1 * SCALE, 100 * SCALE, 20 * SCALE);
+        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 300 * SCALE), 0);
+
+        // With $50 of cash the same floor leaves $20 free (IMR slack is far looser at 220).
+        pair.setBucket(WINNER, true, 1 * SCALE, 100 * SCALE, 50 * SCALE);
+        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 300 * SCALE), 20 * SCALE);
     }
 
     function test_getMaxWithdrawable_position_orderExposureWidensImr() public {
@@ -451,7 +468,7 @@ contract BazaarPairLensTest is Test {
         pair.setBucket(WINNER, true, 1 * SCALE, 100 * SCALE, 20 * SCALE);
         pair.setOrderExposure(50 * SCALE, 0); // same-direction resting orders
         // Worst case = $100 position + $50 same-dir orders -> IMR $15 -> slack $5.
-        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 100 * SCALE, false), 5 * SCALE);
+        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 100 * SCALE), 5 * SCALE);
     }
 
     function test_getMaxWithdrawable_frozenStates_zero() public {
@@ -459,18 +476,18 @@ contract BazaarPairLensTest is Test {
         pair.setBucket(WINNER, true, 1 * SCALE, 100 * SCALE, 20 * SCALE);
 
         pair.setTerminal(100 * SCALE, block.timestamp, 0); // sweep window open
-        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 100 * SCALE, false), 0, "sweep window");
+        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 100 * SCALE), 0, "sweep window");
         pair.setTerminal(0, 0, 0);
 
         pair.setEmergencyTerminated(true);
-        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 100 * SCALE, false), 0, "emergency");
+        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 100 * SCALE), 0, "emergency");
         pair.setEmergencyTerminated(false);
 
         pair.setAdl(true, block.timestamp);
-        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 100 * SCALE, false), 0, "ADL freezes position holders");
+        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 100 * SCALE), 0, "ADL freezes position holders");
         pair.setBucket(WINNER, false, 0, 0, 100 * SCALE);
         assertEq(
-            lens.getMaxWithdrawable(address(pair), WINNER, 0, false),
+            lens.getMaxWithdrawable(address(pair), WINNER, 0),
             100 * SCALE,
             "flat users stay withdrawable during ADL"
         );
@@ -480,7 +497,7 @@ contract BazaarPairLensTest is Test {
         pair.setMarginReqs(1_000, 500, 500);
         // Long 1 unit at $100 entry, price $50: the $50 loss swamps the $20 collateral.
         pair.setBucket(WINNER, true, 1 * SCALE, 100 * SCALE, 20 * SCALE);
-        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 50 * SCALE, false), 0);
+        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 50 * SCALE), 0);
     }
 
     function test_getLiquidationRewardConstants() public view {

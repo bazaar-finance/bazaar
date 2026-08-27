@@ -3,8 +3,9 @@ pragma solidity 0.8.34;
 
 import {IntegrationBase} from "./IntegrationBase.sol";
 import {StdStorage, stdStorage} from "forge-std/Test.sol";
+import {BazaarPair} from "../../src/BazaarPair.sol";
 import {BazaarPairTerminator} from "../../src/BazaarPairTerminator.sol";
-import {CollateralLib} from "../../src/libraries/CollateralLib.sol";
+import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 
 /// @title CrisisBackstopIntegrationTest
 /// @notice The protocol's last-resort insolvency backstops, end-to-end: a recorded deficit
@@ -39,18 +40,17 @@ contract CrisisBackstopIntegrationTest is IntegrationBase {
         assertFalse(pair.isPairTerminatedNormal(), "not terminated until finalize");
 
         // The pair is halted: no further deposits — INCLUDING at the stamping timestamp itself.
-        // scheduledTerminationTs is stamped at `now` and the limbo guards compare with >=, so
-        // there is no same-second window in which the settlement price is already known but
-        // deposits/orders/matching still pass. A strict > would open exactly that window, and it
-        // is reachable atomically (both terminator entry points are permissionless) rather than
-        // only via Arbitrum's shared block timestamps — so the same-second leg below is the one
-        // that matters.
+        // The deposit sweep guard keys on settlementPriceFixedTs directly (no timestamp
+        // comparison), so there is no same-second window in which the settlement price is
+        // already known but new principal still enters. Both terminator entry points are
+        // permissionless, so such a window would be reachable atomically rather than only via
+        // Arbitrum's shared block timestamps — the same-second leg below is the one that matters.
         vm.startPrank(carol);
         usdc.approve(address(pair), 2 * USDC_SCALE);
-        vm.expectRevert(CollateralLib.CollateralLib__PairScheduledForTermination.selector);
+        vm.expectRevert(BazaarPair.BazaarPair__SweepWindowActive.selector);
         pair.depositCollateral(1 * BAZAAR_SCALE, 0, 0, 0, "", "");
         vm.warp(vm.getBlockTimestamp() + 1);
-        vm.expectRevert(CollateralLib.CollateralLib__PairScheduledForTermination.selector);
+        vm.expectRevert(BazaarPair.BazaarPair__SweepWindowActive.selector);
         pair.depositCollateral(1 * BAZAAR_SCALE, 0, 0, 0, "", "");
         vm.stopPrank();
 
@@ -59,6 +59,69 @@ contract CrisisBackstopIntegrationTest is IntegrationBase {
         pair.finalizeTermination();
         assertTrue(pair.isPairTerminatedNormal(), "deficit settled the pair via the equity path");
         assertFalse(pair.isPairTerminatedEmergency(), "live price -> normal, not emergency");
+    }
+
+    /// @notice Check 0 while an accepted scheduled termination's cutoff is still in the future:
+    ///         fixing the settlement price pulls scheduledTerminationTs back to now, so the sweep
+    ///         window opens with matching, orders and deposits halted — rather than a market
+    ///         trading live at the oracle price whose only exit is the frozen settlement price.
+    function test_e2e_Deficit_DuringScheduledNotice_HaltsMarketAtFix() public {
+        // An accepted scheduled-termination proposal leaves the cutoff in the future: trading is
+        // meant to continue until then, so every cutoff-keyed guard is still open when the
+        // deficit lands.
+        uint256 futureCutoff = vm.getBlockTimestamp() + 3 days;
+        _stdstore.target(address(pair)).sig("scheduledTerminationTs()").checked_write(futureCutoff);
+        _stdstore.target(address(pair)).sig("pairVault()").depth(11).checked_write(100 * BAZAAR_SCALE);
+
+        // The notice period keeps the LIVE liquidation path open; its post-liquidation health
+        // check hits Check 0 and fixes the settlement price at the live price.
+        _setupInsolventAlice();
+        vm.prank(bob);
+        pair.liquidate(_arr1(alice), _freshPrice());
+
+        assertGt(pair.settlementPriceFixedTs(), 0, "deficit opened the settlement window");
+        assertEq(pair.scheduledTerminationTs(), vm.getBlockTimestamp(), "future cutoff pulled back to the fix time");
+
+        // Matching and order creation are halted for the whole window.
+        bytes[] memory noPu = new bytes[](0);
+        uint64 obs = uint64(vm.getBlockNumber()) - 1;
+        vm.prank(seq);
+        vm.expectRevert(BazaarPair.BazaarPair__PairScheduledForTermination.selector);
+        pair.matchBatch(_lists(_empty(), _empty(), _empty(), _empty()), 1, noPu, obs);
+
+        vm.prank(carol);
+        vm.expectRevert(BazaarPair.BazaarPair__PairScheduledForTermination.selector);
+        pair.createOrder(
+            BazaarTypes.OrderType.Limit,
+            0,
+            49_000 * BAZAAR_SCALE,
+            0,
+            BAZAAR_SCALE / 10,
+            true,
+            false,
+            uint64(vm.getBlockNumber() + 500_000),
+            address(0),
+            noPu,
+            0,
+            0,
+            0,
+            ""
+        );
+
+        // Both deposit paths refuse new principal.
+        vm.startPrank(carol);
+        usdc.approve(address(pair), 20 * USDC_SCALE);
+        vm.expectRevert(BazaarPair.BazaarPair__SweepWindowActive.selector);
+        pair.depositCollateral(1 * BAZAAR_SCALE, 0, 0, 0, "", "");
+        vm.expectRevert(BazaarPair.BazaarPair__SweepWindowActive.selector);
+        pair.depositToInsurance(10 * BAZAAR_SCALE, 0, 0, 0, "", "");
+        vm.stopPrank();
+
+        // Sweep settlement stays live, and finalize completes inside the original notice period.
+        assertEq(pair.liquidate(_arr1(carol), noPu), 0, "flat user: settlement path callable");
+        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
+        pair.finalizeTermination();
+        assertTrue(pair.isPairTerminatedNormal(), "finalized before the original cutoff arrived");
     }
 
     /// @notice ADL timeout: an ADL that stays pending past ADL_TIMEOUT_DURATION (24h) is treated as

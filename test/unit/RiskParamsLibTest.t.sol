@@ -25,7 +25,7 @@ contract RiskParamsHarness {
     }
 
     function takerFeeEbp(uint256 currentPrice) external view returns (uint256) {
-        return RiskParamsLib.getTakerInsuranceFeeEbp(pairVault, lastPairPrice, liquidationGapEma, currentPrice);
+        return RiskParamsLib.getTakerInsuranceFeeEbp(pairVault, lastPairPrice, liquidationGapEma, currentPrice, 0);
     }
 }
 

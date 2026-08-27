@@ -97,18 +97,19 @@ contract SequencerStaleChallengeTest is IntegrationBase {
 
     // ==================== reason 9: stale-skipped id ====================
 
-    /// @notice An order the sequencer INCLUDED but the walk skipped for a stale-only 2×IMR failure is
-    ///         recorded in staleSkippedIds. Challenging its "omission" must be rejected with reason 9
-    ///         and slash nothing — it wasn't censored, it was a documented margin skip.
+    /// @notice An order the sequencer INCLUDED but the walk skipped because its fill priced
+    ///         outside the stale deviation band is recorded in staleSkippedIds. Challenging its
+    ///         "omission" must be rejected with reason 9 and slash nothing — it wasn't censored,
+    ///         it was a documented band skip.
     function test_omission_staleSkippedId_reason9_notSlashed() public {
-        // $80 passes creation + normal 30% IMR (~$60) but fails the stale 2× IMR (~$120) for 1 share @ $200.
-        _depositAapl(alice, 80 * BAZAAR_SCALE); // under-margined -> stale-skipped
+        _depositAapl(alice, 20_000 * BAZAAR_SCALE); // out-of-band maker -> stale-skipped
         _depositAapl(bob, 20_000 * BAZAAR_SCALE); // well-margined short
         _depositAapl(carol, 20_000 * BAZAAR_SCALE); // well-margined long that actually fills
 
-        // Alice and carol both bid $202; alice is older (lower id) so the walk hits her first, skips
-        // her on the stale 2× IMR, then fills carol against bob — recording a batch with the skip.
-        uint256 aliceLong = _placeLimitAapl(alice, true, 1 * BAZAAR_SCALE, 202 * BAZAAR_SCALE);
+        // Alice bids $250 — outside the ±10% band around the ~$200 stale mark. She is the oldest
+        // order, so the walk prices her pairing at her own $250 limit, band-voids her, then fills
+        // carol against bob in-band — recording a batch that carries the skip.
+        uint256 aliceLong = _placeLimitAapl(alice, true, 1 * BAZAAR_SCALE, 250 * BAZAAR_SCALE);
         uint256 carolLong = _placeLimitAapl(carol, true, 1 * BAZAAR_SCALE, 202 * BAZAAR_SCALE);
         uint256 bobShort = _placeLimitAapl(bob, false, 1 * BAZAAR_SCALE, 198 * BAZAAR_SCALE);
 
@@ -120,7 +121,7 @@ contract SequencerStaleChallengeTest is IntegrationBase {
         (uint256 batchId, BazaarTypes.BatchInfo memory info) = _captureBatch();
 
         assertTrue(info.isStale, "batch labeled stale");
-        assertTrue(_contains(info.staleSkippedIds, aliceLong), "under-margined long recorded as stale-skipped");
+        assertTrue(_contains(info.staleSkippedIds, aliceLong), "band-voided long recorded as stale-skipped");
 
         uint256 bondBefore = sequencer.sequencerBonds(seq);
         vm.expectEmit(true, true, true, false, address(sequencer));

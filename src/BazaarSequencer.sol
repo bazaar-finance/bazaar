@@ -39,7 +39,6 @@ contract BazaarSequencer is ReentrancyGuard {
     ///         victim, so a sequencer can't profit by self-censoring its own order).
     uint256 public constant OMISSION_PENALTY_BP = BazaarTypes.OMISSION_PENALTY_BP;
     uint256 public constant OMISSION_PENALTY_MIN = 20 * BAZAAR_SCALE; // $20 floor (mirrors stale)
-    uint256 public constant STALE_MARGIN_MULTIPLIER = BazaarTypes.STALE_MARGIN_MULTIPLIER;
 
     // -------------------- Stale-batch challenge constants --------------------
 
@@ -136,7 +135,8 @@ contract BazaarSequencer is ReentrancyGuard {
     //   3 = order out of price range (no in-range witness available)
     //   4 = order not live at observationBlock or executionBlock
     //   5 = order ineligible for stale batch (Market/StopLoss during stale)
-    //   9 = order is in BatchInfo.staleSkippedIds (sequencer included it; walk skipped due to stale-only IMR failure)
+    //   9 = order is in BatchInfo.staleSkippedIds (sequencer included it; walk skipped it because
+    //       its fill priced outside the stale deviation band)
 
     // -------------------- Modifiers --------------------
 
@@ -292,8 +292,8 @@ contract BazaarSequencer is ReentrancyGuard {
     /// @notice Challenge a batch for omitting an order that should have matched.
     ///         No challenger-supplied bucket-state preimage is required — soundness comes from:
     ///           (a) creation-time IMR enforcement bounding active-order exposure per user,
-    ///           (b) auto-cancel of fresh-IMR margin failures during the walk,
-    ///           (c) staleSkippedIds[] for stale-only IMR failures.
+    ///           (b) auto-cancel of IMR margin failures during the walk,
+    ///           (c) staleSkippedIds[] for stale-batch deviation-band skips.
     ///         An order alive at execution + in matched range and not in staleSkippedIds was
     ///         definitively omitted by the sequencer.
     function challengeOmission(
@@ -353,7 +353,8 @@ contract BazaarSequencer is ReentrancyGuard {
         }
 
         // === Step 5: staleSkippedIds membership — sequencer demonstrably included this order
-        //     and the walk skipped it due to stale-only IMR failure. Not omission.
+        //     and the walk skipped it because its fill priced outside the stale deviation band.
+        //     Not omission.
         uint256 skippedLen = info.staleSkippedIds.length;
         for (uint256 i; i < skippedLen;) {
             if (info.staleSkippedIds[i] == omittedOrderId) {
@@ -659,7 +660,7 @@ contract BazaarSequencer is ReentrancyGuard {
         // delivered (BAZAAR precision) so the fund stays fully backed (vault-health Check-3).
         if (insuranceUsdc > 0) {
             usdc.safeTransfer(pair, insuranceUsdc);
-            IBazaarPair(pair).creditInsuranceFromSequencer(insuranceUsdc * USDC_TO_BAZAAR);
+            IBazaarPair(pair).creditInsurance(insuranceUsdc * USDC_TO_BAZAAR);
         }
 
         return penalty;

@@ -44,6 +44,6 @@ Integrators are naturally positioned to run the [meta-transaction relayer](../pr
 ## Checklist for a production integration
 
 1. Set `integrator` on every order (and test that fills emit your address's transfers). `OrderFilled` is the only per-fill event — it carries `fillSize`, `executionPrice`, the total `fee` charged that side, and an `isMaker` flag, and a pair match emits one per side — so index that to attribute your revenue.
-2. Decide gasless vs. direct: relayed calls need the 2-second price-staleness tier — your relayer should attach a fresh Pyth update to each call.
+2. Decide gasless vs. direct: every path needs a Pyth update at most 2 seconds old. Relaying is the dependable way to meet that, since `priceUpdate` is outside the signed payload and your relayer attaches a fresh price at submission. A direct-signing UI has to either land inside the window or send an empty `priceUpdate` and accept that the call reverts whenever the pair's cached price has aged out.
 3. Read [Orders](../protocol/orders.md) for the per-user caps your UI must respect (100 resting limits, 1 market order, 1 TP + 1 SL per position) and surface auto-cancel events (`OrderUpdated` with `Canceled`) to users.
 4. Use `BazaarPairLens` for all read paths — solvency, margin, share prices — rather than re-deriving them client-side.

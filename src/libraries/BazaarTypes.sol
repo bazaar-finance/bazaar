@@ -153,19 +153,6 @@ library BazaarTypes {
         uint256 deficit;
     }
 
-    /// @notice Absorb a loss into the insurance fund, recording any uncovered overrun as realized
-    ///         bad debt. Shared by the Pass-A vault close (MatchingEngineLib) and the
-    ///         opposing-liquidation netting (LiquidationLib) so the bad-debt accounting can't drift.
-    ///         A non-zero `deficit` is the insolvency signal that isVaultHealthy terminates on.
-    function absorbLossIntoInsurance(Vault storage v, uint256 loss) internal {
-        if (loss > v.insuranceFundBalance) {
-            v.deficit += loss - v.insuranceFundBalance;
-            v.insuranceFundBalance = 0;
-        } else {
-            v.insuranceFundBalance -= loss;
-        }
-    }
-
     struct MarginRequirements {
         uint256 imrBp;
         uint256 mmrBp;
@@ -208,6 +195,36 @@ library BazaarTypes {
         uint256 updateTs;
         uint256 lowPrice; // spotPrice − Pyth confidence, floored at 1 wei
         uint256 highPrice; // spotPrice + Pyth confidence
+    }
+
+    /// @notice The price observation the variance EMA was last advanced from.
+    /// @dev Held separately from PairPrice so the variance clock is independent of the price
+    ///      clock. PairPrice.updateTs advances on every stored price, so measuring the sampling
+    ///      interval against it would put every interval on a pair touched more often than
+    ///      RiskParamsLib.VARIANCE_UPDATE_COOLDOWN under the cooldown, discarding every sample
+    ///      and pinning the EMA at its seed value for the life of the pair. Advancing this
+    ///      sample only when the EMA advances makes a fast update cadence defer a sample rather
+    ///      than drop it, and keeps the measured return and the interval it is annualized over
+    ///      spanning the same two observations.
+    ///      Packed into one slot. uint192 is not the binding constraint on price magnitude: the
+    ///      pair's own notional math (size × price / BAZAAR_SCALE) overflows well below it, so a
+    ///      price this field could not hold is unusable protocol-wide. Publish times are Unix
+    ///      seconds.
+    struct VarianceSample {
+        uint192 spotPrice;
+        uint64 publishTs;
+    }
+
+    /// @dev Peak-hold floor for a non-continuously traded pair's reopen gap: the largest
+    ///      |return| observed across a market discontinuity — closure, halt, or trading break
+    ///      (a price-storage gap of at least RiskParamsLib.REOPEN_GAP_MIN_STALENESS) — decayed
+    ///      slowly between observations. Feeds calculateIMRandMMR's gap leg — the non-continuous
+    ///      IMR is 2 x max(vol curve, gapEmaBp) — so margin covers the pair's demonstrated jump
+    ///      risk, which intraday variance says little about. Packed into one slot; gapEmaBp is
+    ///      capped at REOPEN_GAP_EMA_CAP_BP so uint192 is never binding.
+    struct ReopenGapEma {
+        uint64 lastObsTs; // publishTime of the last accepted observation (0 = none yet)
+        uint192 gapEmaBp; // peak-hold reopen-gap magnitude in bp
     }
 
     struct LiquidationGapEma {
@@ -285,7 +302,6 @@ library BazaarTypes {
     uint256 internal constant MAKER_INSURANCE_FEE_EBP = 50;
 
     uint256 internal constant MAX_STALE_DEVIATION_BP = 1000;
-    uint256 internal constant STALE_MARGIN_MULTIPLIER = 2;
 
     // Cap on slippage for vault liquidation fills (5%). The effective Pass A band is
     // min(this, current MMR) — tightens with the margin cushion in calm regimes.
@@ -457,7 +473,7 @@ library BazaarTypes {
         bool isPairTerminatedNormal; // whether pair is normal-terminated
         bool pendingTermination; // scheduledTerminationTs has passed but terminatePair() not yet executed
         uint256 emergencyHaircutBp; // emergencyTerminalCollateralWithdrawalRatioBp
-        bool isOracleStale; // true when oracle is stale
+        bool isOracleStale; // stale price fallback in use — position-holder withdrawals revert
         uint256 normalTerminationPrice; // settlement price for normal termination
         uint256 normalTerminalCollateralRatioBp; // principal haircut for deep-insolvency normal termination (BP_SCALE/0 = none)
         bool isVaultHealthy; // result of vault health check (only relevant when exposure present)
@@ -466,6 +482,7 @@ library BazaarTypes {
         uint256 outstandingShortOrderExposure; // total notional of user's active short limit orders
         uint64 currentBlock; // L2 block number at tx execution time
         address usdcToken; // USDC address — terminal branch reads cash for the surplus clip
+        bool isContinuouslyTraded; // selects the retained-cash floor rate: mmrBp (24/7) vs imrBp (session-bound)
     }
 
     /// @notice Result from withdrawCollateral
@@ -499,9 +516,7 @@ library BazaarTypes {
     /// @notice Shared matching context — built once by BazaarPair and passed by reference
     ///         to the walk library to minimize calldata/memory copies.
     struct MatchContext {
-        uint256 cachedPrice;
-        uint256 cachedLow; // existing-portion valuation: long buckets at low
-        uint256 cachedHigh; // existing-portion valuation: short buckets at high
+        uint256 cachedPrice; // single valuation basis for the whole batch: existing and fresh exposure alike
         int256 cachedFundingIdx;
         uint256 insuranceFeeEbp;
         uint256 takerSequencerFeeEbp;
@@ -575,6 +590,15 @@ library BazaarTypes {
         uint256 totalInsuranceFees;
         int256 totalVaultPnl;
 
+        // Deposits-ledger headroom remaining for fee attribution: seeded from
+        // totalCollateralDeposited at walk start, drawn down by every charged fill. Fees
+        // are collected from book collateral but settled against the deposits ledger in
+        // _finalize, and book collateral can legitimately exceed that ledger (open losers
+        // back profits that were already withdrawn) — so a fill whose fees exceed the
+        // remaining budget has ALL its fees waived (nothing charged, nothing paid out)
+        // rather than collecting a fee the ledger cannot fund.
+        uint256 feeBudget;
+
         // Integrator dedup buffer (preallocated to 2x the batch fill bound at executeBatch
         // entry — each match can append two distinct integrators, one per side)
         IntegratorAccum[] integratorAccums;
@@ -641,7 +665,6 @@ library BazaarTypes {
         uint256 currentPrice; // cached oracle price
         int256 currentFundingIndex;
         MarginRequirements marginReqs;
-        bool isOracleStale;
         uint256 nextOrderId; // will be updated
         uint256 outstandingLongOrderExposure; // total notional of user's active long limit orders
         uint256 outstandingShortOrderExposure; // total notional of user's active short limit orders
@@ -666,6 +689,7 @@ library BazaarTypes {
         uint256 spotPrice;
         uint256 emaVarianceBp;
         int256 emaGapBp;
+        uint256 reopenGapBp; // ReopenGapEma.gapEmaBp for non-continuously traded pairs, 0 otherwise (raises the fund target)
         uint256 lockedShares; // shares locked in active insurer-vote termination proposal
     }
 

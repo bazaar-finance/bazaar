@@ -4,6 +4,7 @@ pragma solidity 0.8.34;
 import {IntegrationBase} from "./IntegrationBase.sol";
 import {StdStorage, stdStorage} from "forge-std/Test.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
+import {CollateralLib} from "../../src/libraries/CollateralLib.sol";
 
 /// @title StaleAndRewardEdgeTest
 /// @notice Stale-oracle margin/liquidation posture and the liquidator-reward soft-fail arms.
@@ -37,26 +38,28 @@ contract StaleAndRewardEdgeTest is IntegrationBase {
         );
     }
 
-    // ============================ stale 2x IMR at creation ============================
+    // ============================ stale creation margin ============================
 
-    /// @notice On a stale oracle, order creation demands DOUBLE the initial margin: collateral that
-    ///         comfortably clears 1x IMR with a fresh price is rejected once the price goes stale.
-    function test_staleOracle_doublesCreationMargin() public {
-        // 1 AAPL @ ~$200 notional: warmup IMR 20% = $40; stale doubles it to $80. Deposit $60.
-        _depositAapl(alice, 60 * BAZAAR_SCALE);
+    /// @notice A stale oracle adds NO margin surcharge at order creation: the same collateral that
+    ///         clears the IMR with a fresh price clears it against the stale fallback too. Gap
+    ///         risk is priced into the non-continuous pair's always-on IMR (2x multiplier +
+    ///         reopen-gap floor), not into a stale-mode rate.
+    function test_staleOracle_noCreationSurcharge() public {
+        // 1 AAPL @ $200 limit: warmup IMR 40% (20% x 2 non-continuous) = $80. Deposit $85 —
+        // above 1x IMR, far below what any 2x stale surcharge would demand ($160).
+        _depositAapl(alice, 85 * BAZAAR_SCALE);
 
-        // Fresh price: creation clears 1x IMR.
+        // Fresh price: creation clears the IMR.
         bytes[] memory fresh = _priceUpdateFor(AAPL_USD_FEED_ID, 200, uint64(vm.getBlockTimestamp()));
         _placeLimitAapl(alice, 1 * BAZAAR_SCALE, 200 * BAZAAR_SCALE, fresh);
         (uint256[] memory ids,,,) = aaplPair.getUserActiveLimitOrders(alice);
         assertEq(ids.length, 1, "fresh-price creation succeeds at 1x IMR");
 
-        // Cancel, stale the cache, retry with an empty update: 2x IMR now binds.
+        // Cancel, stale the cache, retry with an empty update: the SAME 1x IMR still clears.
         vm.prank(alice);
         aaplPair.cancelOrders(ids, 0, 0, 0, "");
         vm.warp(vm.getBlockTimestamp() + 30);
         vm.prank(alice);
-        vm.expectRevert();
         aaplPair.createOrder(
             BazaarTypes.OrderType.Limit,
             0,
@@ -73,6 +76,64 @@ contract StaleAndRewardEdgeTest is IntegrationBase {
             0,
             ""
         );
+        (uint256[] memory staleIds,,,) = aaplPair.getUserActiveLimitOrders(alice);
+        assertEq(staleIds.length, 1, "stale-price creation succeeds at the same 1x IMR");
+    }
+
+    // ============================ stale withdrawal freeze ============================
+
+    /// @notice A position holder cannot withdraw against the stale fallback. Around a closure,
+    ///         off-chain venues print the reopen hours before the oracle can, so releasing
+    ///         equity at the frozen mark would let a holder who is already dead at the real
+    ///         price convert that loss into vault deficit. The identical withdrawal clears the
+    ///         moment a fresh price is supplied.
+    function test_staleOracle_positionHolderWithdrawalBlocked() public {
+        // Warm the AAPL cache at $200 and give dave a healthy 1-share long with wide headroom.
+        bytes[] memory pu = _priceUpdateFor(AAPL_USD_FEED_ID, 200, uint64(vm.getBlockTimestamp()));
+        vm.deal(address(this), 1 ether);
+        mockPyth.updatePriceFeeds{value: mockPyth.getUpdateFee(pu)}(pu);
+        aaplPair.refreshPrice(new bytes[](0));
+
+        _depositAapl(dave, 200 * BAZAAR_SCALE);
+        _stdstore.target(address(aaplPair)).sig("positionBuckets(address)").with_key(dave).depth(0).checked_write(true);
+        _stdstore.target(address(aaplPair)).sig("positionBuckets(address)").with_key(dave).depth(1)
+            .checked_write(1 * BAZAAR_SCALE); // size
+        _stdstore.target(address(aaplPair)).sig("positionBuckets(address)").with_key(dave).depth(2)
+            .checked_write(200 * BAZAAR_SCALE); // entryValue
+
+        vm.warp(vm.getBlockTimestamp() + 30); // stale the cache (MAX_PRICE_STALENESS = 2s)
+        vm.prank(dave);
+        vm.expectRevert(CollateralLib.CollateralLib__WithdrawalRequiresFreshPrice.selector);
+        aaplPair.withdrawCollateral(10 * BAZAAR_SCALE, new bytes[](0), 0, 0, 0, "");
+
+        // Same withdrawal, fresh price: clears every gate.
+        bytes[] memory fresh = _priceUpdateFor(AAPL_USD_FEED_ID, 200, uint64(vm.getBlockTimestamp()));
+        uint256 before = usdc.balanceOf(dave);
+        vm.deal(dave, 1 ether);
+        vm.prank(dave);
+        aaplPair.withdrawCollateral{value: 0.01 ether}(10 * BAZAAR_SCALE, fresh, 0, 0, 0, "");
+        assertEq(usdc.balanceOf(dave) - before, 10 * BAZAAR_SCALE / 1e12, "fresh-price withdrawal pays out");
+    }
+
+    /// @notice Flat accounts with resting orders keep the stale-fallback path: they hold no
+    ///         position whose frozen mark could hide a loss, and their resting exposure keeps
+    ///         its order-IMR reserve through the withdrawal.
+    function test_staleOracle_flatWithOrdersWithdrawalAllowed() public {
+        bytes[] memory pu = _priceUpdateFor(AAPL_USD_FEED_ID, 200, uint64(vm.getBlockTimestamp()));
+        vm.deal(address(this), 1 ether);
+        mockPyth.updatePriceFeeds{value: mockPyth.getUpdateFee(pu)}(pu);
+        aaplPair.refreshPrice(new bytes[](0));
+
+        // $100 collateral, one resting half-share bid at $150: order-IMR reserve = 40% x $75 = $30.
+        _depositAapl(alice, 100 * BAZAAR_SCALE);
+        bytes[] memory fresh = _priceUpdateFor(AAPL_USD_FEED_ID, 200, uint64(vm.getBlockTimestamp()));
+        _placeLimitAapl(alice, BAZAAR_SCALE / 2, 150 * BAZAAR_SCALE, fresh);
+
+        vm.warp(vm.getBlockTimestamp() + 30); // stale
+        uint256 before = usdc.balanceOf(alice);
+        vm.prank(alice);
+        aaplPair.withdrawCollateral(20 * BAZAAR_SCALE, new bytes[](0), 0, 0, 0, "");
+        assertEq(usdc.balanceOf(alice) - before, 20 * BAZAAR_SCALE / 1e12, "order-only account withdraws while stale");
     }
 
     // ============================ stale liquidation posture ============================

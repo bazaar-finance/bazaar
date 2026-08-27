@@ -8,15 +8,15 @@ One EIP-1167 clone per market. Initialized once by the factory.
 
 | Function | Access | Purpose |
 |---|---|---|
-| `depositCollateral` / `withdrawCollateral` | anyone / meta-tx | collateral in/out; withdrawal enforces IMR at bracket prices and, while a position is open, the `max(0.5% of notional, $5)` retained floor |
+| `depositCollateral` / `withdrawCollateral` | anyone / meta-tx | collateral in/out; withdrawal enforces IMR at bracket prices and, while a position is open, retention of `mmrBp` (continuously traded) or `imrBp` (session-bound) of notional in collateral proper |
 | `createOrder` / `cancelOrders` | anyone / meta-tx | see [Orders](../protocol/orders.md) |
 | `matchBatch` | bonded sequencer | three-pass batch matching |
 | `liquidate(users[], …)` | anyone | full liquidation of insolvent buckets — and, once a settlement price is fixed, the terminal-settlement entry point (no price update, no ETH, no solvency threshold) |
 | `executeAdl(winners[], …)` | anyone | Dutch-auction deleveraging |
 | `depositToInsurance` / `requestInsuranceWithdrawal` / `executeInsuranceWithdrawal` | anyone / meta-tx | insurance LP flows |
 | `refreshPrice` | anyone | push a Pyth update, roll funding/margin state |
-| `creditInsuranceFromSequencer` | wired (sequencer) | books slash proceeds |
-| `setScheduledTermination` / `fixSettlementPrice` / `creditInsuranceFromTerminator` | wired (terminator) | lifecycle transitions (`finalizeTermination` is public after the 48 h settlement window; settling positions at the fixed price runs through `liquidate`) |
+| `creditInsurance` | wired (terminator or sequencer) | books forfeited insurer bonds and slash proceeds |
+| `setScheduledTermination` / `fixSettlementPrice` | wired (terminator) | lifecycle transitions (`finalizeTermination` is public after the 48 h settlement window; settling positions at the fixed price runs through `liquidate`) |
 
 Key views: `batchHashes`, `positionBuckets`, `orders`, `lastPairPrice`, `getSharesAsOf`, plus everything on the lens.
 

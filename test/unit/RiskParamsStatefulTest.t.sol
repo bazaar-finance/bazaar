@@ -5,21 +5,28 @@ import {Test} from "forge-std/Test.sol";
 import {RiskParamsLib} from "../../src/libraries/RiskParamsLib.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 
-/// @dev Storage host exposing the three STATEFUL RiskParamsLib functions that had zero direct
-///      coverage: `calculateVariance` (the volatility EMA), `updateLiquidationGapEmaBatch`
-///      (the liquidation-gap EMA), and `calculateIMRandMMR` (the composed margin curve). Together
-///      these are the volatility/liquidation → leverage-limit feedback loop.
+/// @dev Storage host for the three STATEFUL RiskParamsLib functions: `calculateVariance` (the
+///      volatility EMA), `updateLiquidationGapEmaBatch` (the liquidation-gap EMA), and
+///      `calculateIMRandMMR` (the composed margin curve). Together these are the
+///      volatility/liquidation → leverage-limit feedback loop.
 contract RiskParamsStatefulHarness {
     BazaarTypes.MarginRequirements internal marginRequirements;
     BazaarTypes.PairPrice internal lastPairPrice;
+    BazaarTypes.VarianceSample internal varianceSample;
     BazaarTypes.LiquidationGapEma internal liquidationGapEma;
     BazaarTypes.Vault internal pairVault;
+    BazaarTypes.ReopenGapEma internal reopenGapEma;
 
     // ---- setters ----
     function setPairPrice(uint256 spotPrice, uint256 updateTs, uint256 emaVarianceBp) external {
         lastPairPrice.spotPrice = spotPrice;
         lastPairPrice.updateTs = updateTs;
         lastPairPrice.emaVarianceBp = emaVarianceBp;
+    }
+
+    function setVarianceSample(uint256 spotPrice, uint256 publishTs) external {
+        varianceSample.spotPrice = uint192(spotPrice);
+        varianceSample.publishTs = uint64(publishTs);
     }
 
     function setGapEma(int256 emaGapBp, uint256 lastLiquidationTs, uint256 decayedSize) external {
@@ -40,9 +47,14 @@ contract RiskParamsStatefulHarness {
         marginRequirements.lastUpdateTs = lastUpdateTs;
     }
 
+    function setReopenGap(uint192 gapEmaBp, uint64 lastObsTs) external {
+        reopenGapEma.gapEmaBp = gapEmaBp;
+        reopenGapEma.lastObsTs = lastObsTs;
+    }
+
     // ---- callers ----
-    function calcVariance(uint256 price) external view returns (uint256) {
-        return RiskParamsLib.calculateVariance(lastPairPrice, price);
+    function calcVariance(uint256 price, uint256 publishTime) external returns (uint256) {
+        return RiskParamsLib.calculateVariance(lastPairPrice, varianceSample, reopenGapEma, price, publishTime);
     }
 
     function updateGapBatch(int256 sumGapTimesSize, uint256 totalFillSize, uint256 count) external {
@@ -60,6 +72,7 @@ contract RiskParamsStatefulHarness {
             lastPairPrice,
             liquidationGapEma,
             pairVault,
+            reopenGapEma,
             currentPrice,
             isContinuouslyTraded,
             pairCreatedTs,
@@ -68,8 +81,16 @@ contract RiskParamsStatefulHarness {
     }
 
     // ---- getters ----
+    function sample() external view returns (uint256, uint256) {
+        return (varianceSample.spotPrice, varianceSample.publishTs);
+    }
+
     function gapEma() external view returns (int256, uint256, uint256) {
         return (liquidationGapEma.emaGapBp, liquidationGapEma.lastLiquidationTs, liquidationGapEma.decayedSize);
+    }
+
+    function reopenGap() external view returns (uint256, uint256) {
+        return (reopenGapEma.gapEmaBp, reopenGapEma.lastObsTs);
     }
 
     function marginReqs() external view returns (uint256, uint256, uint256) {
@@ -92,17 +113,26 @@ contract RiskParamsStatefulTest is Test {
     // calculateVariance
     // =====================================================================
 
-    /// @notice First-ever price (no prior spot) returns 0 — no return to compute variance from.
-    function test_variance_firstPrice_returnsZero() public {
+    /// @notice With no baseline observation there is no return to measure, so the first stored
+    ///         price only seeds the sample and leaves the EMA at its prior value.
+    function test_variance_noBaseline_seedsAndHoldsEma() public {
         h.setPairPrice({spotPrice: 0, updateTs: BASE_TS, emaVarianceBp: 777});
-        assertEq(h.calcVariance(100e18), 0, "no prior price -> 0");
+        assertEq(h.calcVariance(100e18, BASE_TS), 777, "no baseline -> EMA held");
+        (uint256 sp, uint256 ts) = h.sample();
+        assertEq(sp, 100e18, "baseline price seeded");
+        assertEq(ts, BASE_TS, "baseline clock seeded");
     }
 
-    /// @notice Within the 1-minute cooldown the previous EMA is returned verbatim (strict `<`).
-    function test_variance_withinCooldown_returnsPrevious() public {
-        // updateTs 59s ago: elapsed 59 < 60 -> return prior emaVarianceBp untouched.
-        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS - 59, emaVarianceBp: 7777});
-        assertEq(h.calcVariance(110e18), 7777, "cooldown holds prior EMA");
+    /// @notice Under the 1-minute cooldown the EMA is returned verbatim (strict `<`) AND the
+    ///         baseline is left in place, so the sampling interval keeps accumulating. Holding
+    ///         the baseline is what makes a fast cadence defer a sample rather than drop it.
+    function test_variance_withinCooldown_holdsEmaAndBaseline() public {
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 7777});
+        h.setVarianceSample({spotPrice: 100e18, publishTs: BASE_TS - 59});
+        assertEq(h.calcVariance(110e18, BASE_TS), 7777, "cooldown holds prior EMA");
+        (uint256 sp, uint256 ts) = h.sample();
+        assertEq(sp, 100e18, "baseline price unchanged");
+        assertEq(ts, BASE_TS - 59, "baseline clock unchanged");
     }
 
     /// @notice At exactly 60s elapsed the cooldown has passed and the EMA recomputes.
@@ -110,17 +140,59 @@ contract RiskParamsStatefulTest is Test {
     ///         returnBp=1000, squared=1e6, effElapsed=60, annualized=1e6*365d/60=525_600_000_000,
     ///         alpha=60*1e4/(60+5d)=1, ema=525_600_000_000*1/1e4=52_560_000.
     function test_variance_cooldownBoundary_recomputes() public {
-        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS - 60, emaVarianceBp: 0});
-        assertEq(h.calcVariance(110e18), 52_560_000, "recomputes at exactly 60s");
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
+        h.setVarianceSample({spotPrice: 100e18, publishTs: BASE_TS - 60});
+        assertEq(h.calcVariance(110e18, BASE_TS), 52_560_000, "recomputes at exactly 60s");
+        (uint256 sp, uint256 ts) = h.sample();
+        assertEq(sp, 110e18, "baseline advanced to the consumed price");
+        assertEq(ts, BASE_TS, "baseline clock advanced");
+    }
+
+    /// @notice A sub-cooldown cadence defers the sample instead of discarding it: the baseline
+    ///         survives the fast update, so the next update that clears the cooldown measures the
+    ///         accumulated interval from the ORIGINAL baseline (100 -> 110 over 60s), not from the
+    ///         intermediate 105 print.
+    function test_variance_subCooldownCadence_defersRatherThanDiscards() public {
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
+        h.setVarianceSample({spotPrice: 100e18, publishTs: BASE_TS});
+
+        assertEq(h.calcVariance(105e18, BASE_TS + 30), 0, "30s sample deferred");
+        (uint256 sp, uint256 ts) = h.sample();
+        assertEq(sp, 100e18, "baseline price survives the deferral");
+        assertEq(ts, BASE_TS, "baseline clock survives the deferral");
+
+        assertEq(h.calcVariance(110e18, BASE_TS + 60), 52_560_000, "deferred interval advances the EMA");
+    }
+
+    /// @notice The EMA cannot be pinned at 0 by update cadence. Every update here lands 30s after
+    ///         the last one — under the cooldown — yet the EMA still advances, because deferral
+    ///         lets every second update carry an accumulated 60s interval.
+    function test_variance_fastCadence_cannotPinEmaAtZero() public {
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
+        h.setVarianceSample({spotPrice: 100e18, publishTs: BASE_TS});
+
+        uint256 ema;
+        for (uint256 i = 1; i <= 40; ++i) {
+            // Period-4 ±10% path. Deferral consumes every second update, so the price must have
+            // period 4 in `i` for consecutive CONSUMED samples to differ; a period-2 path would
+            // alias onto a single price and measure a genuine zero return every time.
+            uint256 price = i % 4 < 2 ? 100e18 : 110e18;
+            uint256 pubTs = BASE_TS + i * 30;
+            ema = h.calcVariance(price, pubTs);
+            // Mirror the pair storing the returned EMA alongside the new price.
+            h.setPairPrice({spotPrice: price, updateTs: pubTs, emaVarianceBp: ema});
+        }
+        assertGt(ema, 0, "fast cadence still advances the EMA");
     }
 
     /// @notice Up-move and down-move of the same magnitude yield identical variance
     ///         (the return is |Δ|/spot, sign-agnostic).
     function test_variance_upDownSymmetry() public {
-        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS - 5 days, emaVarianceBp: 0});
-        uint256 up = h.calcVariance(110e18); // +10%
-        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS - 5 days, emaVarianceBp: 0});
-        uint256 down = h.calcVariance(90e18); // -10%
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
+        h.setVarianceSample({spotPrice: 100e18, publishTs: BASE_TS - 5 days});
+        uint256 up = h.calcVariance(110e18, BASE_TS); // +10%
+        h.setVarianceSample({spotPrice: 100e18, publishTs: BASE_TS - 5 days});
+        uint256 down = h.calcVariance(90e18, BASE_TS); // -10%
         assertEq(up, down, "symmetric in price direction");
         assertGt(up, 0, "non-trivial variance");
     }
@@ -129,21 +201,96 @@ contract RiskParamsStatefulTest is Test {
     ///         returnBp=1000, squared=1e6, effElapsed capped at 1 day -> annualized=1e6*365=365_000_000,
     ///         alpha=5d*1e4/(5d+5d)=5000, ema=365_000_000*5000/1e4=182_500_000.
     function test_variance_exactValue_fiveDayStep() public {
-        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS - 5 days, emaVarianceBp: 0});
-        assertEq(h.calcVariance(110e18), 182_500_000, "exact EMA after 5-day 10% step");
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
+        h.setVarianceSample({spotPrice: 100e18, publishTs: BASE_TS - 5 days});
+        assertEq(h.calcVariance(110e18, BASE_TS), 182_500_000, "exact EMA after 5-day 10% step");
     }
 
     /// @notice The effective-elapsed (1-day) and alpha (5000) caps both saturate beyond 5 days,
     ///         so a 5-day step and a 15-day step of identical magnitude produce the SAME variance.
     ///         Proves both clamps at once.
     function test_variance_effElapsedAndAlphaCaps_saturate() public {
-        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS - 5 days, emaVarianceBp: 0});
-        uint256 fiveDay = h.calcVariance(110e18);
-        vm.warp(BASE_TS + 10 days); // so a 15-day-old updateTs is reachable
-        h.setPairPrice({spotPrice: 100e18, updateTs: (BASE_TS + 10 days) - 15 days, emaVarianceBp: 0});
-        uint256 fifteenDay = h.calcVariance(110e18);
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
+        h.setVarianceSample({spotPrice: 100e18, publishTs: BASE_TS - 5 days});
+        uint256 fiveDay = h.calcVariance(110e18, BASE_TS);
+
+        uint256 later = BASE_TS + 10 days; // headroom for a 15-day-old baseline
+        h.setVarianceSample({spotPrice: 100e18, publishTs: later - 15 days});
+        uint256 fifteenDay = h.calcVariance(110e18, later);
         assertEq(fiveDay, fifteenDay, "effElapsed & alpha caps saturate identically");
         assertEq(fiveDay, 182_500_000, "and equal the pinned value");
+    }
+
+    // =====================================================================
+    // reopen-gap observation (piggybacks on calculateVariance)
+    // =====================================================================
+
+    /// @notice A storage gap below REOPEN_GAP_MIN_STALENESS (1h) is on-chain call sparsity, not
+    ///         a market discontinuity: its return feeds only the variance EMA and never the
+    ///         reopen-gap floor.
+    function test_reopenGap_below1h_ignored() public {
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
+        h.setVarianceSample({spotPrice: 100e18, publishTs: BASE_TS});
+        h.calcVariance(110e18, BASE_TS + 1 hours - 1);
+        (uint256 gap, uint256 obsTs) = h.reopenGap();
+        assertEq(gap, 0, "sub-1h gap not observed");
+        assertEq(obsTs, 0, "observation clock untouched");
+    }
+
+    /// @notice At exactly 1h the gap is eligible (>= boundary): |110-100|/100 = 1000bp, and the
+    ///         observation clock stamps the reopen's publish time.
+    function test_reopenGap_at1hBoundary_records() public {
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
+        h.setVarianceSample({spotPrice: 100e18, publishTs: BASE_TS});
+        h.calcVariance(110e18, BASE_TS + 1 hours);
+        (uint256 gap, uint256 obsTs) = h.reopenGap();
+        assertEq(gap, 1000, "10% reopen gap recorded");
+        assertEq(obsTs, BASE_TS + 1 hours, "observation clock stamped");
+    }
+
+    /// @notice Peak-hold: a quiet reopen decays the held value instead of averaging it down.
+    ///         Nightly cadence — held 2000 observed at T0, close stored at T0+6.5h, reopen one
+    ///         day after T0 with a 1% gap: decayed = 2000 x 180d/(180d+1d) = 1988, and the 100bp
+    ///         observation loses the max.
+    function test_reopenGap_quietReopen_decaysNotAverages() public {
+        h.setReopenGap({gapEmaBp: 2000, lastObsTs: uint64(BASE_TS)});
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS + 6.5 hours, emaVarianceBp: 0});
+        h.setVarianceSample({spotPrice: 100e18, publishTs: BASE_TS + 6.5 hours});
+        h.calcVariance(101e18, BASE_TS + 1 days);
+        (uint256 gap, uint256 obsTs) = h.reopenGap();
+        assertEq(gap, 1988, "harmonic decay of the held peak, not a mean");
+        assertEq(obsTs, BASE_TS + 1 days, "clock advances on every accepted observation");
+    }
+
+    /// @notice A reopen worse than the (decayed) held value ratchets the floor up to the new
+    ///         observation.
+    function test_reopenGap_severeReopen_ratchets() public {
+        h.setReopenGap({gapEmaBp: 500, lastObsTs: uint64(BASE_TS)});
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS + 6.5 hours, emaVarianceBp: 0});
+        h.setVarianceSample({spotPrice: 100e18, publishTs: BASE_TS + 6.5 hours});
+        h.calcVariance(88e18, BASE_TS + 1 days); // -12% reopen
+        (uint256 gap,) = h.reopenGap();
+        assertEq(gap, 1200, "held value ratchets to the worse observation");
+    }
+
+    /// @notice The floor is capped at REOPEN_GAP_EMA_CAP_BP: a catastrophic 45% reopen stores
+    ///         4000bp, not 4500.
+    function test_reopenGap_capAt4000() public {
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
+        h.setVarianceSample({spotPrice: 100e18, publishTs: BASE_TS});
+        h.calcVariance(145e18, BASE_TS + 9 hours);
+        (uint256 gap,) = h.reopenGap();
+        assertEq(gap, 4000, "capped at REOPEN_GAP_EMA_CAP_BP");
+    }
+
+    /// @notice The first-ever stored price has no baseline (spot 0): nothing to measure a reopen
+    ///         against, so no observation is taken however long the gap.
+    function test_reopenGap_noBaseline_skipped() public {
+        h.setPairPrice({spotPrice: 0, updateTs: BASE_TS, emaVarianceBp: 0});
+        h.calcVariance(100e18, BASE_TS + 3 days);
+        (uint256 gap, uint256 obsTs) = h.reopenGap();
+        assertEq(gap, 0, "no baseline, no observation");
+        assertEq(obsTs, 0, "clock untouched");
     }
 
     // =====================================================================
@@ -231,14 +378,76 @@ contract RiskParamsStatefulTest is Test {
         assertEq(ts, BASE_TS, "lastUpdateTs stamped");
     }
 
-    /// @notice Non-continuous applies the 1.5x multiplier: 300bp -> 450bp (above the 400 floor).
+    /// @notice Non-continuous applies the 2x multiplier: 300bp -> 600bp (above the 400 floor).
     function test_imr_nonContinuousMultiplier() public {
         h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
         h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 0});
         h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: false, pairCreatedTs: 0, priceUpdateCount: 50_000});
         (uint256 imr, uint256 mmr,) = h.marginReqs();
-        assertEq(imr, 450, "1.5x non-continuous multiplier");
-        assertEq(mmr, 225, "MMR = IMR/2");
+        assertEq(imr, 600, "2x non-continuous multiplier");
+        assertEq(mmr, 300, "MMR = IMR/2");
+    }
+
+    /// @notice The gap leg binds when the gap EMA exceeds the (pre-doubling) vol estimate, and
+    ///         the winner is doubled: calm vol reads 300bp, a learned 15% reopen gap gives
+    ///         IMR = 2 x 1500 = 3000bp — so MMR (1500) covers a full repeat of the demonstrated
+    ///         reopen and IMR covers twice it.
+    function test_imr_reopenGapBinds_doubled() public {
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
+        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 0});
+        h.setReopenGap({gapEmaBp: 1500, lastObsTs: uint64(BASE_TS)});
+        h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: false, pairCreatedTs: 0, priceUpdateCount: 50_000});
+        (uint256 imr, uint256 mmr,) = h.marginReqs();
+        assertEq(imr, 3000, "IMR = 2 x max(vol 300, gap 1500)");
+        assertEq(mmr, 1500, "MMR = the full demonstrated reopen");
+    }
+
+    /// @notice A reopen gap below the (pre-doubling) vol estimate is inert: the estimators
+    ///         compose by max BEFORE the closure prior doubles the winner, so the same event
+    ///         is never charged through both.
+    function test_imr_reopenGapBelowVolEstimate_noEffect() public {
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
+        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 0});
+        h.setReopenGap({gapEmaBp: 250, lastObsTs: uint64(BASE_TS)});
+        h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: false, pairCreatedTs: 0, priceUpdateCount: 50_000});
+        (uint256 imr,,) = h.marginReqs();
+        assertEq(imr, 600, "gap below the vol estimate is inert: 2 x max(300, 250)");
+    }
+
+    /// @notice A cap-sized reopen gap (40%) doubles to exactly MAX_IMR_BP: a catastrophic
+    ///         reopen pins the pair at the 80% clamp (1.25x max leverage) until the peak-hold
+    ///         decays, with MMR at the full 40% cap.
+    function test_imr_cappedGapDoublesToMaxClamp() public {
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
+        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 0});
+        h.setReopenGap({gapEmaBp: 4000, lastObsTs: uint64(BASE_TS)});
+        h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: false, pairCreatedTs: 0, priceUpdateCount: 50_000});
+        (uint256 imr, uint256 mmr,) = h.marginReqs();
+        assertEq(imr, 8000, "2 x capped gap lands exactly on MAX_IMR_BP");
+        assertEq(mmr, 4000, "MMR = the 40% gap cap");
+    }
+
+    /// @notice Continuously traded pairs never consume the reopen-gap floor, whatever is stored.
+    function test_imr_reopenGapIgnoredForContinuous() public {
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
+        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 0});
+        h.setReopenGap({gapEmaBp: 4000, lastObsTs: uint64(BASE_TS)});
+        h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: true, pairCreatedTs: 0, priceUpdateCount: 50_000});
+        (uint256 imr,,) = h.marginReqs();
+        assertEq(imr, 400, "continuous pair sticks to the vol curve");
+    }
+
+    /// @notice The volatility leg alone can exceed 3x: at its 6x saturation variance the
+    ///         composed IMR is 300 x 6 = 1800bp for a continuous pair. The other legs read 1x —
+    ///         which at extreme variance requires the fund to sit at the vol-RAISED max target
+    ///         (10% of OI), not merely above the calm-market one.
+    function test_imr_volCapAt6x_flowsThroughCurve() public {
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 247_000_000});
+        h.setVault({insuranceFundBalance: 100_000e18, totalLongOI: 1_000_000e18, totalShortOI: 0}); // 10% ratio = max target
+        h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: true, pairCreatedTs: 0, priceUpdateCount: 50_000});
+        (uint256 imr, uint256 mmr,) = h.marginReqs();
+        assertEq(imr, 1800, "vol leg saturates at 6x: 300 x 6");
+        assertEq(mmr, 900, "MMR = IMR/2");
     }
 
     /// @notice Extreme vol + extreme gap + empty fund: combined 3x*3x*3x -> 8100bp, clamped to
@@ -264,15 +473,16 @@ contract RiskParamsStatefulTest is Test {
         assertEq(mmr, 1000, "MMR = IMR/2");
     }
 
-    /// @notice Non-continuous during warmup: floor is 2000 * 1.5 = 3000bp — the value
-    ///         StaleLiquidationExploitTest relies on for AAPL-style pairs.
+    /// @notice Non-continuous during warmup: floor is 2000 * 2 = 4000bp (2.5x max leverage; a
+    ///         freshly listed pair has no reopen-gap history, so the warmup floor carries the
+    ///         cold-start gap risk).
     function test_imr_warmupFloor_nonContinuous() public {
         h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
         h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 0});
         h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: false, pairCreatedTs: BASE_TS, priceUpdateCount: 0});
         (uint256 imr, uint256 mmr,) = h.marginReqs();
-        assertEq(imr, 3000, "non-continuous warmup floor = 30% IMR");
-        assertEq(mmr, 1500, "MMR = IMR/2");
+        assertEq(imr, 4000, "non-continuous warmup floor = 40% IMR");
+        assertEq(mmr, 2000, "MMR = IMR/2");
     }
 
     /// @notice Within the 1-minute IMR cooldown the call early-returns and leaves margins untouched;

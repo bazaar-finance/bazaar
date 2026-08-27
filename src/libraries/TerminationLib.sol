@@ -63,12 +63,21 @@ library TerminationLib {
         uint256 snapshotInsuranceFundBalance = pairVault.insuranceFundBalance;
 
         // === Settle the pending-liquidation (estate) aggregate ===
-        // The estate leg (vault inventory from pre-termination liquidations) settles as an
-        // I <-> D transfer of its FULL entry -> settlement value change — price leg AND the
-        // funding leg (currentFundingIndex vs the liquidatees' entry-weighted index), mirroring
-        // _settleVaultLiquidation and _netOpposingLiquidation. The funding leg is required:
-        // without it the estates' funding obligation would vanish while the surviving
-        // counterparties still realize theirs, leaving unbacked claims on the deposits ledger.
+        // The estate (vault inventory from pre-termination liquidations) settles its FULL
+        // entry -> settlement value change — the price leg AND the funding leg
+        // (currentFundingIndex vs the liquidatees' entry-weighted index). The funding leg is
+        // required: without it the estate's funding obligation would vanish while the surviving
+        // counterparties still realize theirs, leaving claims no cash backs.
+        //
+        // Both directions adjust the insurance ledger ONLY — never totalCollateralDeposited.
+        // Terminal settlement books the estate's counterparties off the deposits ledger: a
+        // winner's PnL is a terminalProfitClaim paid from the cash surplus (cash - D - I,
+        // frozen below), and a loser's realized loss is released from D when swept
+        // (CollateralLib._settleOne). Mirroring the live-phase I <-> D transfer here would
+        // break both directions: on an estate loss, crediting D adds cash no bucket owns and
+        // cancels — via the surplus derivation — exactly the surplus meant to fund the claims;
+        // on an estate gain, debiting D subtracts value the sweep already released, pushing D
+        // below the principal still owed and underflowing the final withdrawals.
         int256 estateNet = 0; // net insurance delta from the estate leg (event reporting)
 
         if (!params.isEmergency && pairVault.pendingLiqSize > 0) {
@@ -84,23 +93,20 @@ library TerminationLib {
                 ? int256(settleNotional) - int256(entryNotional) - fundingLeg
                 : int256(entryNotional) - int256(settleNotional) + fundingLeg;
             if (valueChange < 0) {
-                // Estate lost: its counterparties' wins draw from D at withdrawal, but the
-                // backing (seized collateral + settlement charge) sits in I — transfer it,
-                // capped at I. Any uncovered remainder simply leaves less cash surplus for
-                // the profit ratio below; nothing unbacked is ever credited to D.
+                // Estate lost: insurance absorbs the loss, capped at I. Any uncovered
+                // remainder surfaces as claims exceeding the cash surplus and is pro-rated
+                // by the frozen ratio below — nothing unbacked is ever credited anywhere.
                 uint256 owed = uint256(-valueChange);
                 uint256 take = owed < pairVault.insuranceFundBalance ? owed : pairVault.insuranceFundBalance;
                 pairVault.insuranceFundBalance -= take;
-                pairVault.totalCollateralDeposited += take;
                 estateNet = -int256(take);
             } else if (valueChange > 0) {
-                // Estate profited: no surviving claimant, insurance inherits. Capped at D —
-                // an uncredited excess errs as unclaimable surplus, never an unbacked claim.
-                uint256 owed = uint256(valueChange);
-                uint256 take = owed < pairVault.totalCollateralDeposited ? owed : pairVault.totalCollateralDeposited;
-                pairVault.totalCollateralDeposited -= take;
-                pairVault.insuranceFundBalance += take;
-                estateNet = int256(take);
+                // Estate profited: no surviving claimant, insurance inherits. The backing cash
+                // is the counterparties' losses released from D by the sweep; if any remain
+                // unswept at finalize, the junior clip below caps I at cash - D, erring as
+                // unclaimable surplus, never an unbacked claim.
+                pairVault.insuranceFundBalance += uint256(valueChange);
+                estateNet = int256(valueChange);
             }
         }
 

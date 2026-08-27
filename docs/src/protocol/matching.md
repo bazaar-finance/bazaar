@@ -35,11 +35,10 @@ Market and StopLoss orders have an *effective price* of oracle ± their slippage
 
 ## Per-fill checks
 
-Each prospective fill re-checks the owner's margin at the fresh oracle price:
+Each prospective fill re-checks the owner's margin at the batch's oracle price:
 
-- **Fails normal IMR** → the order is **auto-canceled** (stamped `canceledBlock`, event emitted). A user who drifted insolvent since creation cannot haunt the book.
-- **Passes normal but fails the 2× stale-IMR check** (only relevant in stale-oracle batches) → the order is skipped and its ID recorded in the batch witness `staleSkippedIds[]`, keeping it alive for the next fresh batch — and unchallengeable for this one.
-- **Stale price band** (also stale-only) — a fill priced more than ±10% (`MAX_STALE_DEVIATION_BP`) from the last oracle price is voided. The out-of-band price is always the *maker's* by construction (Pass B fills at the limit's price, Pass C at the older order's), so only the maker leg is retired, and only its ID goes into `staleSkippedIds[]` — enough for the void to read as a legitimate skip rather than an omission. The counterparty stays live and retries against the next order on the maker's side; it needs no witness entry of its own, because the walk never advances past it and so no worse-priced same-side order can match ahead of it.
+- **Fails IMR** → the order is **auto-canceled** (stamped `canceledBlock`, event emitted). A user who drifted insolvent since creation cannot haunt the book. The requirement is identical in fresh and stale batches — gap risk is priced into the always-on IMR ([Margin](margin.md)), not into a stale-mode rate.
+- **Stale price band** (stale-only) — a fill priced more than ±10% (`MAX_STALE_DEVIATION_BP`) from the last oracle price is voided. The out-of-band price is always the *maker's* by construction (Pass B fills at the limit's price, Pass C at the older order's), so only the maker leg is retired, and only its ID goes into `staleSkippedIds[]` — the band is the sole feeder of that witness, and the entry is what makes the void read as a legitimate skip rather than an omission. The counterparty stays live and retries against the next order on the maker's side; it needs no witness entry of its own, because the walk never advances past it and so no worse-priced same-side order can match ahead of it.
 
 Fills realize proportional PnL and funding on closing portions, classify open/add/close/flip by size, and update both sides' buckets plus open-interest aggregates.
 

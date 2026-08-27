@@ -25,8 +25,6 @@ contract HelperConfig is Script {
             activeNetworkConfig = getArbitrumMainnetConfig();
         } else if (block.chainid == 421614) {
             activeNetworkConfig = getOrCreateArbitrumSepoliaConfig();
-        } else if (block.chainid == 84532) {
-            activeNetworkConfig = getBaseSepoliaConfig();
         } else if (block.chainid == 31337) {
             activeNetworkConfig = getOrCreateAnvilConfig();
         } else {
@@ -38,7 +36,7 @@ contract HelperConfig is Script {
 
     function getArbitrumMainnetConfig() public pure returns (NetworkConfig memory) {
         return NetworkConfig({
-            pythFeed: 0xff1a0f4744e8582DF1aE09D5611b887B6a12925C,
+            pythFeed: 0xe15357fB7ab31E091583b9c4b4135BB2f176f38e,
             usdcContract: 0xaf88d065e77c8cC2239327C5EDb3A432268e5831,
             optimisticOracleV3: 0xa6147867264374F324524E30C02C331cF28aa879,
             name: "Arbitrum-Mainnet"
@@ -56,7 +54,7 @@ contract HelperConfig is Script {
             vm.stopBroadcast();
 
             return NetworkConfig({
-                pythFeed: 0x4374e5a8b9C22271E9EB878A2AA31DE97DF15DAF,
+                pythFeed: 0x0B73614636C855Bf23F342F307FB981A3e47f42B,
                 usdcContract: 0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d,
                 optimisticOracleV3: address(mockOO),
                 name: "Arbitrum-Sepolia"
@@ -64,19 +62,6 @@ contract HelperConfig is Script {
         } else {
             return activeNetworkConfig;
         }
-    }
-
-    // -------------------- Base Sepolia --------------------
-    // UMA has an official OOv3 deployment on Base Sepolia,
-    // so we can test the full UMA dispute flow here.
-
-    function getBaseSepoliaConfig() public pure returns (NetworkConfig memory) {
-        return NetworkConfig({
-            pythFeed: 0xA2aa501b19aff244D90cc15a4Cf739D2725B5729,
-            usdcContract: 0x036CbD53842c5426634e7929541eC2318f3dCF7e,
-            optimisticOracleV3: 0x0F7fC5E6482f096380db6158f978167b57388deE,
-            name: "Base-Sepolia"
-        });
     }
 
     // -------------------- Anvil (local) --------------------

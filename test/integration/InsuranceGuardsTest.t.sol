@@ -15,10 +15,11 @@ import {InsuranceVaultLib} from "../../src/libraries/InsuranceVaultLib.sol";
 contract InsuranceGuardsTest is IntegrationBase {
     using stdStorage for StdStorage;
 
+    // Slots from `forge inspect BazaarPair storage-layout`; re-derive them there if a state
+    // variable declared earlier in BazaarPair is added or resized.
     uint256 constant SLOT_TERMINATION_FLAGS = 29;
-    uint256 constant SLOT_NORMAL_TERMINATION_PRICE = 64;
-    // (the winners-payout slot was deleted pre-deployment; profit ratio lives in terminalState)
-    uint256 constant SLOT_NORMAL_COLLATERAL_RATIO = 66;
+    uint256 constant SLOT_NORMAL_TERMINATION_PRICE = 65;
+    uint256 constant SLOT_NORMAL_COLLATERAL_RATIO = 67;
 
     /// @dev Open a 1v1 BTC position (alice long / bob short at $50k) so the pair has live OI.
     function _openOI() internal {
