@@ -346,8 +346,10 @@ library BazaarTypes {
 
     // Shared node-visit ceiling for book walks: caps the matching walk (MatchHints.maxSteps is
     // clamped to it; 0 selects it as the default) and caps OrderBookLib's insert repair walk.
-    // 64 settlements bound the worst-case arrival transaction well inside a block's gas.
-    uint256 internal constant MAX_WALK_STEPS = 64;
+    // Sized so the worst-case arrival — 32 cold settlements in one transaction — stays a modest
+    // fraction of an Arbitrum block, leaving the chain's throughput to other traffic. A taker
+    // wanting more depth splits it across transactions.
+    uint256 internal constant MAX_WALK_STEPS = 32;
 
     // Keeper tip for executing a triggered StopLimit/StopLoss, charged from the stop owner's
     // bucket collateral at execution time (like a trading fee — no escrow). An owner whose
@@ -355,10 +357,16 @@ library BazaarTypes {
     // rule in the fill margin gate. No tip is charged when a stop arms immediately at creation.
     uint256 internal constant TRIGGER_TIP = BAZAAR_SCALE / 4; // $0.25
 
-    // unloadVault pays its caller max(MIN_LIQUIDATOR_REWARD, LIQUIDATION_FEE_EBP of unloaded
-    // notional) from insurance, but only when at least this much notional was unloaded —
-    // otherwise dust-sized unload calls could farm the flat floor out of the fund.
-    uint256 internal constant UNLOAD_BOUNTY_MIN_NOTIONAL = 100 * BAZAAR_SCALE;
+    // unloadVault pays its caller max(UNLOAD_BOUNTY_MIN, LIQUIDATION_FEE_EBP of unloaded
+    // notional) from insurance, gated on either unloading at least UNLOAD_BOUNTY_MIN_NOTIONAL or
+    // clearing the inventory outright. The floor covers a keeper's gas even in an expensive
+    // block, so clearing inventory is always worth doing rather than worth waiting out; the
+    // notional gate is set exactly where the bps term overtakes that floor
+    // (UNLOAD_BOUNTY_MIN / LIQUIDATION_FEE_EBP), so splitting one large unload into many
+    // minimum-sized calls earns no more than doing it in one — only the final clearing call can
+    // ever collect the floor on a small amount.
+    uint256 internal constant UNLOAD_BOUNTY_MIN = BAZAAR_SCALE / 4; // $0.25
+    uint256 internal constant UNLOAD_BOUNTY_MIN_NOTIONAL = 1_250 * BAZAAR_SCALE; // 2 bp of this == $0.25
 
     // Bounds one executeTriggeredOrders call (each exec can run a full walk).
     uint256 internal constant MAX_TRIGGER_EXECS_PER_CALL = 20;

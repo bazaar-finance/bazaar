@@ -195,4 +195,34 @@ contract TriggerExecutionTest is IntegrationBase {
         assertEq(_posSize(bob), 0, "bob closed");
         _assertBooks("after double trigger execution");
     }
+
+    /// @notice A keeper cannot use its step budget to truncate someone else's stop. Hitting the
+    ///         cap mid-cross cancels the remainder, so honouring a caller-chosen `maxSteps` here
+    ///         would let anyone fill a protective stop against one dust node and destroy the
+    ///         rest of it — for a $0.25 tip paid by the victim. The stop's owner never
+    ///         authorised this caller, so the budget is always the protocol default.
+    function test_executeTrigger_keeperMaxStepsCannotTruncateStop() public {
+        _openPosition(bob, carol, true, BTC / 2); // bob long 0.5
+        _deposit(dave, 200_000 * BAZAAR_SCALE);
+        _deposit(alice, 200_000 * BAZAAR_SCALE);
+        uint256 sl = _placeStopLoss(bob, false, BTC / 2, 48_000 * BAZAAR_SCALE, 500);
+
+        // Two resting bids: a dust node at the top of book, then real liquidity behind it.
+        _placeLimitAt(alice, true, BTC / 100, 47_900 * BAZAAR_SCALE, 47_500);
+        _placeLimitAt(dave, true, BTC / 2, 47_800 * BAZAAR_SCALE, 47_500);
+
+        vm.warp(vm.getBlockTimestamp() + 3);
+        bytes[] memory pu = _priceUpdate(47_500, uint64(vm.getBlockTimestamp()));
+        BazaarTypes.TriggerExec[] memory execs = new BazaarTypes.TriggerExec[](1);
+        execs[0].orderId = uint64(sl);
+        execs[0].hints.maxSteps = 1; // a hostile keeper asking for one node only
+
+        vm.prank(seq);
+        assertEq(pair.executeTriggeredOrders(execs, pu), 1, "stop fired");
+
+        // The walk ran to the protocol default, not the keeper's budget: the stop closed the
+        // whole position instead of stopping after the dust fill.
+        assertEq(_filledSize(sl), BTC / 2, "stop filled in full despite maxSteps = 1");
+        assertEq(_posSize(bob), 0, "position fully protected");
+    }
 }

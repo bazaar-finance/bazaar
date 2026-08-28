@@ -939,10 +939,10 @@ contract BazaarPair is Initializable, ReentrancyGuard {
                     false,
                     _buildArrivalCtx(currentPrice, isPriceStale, liqMarginReqs)
                 );
-                _postWalk(sum, currentPrice, isPriceStale);
+                _postWalk(sum, currentPrice);
             }
             // Re-evaluate vault health after liquidations (live pair only; terminal settlement
-            // never routes here).
+            // never routes here). Exactly one health call per transaction — see _postWalk.
             isVaultHealthy(currentPrice, isPriceStale);
             // Refresh IMR/MMR + sample the curve so a mass liquidation (which burns insurance via
             // collateral seizure and liquidator rewards) feeds the instantaneous insurance
@@ -1183,6 +1183,14 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             user
         );
 
+        BazaarTypes.MatchHints memory execHints = hints;
+        // A relayer supplies the hints for a signature it did not produce. Predecessor hints are
+        // harmless (verified against the real neighbours before linking), but the step budget
+        // decides how much of the order executes — hitting the cap mid-cross cancels the
+        // remainder. Only the signer may bound their own order, so a relayed call always runs
+        // the protocol default; a self-submitted caller sets its own gas budget.
+        if (signature.length > 0) execHints.maxSteps = 0;
+
         BazaarTypes.WalkSummary memory sum = MatchingEngineLib.executeArrival(
             orders,
             positionBuckets,
@@ -1190,10 +1198,11 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             pairVault,
             book,
             orderId,
-            hints,
+            execHints,
             _buildArrivalCtx(priceStruct.spotPrice, _isOracleStale, _marginReqsWithLag())
         );
-        _postWalk(sum, priceStruct.spotPrice, _isOracleStale);
+        _postWalk(sum, priceStruct.spotPrice);
+        if (sum.totalFillSize > 0) isVaultHealthy(priceStruct.spotPrice, _isOracleStale);
 
         // Send relayer fee from contract balance (already deducted from user's collateral above)
         if (effRelayerFee > 0) {
@@ -1339,9 +1348,12 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     }
 
     /// @dev Post-walk bookkeeping shared by every matching entry point, all fill-gated: fold the
-    ///      walk's VWAP into the mark price, its liquidation fills into the gap EMA, and
-    ///      re-evaluate vault health against the same price basis the fills settled at.
-    function _postWalk(BazaarTypes.WalkSummary memory sum, uint256 spot, bool stale) internal {
+    ///      walk's VWAP into the mark price and its liquidation fills into the gap EMA.
+    /// @dev Deliberately does NOT re-evaluate vault health — each entry point does that exactly
+    ///      once itself. `_terminatePair` reverts on re-entry (`AlreadyTerminated`), so a second
+    ///      health call in the same transaction would turn the very insolvency the check exists
+    ///      to catch into a revert of the whole call.
+    function _postWalk(BazaarTypes.WalkSummary memory sum, uint256 spot) internal {
         if (sum.totalFillSize == 0) return;
         // totalMatchedVolume IS Σ(price × size): exact VWAP numerator and exact total
         // notional, so no re-derivation through an average price is needed.
@@ -1352,7 +1364,6 @@ contract BazaarPair is Initializable, ReentrancyGuard {
                 liquidationGapEma, sum.sumLiqGapTimesSize, sum.totalLiqFillSize, sum.liqCount
             );
         }
-        isVaultHealthy(spot, stale);
     }
 
     /// @notice Permissionless keeper entry point: fire triggered StopLimit/StopLoss orders
@@ -1385,7 +1396,8 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             execs,
             _buildArrivalCtx(priceStruct.spotPrice, _isOracleStale, _marginReqsWithLag())
         );
-        _postWalk(sum, priceStruct.spotPrice, _isOracleStale);
+        _postWalk(sum, priceStruct.spotPrice);
+        if (sum.totalFillSize > 0) isVaultHealthy(priceStruct.spotPrice, _isOracleStale);
 
         _refundEth(ethRefund);
     }
@@ -1423,7 +1435,8 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             _buildArrivalCtx(priceStruct.spotPrice, _isOracleStale, _marginReqsWithLag())
         );
         unloadedSize = sum.totalFillSize;
-        _postWalk(sum, priceStruct.spotPrice, _isOracleStale);
+        _postWalk(sum, priceStruct.spotPrice);
+        if (unloadedSize > 0) isVaultHealthy(priceStruct.spotPrice, _isOracleStale);
 
         _refundEth(ethRefund);
     }

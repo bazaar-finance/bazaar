@@ -18,8 +18,10 @@ import {OrderBookLib} from "./OrderBookLib.sol";
 ///         Runs via DELEGATECALL from BazaarPair — has direct storage access.
 ///
 /// Key invariants:
-///  • Fills price at the MAKER's limitPrice; the resting side is always the maker (it is always
-///    the older order — arriving ids are strictly larger).
+///  • Fills price at the MAKER's limitPrice: the resting side is always the maker, because only
+///    a resting order carries a book position for the arriving side to trade against. (For a
+///    just-created order that is also the older-id side; a stop fired later by a keeper takes
+///    against makers that may be newer than itself.)
 ///  • The book never rests crossed: every disposition that could leave a still-crossing
 ///    remainder (step-cap, stale band, self-match, margin failure) cancels the incoming order.
 ///  • The walk re-reads its side's head from storage every iteration and never carries a next
@@ -167,6 +169,11 @@ library MatchingEngineLib {
 
             {
                 BazaarTypes.PositionBucket storage bucket = positionBuckets[o.creator];
+                // The tip debits the deposits ledger too, and D can legitimately sit below an
+                // individual bucket's collateral (realized-but-unwithdrawn PnL). Skip rather
+                // than underflow: reverting here would take every other owner's stop in the
+                // batch down with it, exactly when the vault is most distressed.
+                if (pairVault.totalCollateralDeposited < BazaarTypes.TRIGGER_TIP) continue;
                 if (bucket.collateral < BazaarTypes.TRIGGER_TIP) {
                     Head memory dead;
                     dead.orderId = orderId;
@@ -183,6 +190,13 @@ library MatchingEngineLib {
             }
 
             BazaarTypes.MatchHints memory hints = execs[i].hints;
+            // The keeper's insertion hints are safe to honour (every candidate is verified
+            // against the real neighbours before linking), but its step budget is NOT: hitting
+            // the cap while still crossing CANCELS the remainder, so a keeper choosing
+            // maxSteps = 1 could fill a stop against one dust node and destroy the rest of a
+            // protective order it was paid to execute. The stop's owner never authorised this
+            // caller, so the budget is always the protocol default here.
+            hints.maxSteps = 0;
             uint256 cap = _resolveCap(hints.maxSteps);
             BazaarTypes.ArrivalResult memory res = _initResult(pairVault, cap);
             _walkTaker(orders, positionBuckets, userActiveLimitOrders, book, orderId, hints, cap, ctx, res);
@@ -198,13 +212,12 @@ library MatchingEngineLib {
     /// @notice Cross the vault's pending liquidation inventory into the book, inside the
     ///         liquidation price band, until the inventory, the crossing book, or the node
     ///         budget runs out. Shared by liquidate()'s inline unload and unloadVault.
-    /// @param payReward When true (the permissionless unloadVault path), the caller earns the
-    ///        liquidator-reward formula on the unloaded notional — max(MIN_LIQUIDATOR_REWARD,
-    ///        LIQUIDATION_FEE_EBP of notional) from insurance — gated by
-    ///        UNLOAD_BOUNTY_MIN_NOTIONAL so dust-sized unloads can't farm the flat floor, paid
-    ///        all-or-nothing on insurance coverage, and soft-fail restored so a failed transfer
-    ///        never reverts the unload. liquidate()'s inline unload passes false: the liquidator
-    ///        is already paid per position.
+    /// @param payReward When true (the permissionless unloadVault path), the caller earns
+    ///        max(UNLOAD_BOUNTY_MIN, LIQUIDATION_FEE_EBP of unloaded notional) from insurance —
+    ///        gated by UNLOAD_BOUNTY_MIN_NOTIONAL so dust-sized unloads can't farm the flat
+    ///        floor, paid all-or-nothing on insurance coverage, and soft-fail restored so a
+    ///        failed transfer never reverts the unload. liquidate()'s inline unload passes
+    ///        false: the liquidator is already paid per position.
     /// @return sum Fill totals for the pair's post-walk hooks.
     function unloadBook(
         mapping(uint256 => BazaarTypes.Order) storage orders,
@@ -247,10 +260,21 @@ library MatchingEngineLib {
 
         _finalizeTx(pairVault, ctx, res);
 
-        if (payReward && res.totalMatchedVolume >= BazaarTypes.UNLOAD_BOUNTY_MIN_NOTIONAL) {
+        // Reward gate: either the call moved enough notional that the bps term stands on its own,
+        // or it cleared the inventory outright. Without the first condition a keeper could split
+        // one large unload into many minimum-sized calls and collect the flat floor on each,
+        // paying itself far above the intended rate out of insurance; without the second, the
+        // last sliver of an inventory would never be worth clearing.
+        if (
+            payReward
+                && (
+                    res.totalMatchedVolume >= BazaarTypes.UNLOAD_BOUNTY_MIN_NOTIONAL
+                        || pairVault.pendingLiqSize == 0
+                )
+        ) {
             uint256 reward =
                 Math.mulDiv(res.totalMatchedVolume, BazaarTypes.LIQUIDATION_FEE_EBP, BazaarTypes.EBP_SCALE);
-            if (reward < BazaarTypes.MIN_LIQUIDATOR_REWARD) reward = BazaarTypes.MIN_LIQUIDATOR_REWARD;
+            if (reward < BazaarTypes.UNLOAD_BOUNTY_MIN) reward = BazaarTypes.UNLOAD_BOUNTY_MIN;
             if (pairVault.insuranceFundBalance >= reward) {
                 pairVault.insuranceFundBalance -= reward;
                 if (!_sendUsdcFromContract(ctx.usdc, msg.sender, reward)) {
@@ -342,6 +366,11 @@ library MatchingEngineLib {
                 takerDead = true;
                 break;
             }
+            // A fill can terminate the TAKER's own order through the oversize fence (a close-only
+            // order that just closed its position out). The taker is held in memory across the
+            // loop, so re-read its terminal stamps from storage rather than trusting the copy —
+            // continuing here would let a canceled order keep trading.
+            if (outcome == FILLED && orders[takerId].canceledBlock != 0) return;
             // FILLED or MAKER_DEAD: loop re-reads the head, which the fill/cancel just advanced.
         }
 
@@ -448,6 +477,12 @@ library MatchingEngineLib {
                     ctx.marginReqs.laggedMmrBp
                 )
             ) {
+                // Nothing settles, so return the budget this attempt reserved — otherwise a run
+                // of margin-failing makers would exhaust it and silently waive the fees of
+                // genuine fills later in the same walk.
+                unchecked {
+                    res.feeBudget += p.fees.longTotalFee + p.fees.shortTotalFee;
+                }
                 _autoCancelOrder(orders, positionBuckets, userActiveLimitOrders, book, mkH, ctx);
                 return MAKER_DEAD;
             }
@@ -470,6 +505,9 @@ library MatchingEngineLib {
                     ctx.marginReqs.laggedMmrBp
                 )
             ) {
+                unchecked {
+                    res.feeBudget += p.fees.longTotalFee + p.fees.shortTotalFee; // nothing settled
+                }
                 // The taker's cancel happens in _walkTaker so the remainder rule stays in one place.
                 return TAKER_DEAD;
             }

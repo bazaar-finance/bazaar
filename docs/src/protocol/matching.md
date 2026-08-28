@@ -20,7 +20,7 @@ For each node, in order:
 2. **Stop if the best price no longer crosses** the taker's bound (its limit price, or
    oracle ± `maxSlippageBp` for Market/StopLoss).
 3. **Count the node** against the walk's step budget (`MatchHints.maxSteps`, clamped to
-   `MAX_WALK_STEPS` = 64; 0 selects the default). The budget counts *nodes visited*, skips
+   `MAX_WALK_STEPS` = 32; 0 selects the default). The budget counts *nodes visited*, skips
    included, so expired dust cannot push a taker past their gas budget.
 4. **Expired maker** → canceled and unlinked on contact; walk continues.
 5. **Fill** `min(remaining, remaining)` at the **maker's** limit price. Both sides pass the margin

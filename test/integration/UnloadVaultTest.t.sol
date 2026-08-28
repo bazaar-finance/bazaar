@@ -112,30 +112,52 @@ contract UnloadVaultTest is IntegrationBase {
         uint256 keeperBefore = usdc.balanceOf(seq);
         _unloadVault();
 
-        // reward = max($0.10, 2bp × $4,990 unloaded) = $0.998.
+        // reward = max($0.25, 2bp × $4,990 unloaded) = $0.998 — the bps term binds here.
         uint256 expected = (BTC / 10) * 49_900 * BazaarTypes.LIQUIDATION_FEE_EBP / BazaarTypes.EBP_SCALE / 1e12;
         assertEq(usdc.balanceOf(seq) - keeperBefore, expected, "2bp-of-notional reward paid");
     }
 
     function test_unload_reward_floorApplies() public {
         _deposit(carol, 20_000 * BAZAAR_SCALE);
-        _placeLimit(carol, true, BTC / 100, 49_900 * BAZAAR_SCALE); // $499 unloaded → 2bp ≈ $0.0998
+        // $499 unloaded → 2bp ≈ $0.0998, under the floor. Below the notional gate, but this call
+        // CLEARS the inventory, which is the case the floor exists to pay for.
+        _placeLimit(carol, true, BTC / 100, 49_900 * BAZAAR_SCALE);
         _setVaultPendingLiq(BTC / 100, 49_900, 48_000, true);
 
         uint256 keeperBefore = usdc.balanceOf(seq);
         _unloadVault();
-        assertEq(usdc.balanceOf(seq) - keeperBefore, 0.1e6, "$0.10 floor applies below the crossover");
+        assertEq(_pendingLiqSize(), 0, "inventory cleared");
+        assertEq(usdc.balanceOf(seq) - keeperBefore, 0.25e6, "$0.25 floor pays the clearing call");
     }
 
-    function test_unload_reward_withheldBelowMinNotional() public {
+    /// @notice A partial unload below the notional gate that leaves inventory behind earns
+    ///         nothing — this is what stops a keeper from slicing one large unload into many
+    ///         minimum-sized calls and collecting the flat floor on each.
+    function test_unload_reward_withheldBelowGate_whenInventoryRemains() public {
         _deposit(carol, 20_000 * BAZAAR_SCALE);
-        // ~$50 unloaded — below UNLOAD_BOUNTY_MIN_NOTIONAL ($100): unload executes, no reward.
-        _placeLimit(carol, true, BTC / 1000, 49_900 * BAZAAR_SCALE);
-        _setVaultPendingLiq(BTC / 1000, 49_900, 48_000, true);
+        // The book can only absorb ~$499 of a 1 BTC inventory: under the $1,250 gate AND the
+        // inventory survives, so no reward.
+        _placeLimit(carol, true, BTC / 100, 49_900 * BAZAAR_SCALE);
+        _setVaultPendingLiq(BTC, 49_900, 48_000, true);
 
         uint256 keeperBefore = usdc.balanceOf(seq);
-        assertEq(_unloadVault(), BTC / 1000, "dust unload still executes");
-        assertEq(usdc.balanceOf(seq), keeperBefore, "no reward for sub-$100 unloads");
+        assertEq(_unloadVault(), BTC / 100, "partial unload still executes");
+        assertGt(_pendingLiqSize(), 0, "inventory remains");
+        assertEq(usdc.balanceOf(seq), keeperBefore, "no reward below the gate while inventory remains");
+    }
+
+    /// @notice Above the notional gate the bps term stands on its own, so a large single unload
+    ///         is paid at the intended rate whether or not it clears the inventory.
+    function test_unload_reward_paidAboveGate_withInventoryRemaining() public {
+        _deposit(carol, 200_000 * BAZAAR_SCALE);
+        _placeLimit(carol, true, BTC / 2, 49_900 * BAZAAR_SCALE); // ~$24,950 absorbed
+        _setVaultPendingLiq(BTC, 49_900, 48_000, true); // 1 BTC inventory: half remains
+
+        uint256 keeperBefore = usdc.balanceOf(seq);
+        assertEq(_unloadVault(), BTC / 2, "half the inventory unloaded");
+        assertGt(_pendingLiqSize(), 0, "inventory remains");
+        uint256 expected = (BTC / 2) * 49_900 * BazaarTypes.LIQUIDATION_FEE_EBP / BazaarTypes.EBP_SCALE / 1e12;
+        assertEq(usdc.balanceOf(seq) - keeperBefore, expected, "2bp paid above the gate");
     }
 
     // ============================================================

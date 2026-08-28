@@ -340,6 +340,12 @@ library AdlLib {
                     bucket.collateral = state.effectiveCollateral + partialPnl;
                     bucket.size -= closedSize;
                     bucket.entryValue -= partialEntry;
+                    // Shrinking the position can leave a TP/SL sized for the old one. Every
+                    // other shrink path cancels the oversized order; without the same fence
+                    // here, that TP could later fill past flat and open a fresh opposite
+                    // position for its owner, and a fired StopLoss could keep taking after its
+                    // position was gone.
+                    _fenceTpSl(orders, book, bucket, params.pairId, params.currentBlock);
                     BucketLib.emitBucketUpdate(
                         user, bucket, params.currentFundingIndex, params.marginRequirements, params.pairId
                     );
@@ -443,6 +449,35 @@ library AdlLib {
         // Note: collateral is NOT reset (already updated by caller with PnL)
 
         BucketLib.emitBucketUpdate(user, bucket, params.currentFundingIndex, params.marginRequirements, params.pairId);
+    }
+
+    /// @dev Cancel any TP/SL whose remaining size exceeds the position left after a partial
+    ///      deleverage — the same invariant the matching engine's fill path maintains:
+    ///      a close-only order may never exceed the position it closes.
+    function _fenceTpSl(
+        mapping(uint256 => BazaarTypes.Order) storage orders,
+        BazaarTypes.OrderBook storage book,
+        BazaarTypes.PositionBucket storage bucket,
+        bytes32 pairId,
+        uint64 currentBlock
+    ) internal {
+        uint256 currentSize = bucket.size;
+        uint256 tpId = bucket.takeProfitOrderId;
+        if (tpId != 0) {
+            BazaarTypes.Order storage tp = orders[tpId];
+            if (tp.size - tp.filledSize > currentSize) {
+                _cancelBucketOrder(orders, book, tpId, pairId, currentBlock);
+                bucket.takeProfitOrderId = 0;
+            }
+        }
+        uint256 slId = bucket.stopLossOrderId;
+        if (slId != 0) {
+            BazaarTypes.Order storage sl = orders[slId];
+            if (sl.size - sl.filledSize > currentSize) {
+                _cancelBucketOrder(orders, book, slId, pairId, currentBlock);
+                bucket.stopLossOrderId = 0;
+            }
+        }
     }
 
     /// @dev Cancel one slot-anchored order (0 = none): stamp, unlink, emit. Already-terminal

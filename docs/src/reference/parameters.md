@@ -12,7 +12,7 @@ All constants live in `src/libraries/BazaarTypes.sol`, `src/libraries/RiskParams
 | `MAX_ACTIVE_LIMIT_ORDERS_PER_USER` | 100 (Limit + StopLimit) |
 | TP/SL per position | 1 each |
 | `MAX_CANCELS_PER_CALL` | 200 |
-| `MAX_WALK_STEPS` | 64 — ceiling on a walk's node budget (`MatchHints.maxSteps`; 0 selects the default) and on the insertion-hint repair walk |
+| `MAX_WALK_STEPS` | 32 — ceiling on a walk's node budget (`MatchHints.maxSteps`; 0 selects the default) and on the insertion-hint repair walk |
 | Insertion hints | up to 4 predecessor candidates (`MatchHints.pred..pred4`), outside the EIP-712 payload |
 | `MAX_TRIGGER_EXECS_PER_CALL` | 20 stops per `executeTriggeredOrders` call |
 | `TRIGGER_TIP` | $0.25 per fired stop, charged to the stop's owner |
@@ -53,7 +53,7 @@ All constants live in `src/libraries/BazaarTypes.sol`, `src/libraries/RiskParams
 | Parameter | Value |
 |---|---|
 | Liquidation keeper reward | max($0.10, 2 bp of notional) |
-| Vault-unload keeper reward | max($0.10, 2 bp of unloaded notional), paid from insurance only when ≥ $100 notional unloads (`UNLOAD_BOUNTY_MIN_NOTIONAL`); all-or-nothing on insurance coverage |
+| Vault-unload keeper reward | max($0.25 `UNLOAD_BOUNTY_MIN`, 2 bp of unloaded notional), paid from insurance when ≥ $1,250 notional unloads (`UNLOAD_BOUNTY_MIN_NOTIONAL`, the point where 2 bp overtakes the floor) or the unload clears the inventory; all-or-nothing on insurance coverage |
 | ADL trigger / cancel | expected loss > 80% / < 60% of fund |
 | ADL auction | 25× score → ~0, quadratic, 10 min; ≤ 25 winners per call |
 | ADL timeout | 24 h → settlement window opens at the live price |
