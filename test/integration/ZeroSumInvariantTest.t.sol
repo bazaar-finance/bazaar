@@ -7,7 +7,6 @@ import {HelperConfig} from "../../script/HelperConfig.s.sol";
 import {BazaarFactory} from "../../src/BazaarFactory.sol";
 import {BazaarPair} from "../../src/BazaarPair.sol";
 import {BazaarOracle} from "../../src/BazaarOracle.sol";
-import {BazaarSequencer} from "../../src/BazaarSequencer.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 import {MockUSDC} from "../mocks/MockUSDC.sol";
 import {MockArbSys} from "../mocks/MockArbSys.sol";
@@ -52,7 +51,6 @@ contract ZeroSumInvariantTest is Test {
     // -------------------- State --------------------
     BazaarFactory public factory;
     BazaarOracle public oracle;
-    BazaarSequencer public sequencer;
     BazaarPair public pair;
     MockUSDC public usdc;
     MockPyth public mockPyth;
@@ -71,6 +69,9 @@ contract ZeroSumInvariantTest is Test {
     ///      the same frame can return a stale value. All warps and price publishTimes go through
     ///      this storage variable instead.
     uint64 internal t;
+
+    /// @dev Probe watermark for _lastCreatedOrderId.
+    uint256 internal idProbe;
 
     function _advance(uint256 secs) internal {
         t += uint64(secs);
@@ -99,7 +100,6 @@ contract ZeroSumInvariantTest is Test {
         (, address usdcAddr,,) = helperConfig.activeNetworkConfig();
         usdc = MockUSDC(usdcAddr);
         oracle = factory.oracle();
-        sequencer = factory.sequencer();
         mockPyth = MockPyth(address(oracle.pyth()));
 
         usdc.mint(deployer, INITIAL_USER_BALANCE);
@@ -119,12 +119,6 @@ contract ZeroSumInvariantTest is Test {
         (,,,,,, bytes32 pairId,,,) = factory.deploymentProposals(assertionId);
         pair = BazaarPair(payable(factory.getPairAddress(pairId)));
 
-        // Bond high enough that the 14× rolling volume cap never binds in these scenarios.
-        vm.startPrank(seq);
-        usdc.approve(address(sequencer), 50_000 * USDC_SCALE);
-        sequencer.deposit(50_000 * USDC_SCALE);
-        vm.stopPrank();
-
         vm.roll(block.number + 20);
         t = uint64(block.timestamp);
     }
@@ -135,7 +129,7 @@ contract ZeroSumInvariantTest is Test {
 
     /// @dev Trader equity marked at (price P, funding index F): collateral + price PnL + funding PnL.
     function _equityAt(address u, uint256 p, int256 f) internal view returns (int256 equity) {
-        (bool isLong, uint256 size, uint256 entryValue, uint256 collateral, int256 entryFundingIdx,,,,,) =
+        (bool isLong, uint256 size, uint256 entryValue, uint256 collateral, int256 entryFundingIdx,,,,) =
             pair.positionBuckets(u);
         equity = int256(collateral);
         if (size == 0) return equity;
@@ -149,7 +143,8 @@ contract ZeroSumInvariantTest is Test {
 
     /// @dev The vault's pendingLiq inventory marked at the same (P, F): price PnL vs its entry
     ///      notional basis plus funding from the liquidatees' entry-weighted index — the same
-    ///      bases Pass A settles against, so realizing inventory moves value to insurance 1:1.
+    ///      bases the unload walk settles against, so realizing inventory moves value to
+    ///      insurance 1:1.
     function _vaultInventoryAt(uint256 p, int256 f) internal view returns (int256 value) {
         (,,,,,, uint256 plSize, uint256 plEntry,, int256 plFundIdx, bool plIsLong,) = pair.pairVault();
         if (plSize == 0) return 0;
@@ -207,15 +202,31 @@ contract ZeroSumInvariantTest is Test {
         pu[0] = data;
     }
 
-    function _freshPrice() internal view returns (bytes[] memory) {
-        return _priceUpdate(50_000, t);
-    }
-
     function _deposit(address user, uint256 amount) internal {
         vm.startPrank(user);
         usdc.approve(address(pair), amount * USDC_SCALE / BAZAAR_SCALE);
         pair.depositCollateral(amount, 0, 0, 0, "", "");
         vm.stopPrank();
+    }
+
+    /// @dev The newest orderId the pair has assigned. Ids are a gapless monotonic counter from 1,
+    ///      so probing forward from a watermark finds the last created order even when it is
+    ///      already terminal (a crossing placement fills in its own transaction, so the
+    ///      active-order set is no source).
+    function _lastCreatedOrderId() internal returns (uint256) {
+        uint256 w = idProbe == 0 ? 1 : idProbe;
+        while (true) {
+            (address creator,,,,,,,,,,,,,,,,,) = pair.orders(w);
+            if (creator == address(0)) break;
+            ++w;
+        }
+        idProbe = w;
+        require(w > 1, "no orders created yet");
+        return w - 1;
+    }
+
+    function _filledOf(uint256 orderId) internal view returns (uint256 filled) {
+        (,,,,,, filled,,,,,,,,,,,) = pair.orders(orderId);
     }
 
     function _placeLimit(address user, bool isLong, uint256 size, uint256 limitPrice) internal returns (uint256) {
@@ -230,60 +241,20 @@ contract ZeroSumInvariantTest is Test {
         // fresh-enough cache from a previous (possibly differently-priced) step.
         _advance(3);
         bytes[] memory pu = _pu(priceUsd);
+        BazaarTypes.OrderSpec memory spec;
+        spec.orderType = BazaarTypes.OrderType.Limit;
+        spec.isLong = isLong;
+        spec.size = size;
+        spec.limitPrice = limitPrice;
+        spec.expirationBlock = uint64(block.number + 500_000);
+        BazaarTypes.MatchHints memory hints;
         vm.prank(user);
-        pair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            limitPrice,
-            0,
-            size,
-            isLong,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
-            pu,
-            0,
-            0,
-            0,
-            ""
-        );
-        (uint256[] memory ids,,,) = pair.getUserActiveLimitOrders(user);
-        return ids[ids.length - 1];
+        pair.createOrder(spec, hints, pu, 0, 0, 0, "");
+        return _lastCreatedOrderId();
     }
 
-    function _lists(uint256[] memory longLimits, uint256[] memory shortLimits)
-        internal
-        pure
-        returns (BazaarTypes.OrderLists memory ol)
-    {
-        ol.longLimits = longLimits;
-        ol.shortLimits = shortLimits;
-        ol.longMarkets = new uint256[](0);
-        ol.shortMarkets = new uint256[](0);
-    }
-
-    function _one(uint256 a) internal pure returns (uint256[] memory out) {
-        out = new uint256[](1);
-        out[0] = a;
-    }
-
-    function _none() internal pure returns (uint256[] memory a) {
-        a = new uint256[](0);
-    }
-
-    function _matchAtPrice(BazaarTypes.OrderLists memory lists, uint256 priceUsd)
-        internal
-        returns (uint256 successCount)
-    {
-        _advance(3);
-        bytes[] memory pu = _pu(priceUsd);
-        vm.roll(block.number + 2);
-        uint64 obs = uint64(block.number - 1);
-        vm.prank(seq);
-        successCount = pair.matchBatch(lists, 10, pu, obs);
-    }
-
-    /// @dev Cross a (long, short) pair of fresh limit orders in one batch at the given oracle price.
+    /// @dev Cross a (long, short) pair of limit orders at the given oracle price. The long is
+    ///      placed first (older id → resting maker), so the arriving short fills at longPx.
     function _crossAt(
         address longUser,
         uint256 longPx,
@@ -292,19 +263,29 @@ contract ZeroSumInvariantTest is Test {
         uint256 size,
         uint256 priceUsd
     ) internal {
-        uint256 longId = _placeLimitAt(longUser, true, size, longPx, priceUsd);
+        _placeLimitAt(longUser, true, size, longPx, priceUsd);
+        vm.roll(vm.getBlockNumber() + 2);
         uint256 shortId = _placeLimitAt(shortUser, false, size, shortPx, priceUsd);
-        vm.roll(block.number + 2); // orders must exist strictly before the observation block
-        assertEq(_matchAtPrice(_lists(_one(longId), _one(shortId)), priceUsd), 1, "cross must fill");
+        assertEq(_filledOf(shortId), size, "cross must fill");
     }
 
     function _cross(address longUser, uint256 longPx, address shortUser, uint256 shortPx, uint256 size) internal {
         _crossAt(longUser, longPx, shortUser, shortPx, size, 50_000);
     }
 
+    /// @dev Unload vault liquidation inventory into the resting book at the given oracle price.
+    ///      The caller (seq) earns the insurance-funded unload reward when >= $100 unloads —
+    ///      cash and the insurance claim fall together, so the zero-sum identity is unmoved.
+    function _unloadAt(uint256 priceUsd) internal returns (uint256 unloadedSize) {
+        _advance(3);
+        bytes[] memory pu = _pu(priceUsd);
+        vm.prank(seq);
+        unloadedSize = pair.unloadVault(0, pu);
+    }
+
     /// @dev Withdraw a flat user's full collateral (rounded down to USDC granularity).
     function _withdrawAll(address u) internal {
-        (, uint256 size,, uint256 coll,,,,,,) = pair.positionBuckets(u);
+        (, uint256 size,, uint256 coll,,,,,) = pair.positionBuckets(u);
         assertEq(size, 0, "withdrawAll expects a flat user");
         uint256 amount = coll - (coll % 1e12);
         if (amount == 0) return;
@@ -347,11 +328,11 @@ contract ZeroSumInvariantTest is Test {
         _assertZeroSum(50_000, "after withdrawals");
     }
 
-    /// @notice Same lifecycle with REAL funding accrued through the live index: a batch executes
-    ///         above oracle (mark > index → longs pay), time passes, the next batch accrues the
+    /// @notice Same lifecycle with REAL funding accrued through the live index: fills execute
+    ///         above oracle (mark > index → longs pay), time passes, the next fill accrues the
     ///         index, then positions close. Funding must transfer between the sides — settled
     ///         into collateral on close — without minting or dropping a cent.
-    ///         Dropping the funding leg on a match-driven close breaks the sum at "after closes".
+    ///         Dropping the funding leg on a fill-driven close breaks the sum at "after closes".
     function test_zeroSum_withFundingAccrual() public {
         _deposit(alice, 15_000 * BAZAAR_SCALE);
         _deposit(bob, 15_000 * BAZAAR_SCALE);
@@ -364,9 +345,9 @@ contract ZeroSumInvariantTest is Test {
 
         // Push the mark above the index: carol/dave cross 0.1 BTC at a ~1% premium.
         _cross(carol, 50_600 * BAZAAR_SCALE, dave, 50_450 * BAZAAR_SCALE, 1 * BAZAAR_SCALE / 10);
-        _assertZeroSum(50_000, "after premium batch");
+        _assertZeroSum(50_000, "after premium fill");
 
-        // Let funding accrue over 30 minutes, then trigger an index update with another batch.
+        // Let funding accrue over 30 minutes, then trigger an index update with another fill.
         _advance(30 minutes);
         _cross(carol, 50_500 * BAZAAR_SCALE, dave, 49_500 * BAZAAR_SCALE, 5 * BAZAAR_SCALE / 100);
         int256 f = pair.currentFundingIndex();
@@ -389,9 +370,9 @@ contract ZeroSumInvariantTest is Test {
     }
 
     /// @notice Liquidation path: a price drop makes alice insolvent; she is liquidated (collateral
-    ///         seized to insurance, inventory to the vault), the vault's inventory is closed in
-    ///         Pass A against a fresh buyer, and the survivors unwind. Every step must conserve —
-    ///         including the liquidator reward (insurance-debited, paid out as cash).
+    ///         seized to insurance, inventory to the vault), the vault's inventory unloads against
+    ///         a fresh buyer's resting bid, and the survivors unwind. Every step must conserve —
+    ///         including the liquidator and unload rewards (insurance-debited, paid out as cash).
     function test_zeroSum_liquidationAndVaultClose() public {
         _deposit(alice, 12_000 * BAZAAR_SCALE);
         _deposit(bob, 15_000 * BAZAAR_SCALE);
@@ -410,10 +391,10 @@ contract ZeroSumInvariantTest is Test {
         assertEq(liquidated, 1, "alice liquidated");
         _assertZeroSum(41_000, "after liquidation");
 
-        // Pass A: the vault sells its inherited long to carol at ~$41k.
+        // The vault sells its inherited long into carol's resting bid at ~$41k.
         _deposit(carol, 12_000 * BAZAAR_SCALE);
-        uint256 carolBid = _placeLimit(carol, true, 1 * BAZAAR_SCALE, 41_400 * BAZAAR_SCALE);
-        assertEq(_matchAtPrice(_lists(_one(carolBid), _none()), 41_000), 1, "vault inventory closed");
+        _placeLimit(carol, true, 1 * BAZAAR_SCALE, 41_400 * BAZAAR_SCALE);
+        assertEq(_unloadAt(41_000), 1 * BAZAAR_SCALE, "vault inventory closed");
         (,,,,,, uint256 plSize,,,,,) = pair.pairVault();
         assertEq(plSize, 0, "vault fully unwound");
         _assertZeroSum(41_000, "after vault close");
@@ -427,19 +408,19 @@ contract ZeroSumInvariantTest is Test {
         _assertZeroSum(41_000, "after bob withdrew");
 
         // Carol — last to withdraw — must get her fully-backed collateral out. Without the I → D
-        // transfer booked in _finalize, the vault's Pass-A loss (backing for bob's realized profit)
-        // would be debited from insurance alone, bob's profit-inclusive withdrawal would drain a
-        // deposits ledger that had never been credited, and carol's withdrawal would underflow it.
-        // With the transfer booked, the ledger covers every withdrawer in any order.
+        // transfer booked at unload finalize, the vault's loss (backing for bob's realized
+        // profit) would be debited from insurance alone, bob's profit-inclusive withdrawal would
+        // drain a deposits ledger that had never been credited, and carol's withdrawal would
+        // underflow it. With the transfer booked, the ledger covers every withdrawer in any order.
         _withdrawAll(carol);
         _assertZeroSum(41_000, "after withdrawals");
     }
 
     /// @notice Whipsaw producing a VAULT PROFIT: bob's short is liquidated on a spike to $59k,
-    ///         the market falls back, and Pass A closes the inherited short below its basis —
-    ///         vaultPnl > 0, exercising the D → I transfer. Pre-transfer, each vault profit
-    ///         permanently inflated expectedBalance (I + D) above actual USDC, accumulating
-    ///         toward a false reason-3 termination.
+    ///         the market falls back, and the unload closes the inherited short below its basis —
+    ///         vaultPnl > 0, exercising the D → I transfer. Without that transfer, each vault
+    ///         profit permanently inflates expectedBalance (I + D) above actual USDC,
+    ///         accumulating toward a false reason-3 termination.
     function test_zeroSum_vaultProfitOnWhipsaw() public {
         _deposit(alice, 15_000 * BAZAAR_SCALE);
         _deposit(bob, 12_000 * BAZAAR_SCALE);
@@ -457,11 +438,11 @@ contract ZeroSumInvariantTest is Test {
         assertEq(pair.liquidate(users, liqPu), 1, "bob liquidated on the spike");
         _assertZeroSum(59_000, "after liquidation");
 
-        // Market falls back to $48k. Pass A buys the inventory back from carol's short limit
+        // Market falls back to $48k. The unload buys the inventory back from carol's resting ask
         // BELOW the vault's ~$50k basis → vault profit → D → I transfer.
         _deposit(carol, 12_000 * BAZAAR_SCALE);
-        uint256 carolAsk = _placeLimitAt(carol, false, 1 * BAZAAR_SCALE, 48_200 * BAZAAR_SCALE, 48_000);
-        assertEq(_matchAtPrice(_lists(_none(), _one(carolAsk)), 48_000), 1, "vault inventory closed at a profit");
+        _placeLimitAt(carol, false, 1 * BAZAAR_SCALE, 48_200 * BAZAAR_SCALE, 48_000);
+        assertEq(_unloadAt(48_000), 1 * BAZAAR_SCALE, "vault inventory closed at a profit");
         (,,,,,, uint256 plSize,,,,,) = pair.pairVault();
         assertEq(plSize, 0, "vault fully unwound");
         _assertZeroSum(48_000, "after profitable vault close");
@@ -493,7 +474,7 @@ contract ZeroSumInvariantTest is Test {
     ///         loser's book collateral; the loser then goes insolvent. The seizure caps at the
     ///         ledger (an uncapped debit would panic and leave the loser unliquidatable), the
     ///         uncapped remainder becomes a cash surplus over claims rather than a deficit, the
-    ///         pair stays live, the estate-close batch runs with a zero fee budget (all fees
+    ///         pair stays live, the estate-close walk runs with a zero fee budget (all fees
     ///         waived — nothing charged, nothing paid), and the surviving winner withdraws in
     ///         full once the estate settles.
     function test_seizureCap_solventPairSurvivesThinLedger() public {
@@ -520,7 +501,7 @@ contract ZeroSumInvariantTest is Test {
 
         // Precondition of the whole scenario: bob's book collateral now exceeds the entire
         // deposits ledger, while bob's EQUITY is only just below zero (solvent boundary).
-        (,,, uint256 bobBook,,,,,,) = pair.positionBuckets(bob);
+        (,,, uint256 bobBook,,,,,) = pair.positionBuckets(bob);
         (,,,, uint256 dBefore, uint256 iBefore,,,,,,) = pair.pairVault();
         assertGt(bobBook, dBefore, "bob's book must exceed the deposits ledger");
 
@@ -549,28 +530,15 @@ contract ZeroSumInvariantTest is Test {
         int256 gapAfter = int256(usdc.balanceOf(address(pair)) * 1e12) - _claimsAt(68_500);
         assertApproxEqAbs(gapAfter - gapBefore, int256(bobBook - dBefore), CLAIMS_TOL, "surplus == dropped seizure");
 
-        // Estate close in Pass A with the deposits ledger at ZERO: the batch's fee budget is
-        // zero, so carol's closing fill is charged NO fee and no fee is paid out. Insurance
-        // funds the estate's entry-basis loss into the ledger, which re-covers carol's claim.
-        (,, uint256 carolEntry, uint256 carolCollBefore, int256 carolFundIdx,,,,,) = pair.positionBuckets(carol);
+        // Estate close through the unload walk with the deposits ledger at ZERO: the walk's fee
+        // budget is zero, so carol's closing fill is charged NO fee and no fee is paid out.
+        // Insurance funds the estate's entry-basis loss into the ledger, which re-covers carol's
+        // claim, and separately pays the caller's unload reward as cash.
+        (,, uint256 carolEntry, uint256 carolCollBefore, int256 carolFundIdx,,,,) = pair.positionBuckets(carol);
         (,,,,, uint256 iPreClose,,,, int256 plFundIdx,,) = pair.pairVault();
 
-        uint256 carolAsk = _placeLimitAt(carol, false, 1 * BAZAAR_SCALE, 68_500 * BAZAAR_SCALE, 68_500);
-        // Inline match with cheatcode block reads: NUMBER-opcode reads can be cached across
-        // vm.roll within this (large) test frame, which would roll the chain BACKWARD and put
-        // the observation block before the ask's creation block.
-        _advance(3);
-        {
-            bytes[] memory closePu = _pu(68_500);
-            vm.roll(vm.getBlockNumber() + 2);
-            uint64 closeObs = uint64(vm.getBlockNumber() - 1);
-            vm.prank(seq);
-            assertEq(
-                pair.matchBatch(_lists(_none(), _one(carolAsk)), 10, closePu, closeObs),
-                1,
-                "estate closed against carol"
-            );
-        }
+        _placeLimitAt(carol, false, 1 * BAZAAR_SCALE, 68_500 * BAZAAR_SCALE, 68_500);
+        assertEq(_unloadAt(68_500), 1 * BAZAAR_SCALE, "estate closed against carol");
 
         {
             (,,,,,, uint256 plSize,,,,,) = pair.pairVault();
@@ -578,8 +546,8 @@ contract ZeroSumInvariantTest is Test {
         }
         {
             // Carol's collateral moved by exactly her realized PnL + funding — zero fee. Any
-            // charged fee (flat leg alone is $0.10 per side) would break this equality.
-            (,,, uint256 carolCollAfter,,,,,,) = pair.positionBuckets(carol);
+            // charged fee would break this equality.
+            (,,, uint256 carolCollAfter,,,,,) = pair.positionBuckets(carol);
             int256 realized = int256(68_500 * BAZAAR_SCALE) - int256(carolEntry);
             int256 rawFunding =
                 (pair.currentFundingIndex() - carolFundIdx) * int256(1 * BAZAAR_SCALE) / int256(BAZAAR_SCALE);
@@ -588,13 +556,17 @@ contract ZeroSumInvariantTest is Test {
         }
         {
             // Insurance paid the estate's full entry-basis loss (price leg + funding leg) into
-            // the deposits ledger and received nothing else — no insurance fee was collected in
-            // the waived batch, so any fee credit would break these equalities.
+            // the deposits ledger, paid the caller's unload reward (2 bp of the $68.5k unloaded
+            // notional — above the $0.10 floor), and received nothing else — no insurance fee
+            // was collected in the waived walk, so any fee credit would break these equalities.
             uint256 expectedLoss =
                 uint256(int256(17_500 * BAZAAR_SCALE) - (pair.currentFundingIndex() - plFundIdx));
+            uint256 unloadReward = 68_500 * BAZAAR_SCALE * BazaarTypes.LIQUIDATION_FEE_EBP / BazaarTypes.EBP_SCALE;
             (,,,, uint256 dPost, uint256 iPost,,,,,, uint256 deficit) = pair.pairVault();
             assertEq(deficit, 0, "estate loss fully funded by insurance");
-            assertApproxEqAbs(iPreClose - iPost, expectedLoss, 1e12, "insurance funded the estate loss");
+            assertApproxEqAbs(
+                iPreClose - iPost, expectedLoss + unloadReward, 1e12, "insurance funded the loss + unload reward"
+            );
             assertApproxEqAbs(dPost, expectedLoss, 1e12, "ledger re-covered for the survivor");
             assertGe(dPost, carolCollAfterOf(), "ledger covers carol's full claim");
         }
@@ -603,7 +575,7 @@ contract ZeroSumInvariantTest is Test {
         _withdrawAll(bob); // seized to zero — no-op
         _withdrawAll(carol);
         {
-            (,,, uint256 carolCollFinal,,,,,,) = pair.positionBuckets(carol);
+            (,,, uint256 carolCollFinal,,,,,) = pair.positionBuckets(carol);
             assertLt(carolCollFinal, 1e12, "carol withdrew her entire claim");
             (,,,,,,,,,,, uint256 deficit) = pair.pairVault();
             assertEq(deficit, 0, "pair ends live and solvent");
@@ -611,7 +583,7 @@ contract ZeroSumInvariantTest is Test {
     }
 
     function carolCollAfterOf() internal view returns (uint256 coll) {
-        (,,, coll,,,,,,) = pair.positionBuckets(carol);
+        (,,, coll,,,,,) = pair.positionBuckets(carol);
     }
 
     /// @notice Mixed-direction liquidations: a long is liquidated on the way down, then a short
@@ -626,8 +598,8 @@ contract ZeroSumInvariantTest is Test {
         _cross(alice, 51_000 * BAZAAR_SCALE, bob, 49_000 * BAZAAR_SCALE, 1 * BAZAAR_SCALE);
 
         // Phase 2: the market drops; carol shorts 1 vs dave long 1 near the bottom (~$41k) on
-        // thin margin. Opened BEFORE alice's liquidation — once the vault holds long inventory,
-        // Pass A would consume dave's long limit before Pass C could cross it with carol.
+        // thin margin. Both fills complete at placement, so no resting order is left for the
+        // liquidation's inline unload to consume.
         _deposit(carol, 8_500 * BAZAAR_SCALE);
         _deposit(dave, 15_000 * BAZAAR_SCALE);
         _crossAt(dave, 41_500 * BAZAAR_SCALE, carol, 40_500 * BAZAAR_SCALE, 1 * BAZAAR_SCALE, 41_000);
@@ -646,7 +618,7 @@ contract ZeroSumInvariantTest is Test {
         // while the vault still holds alice's long fires the opposing-netting arm.
         uint256 liqPriceUsd;
         {
-            (,, uint256 carolEntry, uint256 carolColl,,,,,,) = pair.positionBuckets(carol);
+            (,, uint256 carolEntry, uint256 carolColl,,,,,) = pair.positionBuckets(carol);
             liqPriceUsd = (carolEntry + carolColl) / BAZAAR_SCALE - 300;
         }
         _advance(3);

@@ -21,6 +21,7 @@ import {MockUSDC} from "../mocks/MockUSDC.sol";
 ///         so the per-position reward math can be unit-tested without a full BazaarPair.
 contract LiqRewardHarness {
     mapping(uint256 => BazaarTypes.Order) public orders;
+    BazaarTypes.OrderBook internal book;
     mapping(address => BazaarTypes.PositionBucket) public positionBuckets;
     BazaarTypes.Vault public vault;
 
@@ -55,6 +56,7 @@ contract LiqRewardHarness {
         return LiquidationLib.processLiquidations(
             users,
             orders,
+            book,
             positionBuckets,
             vault,
             BazaarTypes.LiquidateParams({
@@ -278,6 +280,7 @@ contract SeizureLedgerClampTest is Test {
 ///         (hardcoded to 0) cannot do.
 contract NettingHarness {
     mapping(uint256 => BazaarTypes.Order) public orders;
+    BazaarTypes.OrderBook internal book;
     mapping(address => BazaarTypes.PositionBucket) public positionBuckets;
     BazaarTypes.Vault public vault;
 
@@ -330,6 +333,7 @@ contract NettingHarness {
         return LiquidationLib.processLiquidations(
             users,
             orders,
+            book,
             positionBuckets,
             vault,
             BazaarTypes.LiquidateParams({
@@ -480,6 +484,7 @@ contract VaultFundingNettingTest is Test {
 ///         standing up a full BazaarPair.
 contract AdlHarness {
     mapping(uint256 => BazaarTypes.Order) public orders;
+    BazaarTypes.OrderBook internal book;
     mapping(address => BazaarTypes.PositionBucket) public positionBuckets;
     BazaarTypes.Vault public vault;
 
@@ -542,7 +547,7 @@ contract AdlHarness {
         returns (BazaarTypes.AdlResult memory)
     {
         return AdlLib.executeAdlCore(
-            orders, positionBuckets, vault, winners, params, adlEpoch, adlDepositEpoch, adlWindowDeposits
+            orders, book, positionBuckets, vault, winners, params, adlEpoch, adlDepositEpoch, adlWindowDeposits
         );
     }
 }

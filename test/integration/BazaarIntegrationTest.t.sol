@@ -6,13 +6,13 @@ import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 
 /// @title BazaarIntegrationTest
 /// @notice Core cross-subsystem scenarios: matching, liquidation, the vault, and the insurance fund
-///         on a full factory/oracle/sequencer/pair deployment. Harness lives in IntegrationBase.
+///         on a full factory/oracle/pair deployment. Harness lives in IntegrationBase.
 contract BazaarIntegrationTest is IntegrationBase {
     /// @notice Liquidation cascade: an underwater position is liquidated → collateral is seized into
     ///         the insurance fund → the vault inherits the position as pending-liq exposure.
     function test_e2e_LiquidationSeizesToInsuranceAndVaultInherits() public {
         _setupInsolventAlice();
-        (, uint256 aliceSize,,,,,,,,) = pair.positionBuckets(alice);
+        (, uint256 aliceSize,,,,,,,) = pair.positionBuckets(alice);
         assertEq(aliceSize, BAZAAR_SCALE / 10, "alice holds a 0.1 BTC long");
 
         (,,,,, uint256 insBefore,,,,,,) = pair.pairVault();
@@ -20,7 +20,7 @@ contract BazaarIntegrationTest is IntegrationBase {
         vm.prank(bob);
         assertEq(pair.liquidate(_arr1(alice), _freshPrice()), 1, "alice liquidated");
 
-        (, uint256 aliceSizeAfter,, uint256 aliceColl,,,,,,) = pair.positionBuckets(alice);
+        (, uint256 aliceSizeAfter,, uint256 aliceColl,,,,,) = pair.positionBuckets(alice);
         assertEq(aliceSizeAfter, 0, "position closed");
         assertEq(aliceColl, 0, "collateral fully seized");
 
@@ -35,10 +35,10 @@ contract BazaarIntegrationTest is IntegrationBase {
     function test_e2e_MatchedPositions_ZeroSumPnl() public {
         _deposit(alice, 20_000 * BAZAAR_SCALE);
         _deposit(bob, 20_000 * BAZAAR_SCALE);
-        uint256 longId = _placeLimit(alice, true, 1 * BAZAAR_SCALE, 50_000 * BAZAAR_SCALE);
-        uint256 shortId = _placeLimit(bob, false, 1 * BAZAAR_SCALE, 49_000 * BAZAAR_SCALE);
+        _placeLimit(alice, true, 1 * BAZAAR_SCALE, 50_000 * BAZAAR_SCALE);
         _roll(2);
-        assertEq(_match(_lists(_one(longId), _one(shortId), _empty(), _empty()), 10), 1, "opened at $50k");
+        _placeLimit(bob, false, 1 * BAZAAR_SCALE, 49_000 * BAZAAR_SCALE);
+        assertEq(_posSize(alice), 1 * BAZAAR_SCALE, "opened at $50k");
 
         BazaarTypes.BucketState memory aState = lens.checkBucketSolvency(address(pair), alice, 55_000 * BAZAAR_SCALE);
         BazaarTypes.BucketState memory bState = lens.checkBucketSolvency(address(pair), bob, 55_000 * BAZAAR_SCALE);

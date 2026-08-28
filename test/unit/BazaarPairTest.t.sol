@@ -7,7 +7,6 @@ import {HelperConfig} from "../../script/HelperConfig.s.sol";
 import {BazaarFactory} from "../../src/BazaarFactory.sol";
 import {BazaarPair} from "../../src/BazaarPair.sol";
 import {BazaarOracle} from "../../src/BazaarOracle.sol";
-import {BazaarSequencer} from "../../src/BazaarSequencer.sol";
 import {BazaarPairTerminator} from "../../src/BazaarPairTerminator.sol";
 import {CollateralLib} from "../../src/libraries/CollateralLib.sol";
 import {MetaTxLib} from "../../src/libraries/MetaTxLib.sol";
@@ -42,7 +41,6 @@ contract BazaarPairTest is Test {
     // Core contracts
     BazaarFactory public factory;
     BazaarOracle public oracle;
-    BazaarSequencer public sequencer;
     BazaarPairTerminator public pairTerminator;
 
     // Deployed pairs
@@ -85,7 +83,6 @@ contract BazaarPairTest is Test {
 
         // Store sub-contract references
         oracle = factory.oracle();
-        sequencer = factory.sequencer();
         pairTerminator = factory.pairTerminator();
         mockPyth = MockPyth(address(oracle.pyth()));
 
@@ -131,7 +128,6 @@ contract BazaarPairTest is Test {
         assertEq(address(btcPair.usdc()), address(usdc));
         assertEq(address(btcPair.oracle()), address(oracle));
         assertEq(btcPair.auxState().bugBountyAddress, bugBountyAddress);
-        assertEq(address(btcPair.sequencerContract()), address(sequencer));
     }
 
     function testSetup_AaplPairInitializedCorrectly() public view {
@@ -209,7 +205,7 @@ contract BazaarPairTest is Test {
         vm.stopPrank();
 
         // Verify collateral recorded in position bucket
-        (,,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, depositAmount);
 
         // Verify vault totalCollateralDeposited updated
@@ -229,7 +225,7 @@ contract BazaarPairTest is Test {
         uint256 relayerFeeUsdc = relayerFeeAmount * USDC_SCALE / BAZAAR_SCALE; // convert fee to USDC decimals
         uint256 totalPullUsdc = 100 * USDC_SCALE + relayerFeeUsdc; // deposit + relayer fee in USDC
         uint256 nonce = 0;
-        uint256 deadline = block.timestamp + 30 seconds;
+        uint256 deadline = block.timestamp + 10 seconds;
 
         // User approves pair to pull deposit + relayer fee
         vm.prank(user1);
@@ -249,7 +245,7 @@ contract BazaarPairTest is Test {
         btcPair.depositCollateral(depositAmount, nonce, deadline, relayerFeeAmount, sig, "");
 
         // Verify collateral recorded for user (not relayer)
-        (,,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, depositAmount);
 
         // Verify relayer received fee
@@ -264,7 +260,7 @@ contract BazaarPairTest is Test {
         uint256 relayerFeeAmount = 5e16; // 0.05 USDC in BAZAAR_SCALE
         uint256 totalPullUsdc = 100 * USDC_SCALE + (relayerFeeAmount * USDC_SCALE / BAZAAR_SCALE);
         uint256 nonce = 0;
-        uint256 deadline = block.timestamp + 30 seconds;
+        uint256 deadline = block.timestamp + 10 seconds;
 
         // Sign the deposit meta-tx (off-chain, free)
         bytes memory depositSig =
@@ -291,7 +287,7 @@ contract BazaarPairTest is Test {
         btcPair.depositCollateral(depositAmount, nonce, deadline, relayerFeeAmount, depositSig, permitData);
 
         // Verify collateral recorded for user
-        (,,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, depositAmount);
 
         // Verify relayer received fee
@@ -317,7 +313,7 @@ contract BazaarPairTest is Test {
         vm.stopPrank();
 
         // Verify collateral is cumulative
-        (,,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, firstDeposit + secondDeposit);
     }
 
@@ -361,7 +357,7 @@ contract BazaarPairTest is Test {
     function testDepositCollateral_RelayerRevertsExpiredDeadline() public {
         uint256 depositAmount = 100 * BAZAAR_SCALE;
         uint256 nonce = 0;
-        uint256 deadline = block.timestamp + 30 seconds;
+        uint256 deadline = block.timestamp + 10 seconds;
 
         bytes memory sig = _signDepositCollateral(btcPair, USER1_PK, depositAmount, nonce, deadline, 0);
 
@@ -376,7 +372,7 @@ contract BazaarPairTest is Test {
     function testDepositCollateral_RelayerRevertsWrongNonce() public {
         uint256 depositAmount = 100 * BAZAAR_SCALE;
         uint256 wrongNonce = 5;
-        uint256 deadline = block.timestamp + 30 seconds;
+        uint256 deadline = block.timestamp + 10 seconds;
 
         bytes memory sig = _signDepositCollateral(btcPair, USER1_PK, depositAmount, wrongNonce, deadline, 0);
 
@@ -389,7 +385,7 @@ contract BazaarPairTest is Test {
         uint256 depositAmount = 100 * BAZAAR_SCALE;
         uint256 excessiveFee = 2 * BAZAAR_SCALE; // 2 USDC — exceeds MAX_RELAYER_FEE (1 USDC)
         uint256 nonce = 0;
-        uint256 deadline = block.timestamp + 30 seconds;
+        uint256 deadline = block.timestamp + 10 seconds;
 
         bytes memory sig = _signDepositCollateral(btcPair, USER1_PK, depositAmount, nonce, deadline, excessiveFee);
 
@@ -406,7 +402,7 @@ contract BazaarPairTest is Test {
         uint256 depositAmount = 1 * BAZAAR_SCALE;
         uint256 relayerFeeAmount = 1 * BAZAAR_SCALE; // fee == amount
         uint256 nonce = 0;
-        uint256 deadline = block.timestamp + 30 seconds;
+        uint256 deadline = block.timestamp + 10 seconds;
 
         bytes memory sig = _signDepositCollateral(btcPair, USER1_PK, depositAmount, nonce, deadline, relayerFeeAmount);
 
@@ -418,7 +414,7 @@ contract BazaarPairTest is Test {
     function testDepositCollateral_RelayerRevertsInvalidSignature() public {
         uint256 depositAmount = 100 * BAZAAR_SCALE;
         uint256 nonce = 0;
-        uint256 deadline = block.timestamp + 30 seconds;
+        uint256 deadline = block.timestamp + 10 seconds;
 
         // Sign with wrong private key
         uint256 WRONG_PK = 0xDEAD;
@@ -433,13 +429,13 @@ contract BazaarPairTest is Test {
     function testDepositCollateral_RevertsDeadlineTooFar() public {
         uint256 depositAmount = 100 * BAZAAR_SCALE;
         uint256 nonce = 0;
-        uint256 deadline = block.timestamp + 60 seconds; // exceeds 30s max window
+        uint256 deadline = block.timestamp + 60 seconds; // exceeds the 10s max window
 
         bytes memory sig = _signDepositCollateral(btcPair, USER1_PK, depositAmount, nonce, deadline, 0);
 
         vm.prank(relayer);
         vm.expectRevert(
-            abi.encodeWithSelector(MetaTxLib.MetaTx__DeadlineTooFar.selector, deadline, block.timestamp + 30 seconds)
+            abi.encodeWithSelector(MetaTxLib.MetaTx__DeadlineTooFar.selector, deadline, block.timestamp + 10 seconds)
         );
         btcPair.depositCollateral(depositAmount, nonce, deadline, 0, sig, "");
     }
@@ -461,10 +457,10 @@ contract BazaarPairTest is Test {
         vm.stopPrank();
 
         // Verify both pairs have correct collateral
-        (,,, uint256 btcCollateral,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 btcCollateral,,,,,) = btcPair.positionBuckets(user1);
         assertEq(btcCollateral, depositAmount);
 
-        (,,, uint256 aaplCollateral,,,,,,) = aaplPair.positionBuckets(user2);
+        (,,, uint256 aaplCollateral,,,,,) = aaplPair.positionBuckets(user2);
         assertEq(aaplCollateral, depositAmount);
     }
 
@@ -530,7 +526,7 @@ contract BazaarPairTest is Test {
         btcPair.withdrawCollateral(withdrawAmount, emptyPriceUpdate, 0, 0, 0, "");
 
         // Verify remaining collateral
-        (,,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, depositAmount - withdrawAmount);
 
         // Verify USDC returned to user
@@ -550,7 +546,7 @@ contract BazaarPairTest is Test {
         btcPair.withdrawCollateral(depositAmount, emptyPriceUpdate, 0, 0, 0, "");
 
         // Verify collateral is zero
-        (,,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, 0);
 
         // Verify vault totalCollateralDeposited is zero
@@ -576,7 +572,7 @@ contract BazaarPairTest is Test {
         uint256 withdrawAmount = 50 * BAZAAR_SCALE;
         uint256 relayerFeeAmount = 5e16; // 0.05 USDC in BAZAAR_SCALE
         uint256 nonce = 0;
-        uint256 deadline = block.timestamp + 30 seconds;
+        uint256 deadline = block.timestamp + 10 seconds;
 
         _depositCollateral(btcPair, user1, depositAmount);
 
@@ -587,7 +583,7 @@ contract BazaarPairTest is Test {
         btcPair.withdrawCollateral(withdrawAmount, new bytes[](0), nonce, deadline, relayerFeeAmount, sig);
 
         // Verify remaining collateral
-        (,,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, depositAmount - withdrawAmount);
 
         // Verify user received withdrawal minus relayer fee
@@ -647,7 +643,7 @@ contract BazaarPairTest is Test {
         btcPair.withdrawCollateral(20 * BAZAAR_SCALE, emptyPriceUpdate, 0, 0, 0, "");
         vm.stopPrank();
 
-        (,,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, 50 * BAZAAR_SCALE);
     }
 
@@ -656,7 +652,7 @@ contract BazaarPairTest is Test {
         _depositCollateral(btcPair, user1, depositAmount);
 
         uint256 nonce = 0;
-        uint256 deadline = block.timestamp + 30 seconds;
+        uint256 deadline = block.timestamp + 10 seconds;
         uint256 withdrawAmount = 50 * BAZAAR_SCALE;
 
         bytes memory sig = _signWithdrawCollateral(btcPair, USER1_PK, withdrawAmount, nonce, deadline, 0);
@@ -673,7 +669,7 @@ contract BazaarPairTest is Test {
         _depositCollateral(btcPair, user1, depositAmount);
 
         uint256 wrongNonce = 3;
-        uint256 deadline = block.timestamp + 30 seconds;
+        uint256 deadline = block.timestamp + 10 seconds;
         uint256 withdrawAmount = 50 * BAZAAR_SCALE;
 
         bytes memory sig = _signWithdrawCollateral(btcPair, USER1_PK, withdrawAmount, wrongNonce, deadline, 0);
@@ -690,7 +686,7 @@ contract BazaarPairTest is Test {
         uint256 withdrawAmount = 10 * BAZAAR_SCALE;
         uint256 relayerFeeAmount = 10 * BAZAAR_SCALE; // fee == withdraw amount
         uint256 nonce = 0;
-        uint256 deadline = block.timestamp + 30 seconds;
+        uint256 deadline = block.timestamp + 10 seconds;
 
         bytes memory sig = _signWithdrawCollateral(btcPair, USER1_PK, withdrawAmount, nonce, deadline, relayerFeeAmount);
 
@@ -731,10 +727,10 @@ contract BazaarPairTest is Test {
         vm.prank(user2);
         aaplPair.withdrawCollateral(withdrawAmount, emptyPriceUpdate, 0, 0, 0, "");
 
-        (,,, uint256 btcCollateral,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 btcCollateral,,,,,) = btcPair.positionBuckets(user1);
         assertEq(btcCollateral, depositAmount - withdrawAmount);
 
-        (,,, uint256 aaplCollateral,,,,,,) = aaplPair.positionBuckets(user2);
+        (,,, uint256 aaplCollateral,,,,,) = aaplPair.positionBuckets(user2);
         assertEq(aaplCollateral, depositAmount - withdrawAmount);
     }
 
@@ -801,10 +797,10 @@ contract BazaarPairTest is Test {
 
     // ==================== withdrawCollateral With Open Position Tests ====================
 
-    /// @dev isAdlPending is PACKED (slot 26, byte offset 20 — see `forge inspect BazaarPair
+    /// @dev isAdlPending is PACKED (slot 25, byte offset 20 — see `forge inspect BazaarPair
     ///      storage-layout`), which stdstore can't write; set the single byte via vm.store.
     function _setAdlPending(bool v) internal {
-        bytes32 slot = bytes32(uint256(26));
+        bytes32 slot = bytes32(uint256(25));
         bytes32 cur = vm.load(address(btcPair), slot);
         bytes32 mask = bytes32(uint256(0xff) << (20 * 8));
         vm.store(address(btcPair), slot, (cur & ~mask) | bytes32(uint256(v ? 1 : 0) << (20 * 8)));
@@ -864,7 +860,7 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         btcPair.withdrawCollateral(1_000 * BAZAAR_SCALE, new bytes[](0), 0, 0, 0, "");
 
-        (,,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, 4_000 * BAZAAR_SCALE, "flat withdrawal proceeds during ADL pending");
     }
 
@@ -927,7 +923,7 @@ contract BazaarPairTest is Test {
         btcPair.withdrawCollateral(withdrawAmount, priceUpdate, 0, 0, 0, "");
 
         // Collateral reduced by withdrawal amount
-        (,,, uint256 remaining,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 remaining,,,,,) = btcPair.positionBuckets(user1);
         assertEq(remaining, 11_000 * BAZAAR_SCALE);
 
         // USDC transferred back to user
@@ -937,7 +933,7 @@ contract BazaarPairTest is Test {
         assertEq(usdc.balanceOf(user1), user1BalanceAfterSetup - depositUsdc + withdrawUsdc);
 
         // Position still open
-        (, uint256 size,,,,,,,,) = btcPair.positionBuckets(user1);
+        (, uint256 size,,,,,,,) = btcPair.positionBuckets(user1);
         assertEq(size, POSITION_SIZE);
     }
 
@@ -974,11 +970,11 @@ contract BazaarPairTest is Test {
     // every slot below it. The helpers assert a public getter afterward where one exists, so a
     // stale slot fails loudly rather than silently writing an unrelated word.
     // Slot 29: adlLongs (byte 0) | isPairTerminatedEmergency (byte 1) | isPairTerminatedNormal (byte 2)
-    uint256 constant SLOT_TERMINATION_FLAGS = 29;
-    uint256 constant SLOT_SCHEDULED_TERMINATION_TS = 30;
-    uint256 constant SLOT_NORMAL_TERMINATION_PRICE = 65;
-    uint256 constant SLOT_EMERGENCY_HAIRCUT_BP = 66; // emergencyTerminalCollateralWithdrawalRatioBp
-    uint256 constant SLOT_NORMAL_COLLATERAL_RATIO = 67; // normalTerminalCollateralRatioBp (black-swan backstop)
+    uint256 constant SLOT_TERMINATION_FLAGS = 28;
+    uint256 constant SLOT_SCHEDULED_TERMINATION_TS = 29;
+    uint256 constant SLOT_NORMAL_TERMINATION_PRICE = 63;
+    uint256 constant SLOT_EMERGENCY_HAIRCUT_BP = 64; // emergencyTerminalCollateralWithdrawalRatioBp
+    uint256 constant SLOT_NORMAL_COLLATERAL_RATIO = 65; // normalTerminalCollateralRatioBp (black-swan backstop)
 
     /// @dev Set isPairTerminatedEmergency = true in the packed slot 29 and write haircut bp.
     function _simulateEmergencyTermination(BazaarPair pair, uint256 haircutBp) internal {
@@ -1013,26 +1009,29 @@ contract BazaarPairTest is Test {
     // ==================== Helper: Create Limit Order ====================
 
     /// @dev Creates a limit order for the given user on btcPair. Requires collateral + fresh price.
+    ///      Callers pass prices that do not cross the resting book, so the order rests unfilled.
     function _createLimitOrder(address user, uint256 pk, bool isLong, uint256 size, uint256 limitPrice)
         internal
         returns (uint256)
     {
+        pk; // silence unused-param (kept for call-site symmetry with signing helpers)
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
-
-        uint256 nonce = btcPair.metaTxNonces(user);
-        uint256 deadline = block.timestamp + 30 seconds;
 
         vm.prank(user);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0, // triggerPrice (not used for limit)
-            limitPrice,
-            0, // maxSlippageBp
-            size,
-            isLong,
-            false, // isPostOnly
-            uint64(block.number + 500_000), // expirationBlock
-            address(0), // integrator
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: isLong,
+                isPostOnly: false,
+                isIoc: false,
+                size: size,
+                triggerPrice: 0, // not used for limit
+                limitPrice: limitPrice,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0, // nonce (direct call)
             0, // deadline
@@ -1040,9 +1039,27 @@ contract BazaarPairTest is Test {
             "" // signature (direct call)
         );
 
-        // Return orderId — read from user's active limit orders
-        (uint256[] memory activeOrders,,,) = btcPair.getUserActiveLimitOrders(user);
-        return activeOrders[activeOrders.length - 1];
+        return _lastCreatedOrderId(btcPair);
+    }
+
+    /// @dev Per-pair probe watermark for _lastCreatedOrderId.
+    mapping(address => uint256) internal _idProbe;
+
+    /// @dev The newest orderId a pair has assigned. Ids are a gapless monotonic counter from 1,
+    ///      so probing forward finds the last created order even when it is already terminal
+    ///      (a crossing or self-matching placement is filled/canceled in its own transaction,
+    ///      so the active-order set is no source).
+    function _lastCreatedOrderId(BazaarPair p) internal returns (uint256) {
+        uint256 w = _idProbe[address(p)];
+        if (w == 0) w = 1;
+        while (true) {
+            (address creator,,,,,,,,,,,,,,,,,) = p.orders(w);
+            if (creator == address(0)) break;
+            ++w;
+        }
+        _idProbe[address(p)] = w;
+        require(w > 1, "no orders created yet");
+        return w - 1;
     }
 
     // ==================== withdrawCollateral: Emergency Termination Tests ====================
@@ -1059,7 +1076,7 @@ contract BazaarPairTest is Test {
         btcPair.withdrawCollateral(8_000 * BAZAAR_SCALE, emptyPriceUpdate, 0, 0, 0, "");
 
         // After 80% haircut, user can only withdraw 8000 of their 10000
-        (,,, uint256 remaining,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 remaining,,,,,) = btcPair.positionBuckets(user1);
         assertEq(remaining, 0);
 
         // Vault totalCollateralDeposited should be reduced by haircut loss (2000) + withdrawal (8000)
@@ -1093,7 +1110,7 @@ contract BazaarPairTest is Test {
         btcPair.withdrawCollateral(7_000 * BAZAAR_SCALE, emptyPriceUpdate, 0, 0, 0, "");
         vm.stopPrank();
 
-        (,,, uint256 remaining,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 remaining,,,,,) = btcPair.positionBuckets(user1);
         assertEq(remaining, 0);
     }
 
@@ -1112,7 +1129,7 @@ contract BazaarPairTest is Test {
         btcPair.withdrawCollateral(3_000 * BAZAAR_SCALE, emptyPriceUpdate, 0, 0, 0, "");
         vm.stopPrank();
 
-        (,,, uint256 remaining,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 remaining,,,,,) = btcPair.positionBuckets(user1);
         assertEq(remaining, 0);
     }
 
@@ -1129,7 +1146,7 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         btcPair.withdrawCollateral(depositAmount, emptyPriceUpdate, 0, 0, 0, "");
 
-        (,,, uint256 remaining,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 remaining,,,,,) = btcPair.positionBuckets(user1);
         assertEq(remaining, 0);
 
         // Vault totalCollateralDeposited should be zero
@@ -1151,7 +1168,7 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         btcPair.withdrawCollateral(15_000 * BAZAAR_SCALE, emptyPriceUpdate, 0, 0, 0, "");
 
-        (, uint256 size,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
+        (, uint256 size,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, 0, "principal fully withdrawn");
         assertEq(size, 0, "position closed by terminal self-settlement");
     }
@@ -1169,7 +1186,7 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         btcPair.withdrawCollateral(5_000 * BAZAAR_SCALE, emptyPriceUpdate, 0, 0, 0, "");
 
-        (, uint256 size,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
+        (, uint256 size,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, 0);
         assertEq(size, 0);
 
@@ -1207,7 +1224,7 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         btcPair.withdrawCollateral(15_000 * BAZAAR_SCALE, emptyPriceUpdate, 0, 0, 0, "");
 
-        (, uint256 size,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
+        (, uint256 size,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, 0, "principal fully withdrawn");
         assertEq(size, 0, "position closed");
     }
@@ -1242,7 +1259,7 @@ contract BazaarPairTest is Test {
         bytes[] memory staleUpdate = _createBtcPriceUpdate(uint64(block.timestamp - 5));
 
         uint256 nonce = 0;
-        uint256 deadline = block.timestamp + 30 seconds;
+        uint256 deadline = block.timestamp + 10 seconds;
         uint256 relayerFee = 0; // zero fee relay
 
         bytes memory sig = _signWithdrawCollateral(btcPair, USER1_PK, 1_000 * BAZAAR_SCALE, nonce, deadline, relayerFee);
@@ -1279,7 +1296,7 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         btcPair.withdrawCollateral(1_000 * BAZAAR_SCALE, priceUpdate, 0, 0, 0, "");
 
-        (,,, uint256 remaining,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 remaining,,,,,) = btcPair.positionBuckets(user1);
         assertEq(remaining, 14_000 * BAZAAR_SCALE);
     }
 
@@ -1290,7 +1307,7 @@ contract BazaarPairTest is Test {
         uint256 withdrawAmount = 50 * BAZAAR_SCALE;
         uint256 relayerFeeAmount = 5e16; // 0.05 USDC in BAZAAR_SCALE
         uint256 nonce = 0;
-        uint256 deadline = block.timestamp + 30 seconds;
+        uint256 deadline = block.timestamp + 10 seconds;
 
         _depositCollateral(btcPair, user1, depositAmount);
 
@@ -1309,7 +1326,7 @@ contract BazaarPairTest is Test {
         assertEq(usdc.balanceOf(relayer), relayerBalanceBefore + relayerFeeUsdc);
 
         // Collateral reduced by full withdrawal amount (fee comes from the withdrawal, not collateral)
-        (,,, uint256 remaining,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 remaining,,,,,) = btcPair.positionBuckets(user1);
         assertEq(remaining, depositAmount - withdrawAmount);
     }
 
@@ -1331,7 +1348,7 @@ contract BazaarPairTest is Test {
         btcPair.withdrawCollateral(withdrawAmount, priceUpdate, 0, 0, 0, "");
 
         // Withdrawal succeeds — position still open
-        (, uint256 size,,,,,,,,) = btcPair.positionBuckets(user1);
+        (, uint256 size,,,,,,,) = btcPair.positionBuckets(user1);
         assertEq(size, POSITION_SIZE);
     }
 
@@ -1363,7 +1380,7 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         btcPair.withdrawCollateral(500 * BAZAAR_SCALE, priceUpdate, 0, 0, 0, "");
 
-        (, uint256 size,,,,,,,,) = btcPair.positionBuckets(user1);
+        (, uint256 size,,,,,,,) = btcPair.positionBuckets(user1);
         assertEq(size, POSITION_SIZE);
     }
 
@@ -1383,7 +1400,7 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         btcPair.withdrawCollateral(4_960 * BAZAAR_SCALE, priceUpdate, 0, 0, 0, "");
 
-        (, uint256 size,,,,,,,,) = btcPair.positionBuckets(user1);
+        (, uint256 size,,,,,,,) = btcPair.positionBuckets(user1);
         assertEq(size, POSITION_SIZE);
     }
 
@@ -1470,7 +1487,7 @@ contract BazaarPairTest is Test {
         priceUpdate = _createAaplPriceUpdateAtPrice(600, uint64(block.timestamp));
         vm.prank(user2);
         aaplPair.withdrawCollateral(deposit - floorAmt, priceUpdate, 0, 0, 0, "");
-        (,,, uint256 remaining,,,,,,) = aaplPair.positionBuckets(user2);
+        (,,, uint256 remaining,,,,,) = aaplPair.positionBuckets(user2);
         assertEq(remaining, floorAmt, "retains exactly initial margin in cash");
     }
 
@@ -1488,7 +1505,7 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         btcPair.withdrawCollateral(5_000 * BAZAAR_SCALE, emptyPriceUpdate, 0, 0, 0, "");
 
-        (,,, uint256 remaining,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 remaining,,,,,) = btcPair.positionBuckets(user1);
         assertEq(remaining, 10_000 * BAZAAR_SCALE);
 
         // Vault totalCollateralDeposited decreased by withdrawal
@@ -1524,7 +1541,7 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         btcPair.withdrawCollateral(4_000 * BAZAAR_SCALE, priceUpdate, 0, 0, 0, "");
 
-        (, uint256 size,,,,,,,,) = btcPair.positionBuckets(user1);
+        (, uint256 size,,,,,,,) = btcPair.positionBuckets(user1);
         assertEq(size, POSITION_SIZE);
     }
 
@@ -1557,7 +1574,7 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         btcPair.withdrawCollateral(15_000 * BAZAAR_SCALE, emptyPriceUpdate, 0, 0, 0, "");
 
-        (,,, uint256 remaining,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 remaining,,,,,) = btcPair.positionBuckets(user1);
         assertEq(remaining, 0);
 
         // Vault totalCollateralDeposited should be zero
@@ -1567,21 +1584,27 @@ contract BazaarPairTest is Test {
 
     // ==================== Helper: Create Order Convenience ====================
 
-    /// @dev Creates a market order for the given user on btcPair.
+    /// @dev Creates a market order for the given user on btcPair. Market orders match against
+    ///      the book inside createOrder itself; any unfilled remainder auto-cancels in the same
+    ///      transaction, so the stored order is terminal when this returns.
     function _createMarketOrder(address user, bool isLong, uint256 size, uint256 maxSlippageBp) internal {
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
 
         vm.prank(user);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Market,
-            0, // triggerPrice
-            0, // limitPrice
-            maxSlippageBp,
-            size,
-            isLong,
-            false, // isPostOnly
-            0, // expirationTs (ignored for market)
-            address(0), // integrator
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Market,
+                isLong: isLong,
+                isPostOnly: false,
+                isIoc: false,
+                size: size,
+                triggerPrice: 0,
+                limitPrice: 0,
+                maxSlippageBp: maxSlippageBp,
+                expirationBlock: 0, // ignored for market
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -1617,6 +1640,7 @@ contract BazaarPairTest is Test {
                 size,
                 isLong,
                 isPostOnly,
+                false, // isIoc — every meta-tx order in this suite is GTC
                 expirationBlock,
                 integrator,
                 nonce,
@@ -1663,15 +1687,19 @@ contract BazaarPairTest is Test {
 
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            limitPrice,
-            0,
-            size,
-            true,
-            false,
-            expiry,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: size,
+                triggerPrice: 0,
+                limitPrice: limitPrice,
+                maxSlippageBp: 0,
+                expirationBlock: expiry,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -1699,15 +1727,19 @@ contract BazaarPairTest is Test {
 
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            POSITION_SIZE,
-            false,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -1727,15 +1759,19 @@ contract BazaarPairTest is Test {
 
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            POSITION_SIZE,
-            true,
-            true,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: true,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -1754,15 +1790,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(OrderManagementLib.OrderManagementLib__ZeroLimitPrice.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            0,
-            0,
-            POSITION_SIZE,
-            true,
-            false, // limitPrice = 0
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: 0, // rejected
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -1779,15 +1819,19 @@ contract BazaarPairTest is Test {
 
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Market,
-            0,
-            0,
-            100, // 1% slippage
-            POSITION_SIZE,
-            true,
-            false,
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Market,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: 0,
+                maxSlippageBp: 100, // 1% slippage
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -1795,11 +1839,17 @@ contract BazaarPairTest is Test {
             ""
         );
 
-        // Market order stored with triggerPrice = currentPrice, expiryBlock = creationBlock + MARKET_ORDER_LIFETIME_BLOCKS
-        (,, uint256 tp,,,,, BazaarTypes.OrderType ot,,,,, uint64 creationBlock, uint64 expiryBlock,,,,) = btcPair.orders(1);
+        // A market order is terminal within its own transaction: it matches on arrival and any
+        // unfilled remainder auto-cancels. Stored with triggerPrice = currentPrice and
+        // expiryBlock = creationBlock; here the book is empty, so nothing fills and the whole
+        // size is canceled in the creation block.
+        (,, uint256 tp,,,, uint256 filledSize, BazaarTypes.OrderType ot,,,,, uint64 creationBlock, uint64 expiryBlock, uint64 canceledBlock,,,)
+        = btcPair.orders(1);
         assertTrue(ot == BazaarTypes.OrderType.Market);
         assertEq(tp, BTC_SPOT_PRICE); // triggerPrice set to current price
-        assertEq(expiryBlock, creationBlock + 12); // MARKET_ORDER_LIFETIME_BLOCKS = 12
+        assertEq(expiryBlock, creationBlock); // never outlives its own transaction
+        assertEq(filledSize, 0); // empty book — nothing crossed
+        assertEq(canceledBlock, creationBlock); // remainder auto-canceled on arrival
     }
 
     function testCreateOrder_MarketOrder_RevertsPostOnly() public {
@@ -1809,15 +1859,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(OrderManagementLib.OrderManagementLib__PostOnlyNotAllowed.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Market,
-            0,
-            0,
-            100,
-            POSITION_SIZE,
-            true,
-            true, // isPostOnly = true
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Market,
+                isLong: true,
+                isPostOnly: true, // rejected
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: 0,
+                maxSlippageBp: 100,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -1833,15 +1887,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(abi.encodeWithSelector(OrderManagementLib.OrderManagementLib__InvalidSlippage.selector, 0));
         btcPair.createOrder(
-            BazaarTypes.OrderType.Market,
-            0,
-            0,
-            0, // maxSlippageBp = 0
-            POSITION_SIZE,
-            true,
-            false,
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Market,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: 0,
+                maxSlippageBp: 0, // rejected
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -1857,15 +1915,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(abi.encodeWithSelector(OrderManagementLib.OrderManagementLib__InvalidSlippage.selector, 501));
         btcPair.createOrder(
-            BazaarTypes.OrderType.Market,
-            0,
-            0,
-            501, // exceeds MAX_SLIPPAGE_BP (500)
-            POSITION_SIZE,
-            true,
-            false,
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Market,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: 0,
+                maxSlippageBp: 501, // exceeds MAX_SLIPPAGE_BP (500)
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -1904,15 +1966,19 @@ contract BazaarPairTest is Test {
 
         vm.prank(user1);
         try btcPair.createOrder(
-            BazaarTypes.OrderType.Market,
-            0,
-            0,
-            maxSlippageBp,
-            size,
-            isLong,
-            false,
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Market,
+                isLong: isLong,
+                isPostOnly: false,
+                isIoc: false,
+                size: size,
+                triggerPrice: 0,
+                limitPrice: 0,
+                maxSlippageBp: maxSlippageBp,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -1942,21 +2008,28 @@ contract BazaarPairTest is Test {
         _depositCollateral(btcPair, user1, 15_000 * BAZAAR_SCALE);
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
 
-        // Buy StopLimit: limit must be >= trigger (fillable side).
+        // Buy StopLimit: limit must be >= trigger (fillable side). The $50k oracle price already
+        // meets the $48k buy trigger (buy arms at price >= trigger, inclusive), so the stop arms
+        // in the creation transaction and rests in the book as a buy limit — the stored trigger
+        // and limit fields are unchanged by arming.
         uint256 triggerPrice = 48_000 * BAZAAR_SCALE;
         uint256 limitPrice = 48_500 * BAZAAR_SCALE;
 
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.StopLimit,
-            triggerPrice,
-            limitPrice,
-            0,
-            POSITION_SIZE,
-            true,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.StopLimit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: triggerPrice,
+                limitPrice: limitPrice,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -1977,15 +2050,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(OrderManagementLib.OrderManagementLib__PostOnlyNotAllowed.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.StopLimit,
-            48_000 * BAZAAR_SCALE,
-            47_500 * BAZAAR_SCALE,
-            0,
-            POSITION_SIZE,
-            true,
-            true, // isPostOnly
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.StopLimit,
+                isLong: true,
+                isPostOnly: true, // rejected before any other stop validation
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 48_000 * BAZAAR_SCALE,
+                limitPrice: 47_500 * BAZAAR_SCALE,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2001,15 +2078,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(OrderManagementLib.OrderManagementLib__ZeroTriggerPrice.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.StopLimit,
-            0,
-            47_500 * BAZAAR_SCALE,
-            0, // triggerPrice = 0
-            POSITION_SIZE,
-            true,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.StopLimit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0, // rejected
+                limitPrice: 47_500 * BAZAAR_SCALE,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2025,15 +2106,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(OrderManagementLib.OrderManagementLib__ZeroLimitPrice.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.StopLimit,
-            48_000 * BAZAAR_SCALE,
-            0,
-            0, // limitPrice = 0
-            POSITION_SIZE,
-            true,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.StopLimit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 48_000 * BAZAAR_SCALE,
+                limitPrice: 0, // rejected
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2051,15 +2136,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(OrderManagementLib.OrderManagementLib__ZeroSize.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            0,
-            true,
-            false, // size = 0
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: 0, // rejected
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2084,15 +2173,19 @@ contract BazaarPairTest is Test {
             )
         );
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            tinySize,
-            true,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: tinySize,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2123,15 +2216,19 @@ contract BazaarPairTest is Test {
 
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Market,
-            0,
-            0,
-            100,
-            DUST_SIZE,
-            false,
-            false, // full-size sell, $4 notional < $5 floor
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Market,
+                isLong: false, // full-size sell, $4 notional < $5 floor
+                isPostOnly: false,
+                isIoc: false,
+                size: DUST_SIZE,
+                triggerPrice: 0,
+                limitPrice: 0,
+                maxSlippageBp: 100,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2152,15 +2249,19 @@ contract BazaarPairTest is Test {
 
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            DUST_SIZE,
-            false,
-            false, // sell limit at spot, $4 notional
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: false, // sell limit at spot, $4 notional
+                isPostOnly: false,
+                isIoc: false,
+                size: DUST_SIZE,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2185,7 +2286,24 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectPartialRevert(OrderManagementLib.OrderManagementLib__NotionalBelowMinimum.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Market, 0, 0, 100, halfSize, false, false, 0, address(0), priceUpdate, 0, 0, 0, ""
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Market,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: halfSize,
+                triggerPrice: 0,
+                limitPrice: 0,
+                maxSlippageBp: 100,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
+            priceUpdate,
+            0,
+            0,
+            0,
+            ""
         );
     }
 
@@ -2199,15 +2317,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectPartialRevert(OrderManagementLib.OrderManagementLib__NotionalBelowMinimum.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Market,
-            0,
-            0,
-            100,
-            DUST_SIZE,
-            true,
-            false, // BUY — adds to the long, not a close
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Market,
+                isLong: true, // BUY — adds to the long, not a close
+                isPostOnly: false,
+                isIoc: false,
+                size: DUST_SIZE,
+                triggerPrice: 0,
+                limitPrice: 0,
+                maxSlippageBp: 100,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2225,15 +2347,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(); // InsufficientMarginAfterOrder
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            POSITION_SIZE,
-            true,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2246,7 +2372,7 @@ contract BazaarPairTest is Test {
         _depositCollateral(btcPair, user1, 15_000 * BAZAAR_SCALE);
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
 
-        // Expiration less than MIN_ORDER_LIFETIME_BLOCKS (16) from current block
+        // Expiration less than MIN_ORDER_LIFETIME_BLOCKS (12) from current block
         uint64 tooSoonExpiration = uint64(block.number + 2);
 
         vm.prank(user1);
@@ -2256,15 +2382,19 @@ contract BazaarPairTest is Test {
             )
         );
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            POSITION_SIZE,
-            true,
-            false,
-            tooSoonExpiration,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: tooSoonExpiration,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2282,15 +2412,19 @@ contract BazaarPairTest is Test {
 
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            POSITION_SIZE,
-            true,
-            false,
-            farExpiration,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: farExpiration,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2311,15 +2445,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(BazaarPair.BazaarPair__TradingHalted.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            POSITION_SIZE,
-            true,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2337,15 +2475,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(BazaarPair.BazaarPair__TradingHalted.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            POSITION_SIZE,
-            true,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2365,15 +2507,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(BazaarPair.BazaarPair__PairScheduledForTermination.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            POSITION_SIZE,
-            true,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2389,15 +2535,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(BazaarPair.BazaarPair__NoPriceUpdatesProvided.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            POSITION_SIZE,
-            true,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             emptyPriceUpdate,
             0,
             0,
@@ -2418,15 +2568,19 @@ contract BazaarPairTest is Test {
 
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.TakeProfit,
-            0,
-            tpPrice,
-            0,
-            POSITION_SIZE,
-            false,
-            false, // isLong=false (closing long)
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.TakeProfit,
+                isLong: false, // closing long
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: tpPrice,
+                maxSlippageBp: 0,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2434,14 +2588,14 @@ contract BazaarPairTest is Test {
             ""
         );
 
-        // TP order stored
+        // TP order stored; it rests in the book at its limit price from creation onward
         (,, uint256 tp, uint256 lp,,,, BazaarTypes.OrderType ot,,,,,,,,,,) = btcPair.orders(1);
         assertTrue(ot == BazaarTypes.OrderType.TakeProfit);
         assertEq(tp, 0); // no triggerPrice for TP
         assertEq(lp, tpPrice);
 
         // Bucket links to TP order
-        (,,,,, uint256 tpOrderId,,,,) = btcPair.positionBuckets(user1);
+        (,,,,, uint256 tpOrderId,,,) = btcPair.positionBuckets(user1);
         assertEq(tpOrderId, 1);
     }
 
@@ -2452,15 +2606,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(OrderManagementLib.OrderManagementLib__NoPositionForTpSl.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.TakeProfit,
-            0,
-            55_000 * BAZAAR_SCALE,
-            0,
-            POSITION_SIZE,
-            false,
-            false,
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.TakeProfit,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: 55_000 * BAZAAR_SCALE,
+                maxSlippageBp: 0,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2478,15 +2636,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(OrderManagementLib.OrderManagementLib__TpSlMustBeOppositeDirection.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.TakeProfit,
-            0,
-            55_000 * BAZAAR_SCALE,
-            0,
-            POSITION_SIZE,
-            true,
-            false, // isLong=true same as position
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.TakeProfit,
+                isLong: true, // same as position — rejected
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: 55_000 * BAZAAR_SCALE,
+                maxSlippageBp: 0,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2510,15 +2672,19 @@ contract BazaarPairTest is Test {
             )
         );
         btcPair.createOrder(
-            BazaarTypes.OrderType.TakeProfit,
-            0,
-            55_000 * BAZAAR_SCALE,
-            0,
-            2 * POSITION_SIZE, // 2 BTC > 1 BTC position
-            false,
-            false,
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.TakeProfit,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: 2 * POSITION_SIZE, // 2 BTC > 1 BTC position
+                triggerPrice: 0,
+                limitPrice: 55_000 * BAZAAR_SCALE,
+                maxSlippageBp: 0,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2536,15 +2702,19 @@ contract BazaarPairTest is Test {
         // First TP succeeds
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.TakeProfit,
-            0,
-            55_000 * BAZAAR_SCALE,
-            0,
-            POSITION_SIZE / 2,
-            false,
-            false,
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.TakeProfit,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE / 2,
+                triggerPrice: 0,
+                limitPrice: 55_000 * BAZAAR_SCALE,
+                maxSlippageBp: 0,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2556,15 +2726,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(OrderManagementLib.OrderManagementLib__TpSlOrderAlreadyExists.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.TakeProfit,
-            0,
-            56_000 * BAZAAR_SCALE,
-            0,
-            POSITION_SIZE / 2,
-            false,
-            false,
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.TakeProfit,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE / 2,
+                triggerPrice: 0,
+                limitPrice: 56_000 * BAZAAR_SCALE,
+                maxSlippageBp: 0,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2577,21 +2751,27 @@ contract BazaarPairTest is Test {
         _depositCollateral(btcPair, user1, 15_000 * BAZAAR_SCALE);
         _simulateOpenPosition(user1); // 1 BTC long at $50,000
 
+        // Sell stop $5k below spot: untriggered at creation (sell stop fires at price <= trigger),
+        // so it rests outside the book awaiting a qualifying price.
         uint256 slTrigger = 45_000 * BAZAAR_SCALE;
         uint256 slSlippage = 500; // 5% max slippage from oracle at execution
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
 
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.StopLoss,
-            slTrigger,
-            0,
-            slSlippage,
-            POSITION_SIZE,
-            false,
-            false, // isLong=false (closing long)
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.StopLoss,
+                isLong: false, // closing long
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: slTrigger,
+                limitPrice: 0,
+                maxSlippageBp: slSlippage,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2606,7 +2786,7 @@ contract BazaarPairTest is Test {
         assertEq(msBp, slSlippage);
 
         // Bucket links to SL order
-        (,,,,,, uint256 slOrderId,,,) = btcPair.positionBuckets(user1);
+        (,,,,,, uint256 slOrderId,,) = btcPair.positionBuckets(user1);
         assertEq(slOrderId, 1);
     }
 
@@ -2619,15 +2799,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(abi.encodeWithSelector(OrderManagementLib.OrderManagementLib__InvalidSlippage.selector, 0));
         btcPair.createOrder(
-            BazaarTypes.OrderType.StopLoss,
-            45_000 * BAZAAR_SCALE,
-            0,
-            0, // maxSlippageBp = 0
-            POSITION_SIZE,
-            false,
-            false,
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.StopLoss,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 45_000 * BAZAAR_SCALE,
+                limitPrice: 0,
+                maxSlippageBp: 0, // rejected
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2639,15 +2823,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(abi.encodeWithSelector(OrderManagementLib.OrderManagementLib__InvalidSlippage.selector, 501));
         btcPair.createOrder(
-            BazaarTypes.OrderType.StopLoss,
-            45_000 * BAZAAR_SCALE,
-            0,
-            501, // exceeds MAX_SLIPPAGE_BP
-            POSITION_SIZE,
-            false,
-            false,
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.StopLoss,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 45_000 * BAZAAR_SCALE,
+                limitPrice: 0,
+                maxSlippageBp: 501, // exceeds MAX_SLIPPAGE_BP
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2665,15 +2853,19 @@ contract BazaarPairTest is Test {
         // First SL succeeds
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.StopLoss,
-            45_000 * BAZAAR_SCALE,
-            0,
-            100,
-            POSITION_SIZE / 2,
-            false,
-            false,
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.StopLoss,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE / 2,
+                triggerPrice: 45_000 * BAZAAR_SCALE,
+                limitPrice: 0,
+                maxSlippageBp: 100,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2685,15 +2877,19 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(OrderManagementLib.OrderManagementLib__TpSlOrderAlreadyExists.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.StopLoss,
-            44_000 * BAZAAR_SCALE,
-            0,
-            200,
-            POSITION_SIZE / 2,
-            false,
-            false,
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.StopLoss,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE / 2,
+                triggerPrice: 44_000 * BAZAAR_SCALE,
+                limitPrice: 0,
+                maxSlippageBp: 200,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
             0,
             0,
@@ -2712,20 +2908,21 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(OrderManagementLib.OrderManagementLib__ZeroLimitPrice.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.TakeProfit,
-            0,
-            0,
-            0,
-            POSITION_SIZE,
-            false,
-            false, // limitPrice = 0
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.TakeProfit,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: 0,
+                maxSlippageBp: 0,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
-            0,
-            0,
-            0,
-            ""
+            0, 0, 0, ""
         );
     }
 
@@ -2737,20 +2934,21 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(OrderManagementLib.OrderManagementLib__ZeroTriggerPrice.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.StopLoss,
-            0,
-            0,
-            100,
-            POSITION_SIZE,
-            false,
-            false, // triggerPrice = 0
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.StopLoss,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: 0,
+                maxSlippageBp: 100,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
-            0,
-            0,
-            0,
-            ""
+            0, 0, 0, ""
         );
     }
 
@@ -2762,20 +2960,21 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(abi.encodeWithSelector(OrderManagementLib.OrderManagementLib__InvalidSlippage.selector, 0));
         btcPair.createOrder(
-            BazaarTypes.OrderType.StopLoss,
-            45_000 * BAZAAR_SCALE,
-            0,
-            0,
-            POSITION_SIZE,
-            false,
-            false, // maxSlippageBp = 0
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.StopLoss,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 45_000 * BAZAAR_SCALE,
+                limitPrice: 0,
+                maxSlippageBp: 0,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
-            0,
-            0,
-            0,
-            ""
+            0, 0, 0, ""
         );
     }
 
@@ -2792,20 +2991,21 @@ contract BazaarPairTest is Test {
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            POSITION_SIZE,
-            true,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
-            0,
-            0,
-            0,
-            ""
+            0, 0, 0, ""
         );
 
         // Both orders tracked
@@ -2823,20 +3023,21 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         vm.expectRevert(); // InsufficientMarginAfterOrder
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            POSITION_SIZE,
-            true,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
-            0,
-            0,
-            0,
-            ""
+            0, 0, 0, ""
         );
     }
 
@@ -2847,7 +3048,7 @@ contract BazaarPairTest is Test {
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
 
         uint256 nonce = 0;
-        uint256 deadline = block.timestamp + 30 seconds;
+        uint256 deadline = block.timestamp + 10 seconds;
         uint256 relayerFeeAmount = 5e16; // 0.05 USDC
         uint64 expirationBlock = uint64(block.number + 500_000);
 
@@ -2870,20 +3071,21 @@ contract BazaarPairTest is Test {
 
         vm.prank(relayer);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            POSITION_SIZE,
-            true,
-            false,
-            expirationBlock,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: expirationBlock,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
-            nonce,
-            deadline,
-            relayerFeeAmount,
-            sig
+            nonce, deadline, relayerFeeAmount, sig
         );
 
         // Order created for user1, not relayer
@@ -2891,7 +3093,7 @@ contract BazaarPairTest is Test {
         assertEq(creator, user1);
 
         // Relayer fee deducted from user's collateral
-        (,,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, 15_000 * BAZAAR_SCALE - relayerFeeAmount);
 
         // Relayer received fee
@@ -2908,7 +3110,7 @@ contract BazaarPairTest is Test {
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
 
         uint256 nonce = 0;
-        uint256 deadline = block.timestamp + 30 seconds;
+        uint256 deadline = block.timestamp + 10 seconds;
         uint256 relayerFeeAmount = 3 * BAZAAR_SCALE; // 3 USDC > 2 USDC collateral
 
         // Note: MAX_RELAYER_FEE is 1e18, so we need fee <= 1 USDC. Use fee 0.9 USDC with 0.5 collateral.
@@ -2939,20 +3141,21 @@ contract BazaarPairTest is Test {
         vm.prank(relayer);
         vm.expectRevert(BazaarPair.BazaarPair__InsufficientCollateralForRelayerFee.selector);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            POSITION_SIZE,
-            true,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
-            nonce,
-            deadline,
-            relayerFeeAmount,
-            sig
+            nonce, deadline, relayerFeeAmount, sig
         );
     }
 
@@ -2966,20 +3169,21 @@ contract BazaarPairTest is Test {
 
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            POSITION_SIZE,
-            true,
-            false,
-            uint64(block.number + 500_000),
-            integratorAddr,
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: integratorAddr
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
-            0,
-            0,
-            0,
-            ""
+            0, 0, 0, ""
         );
 
         (, address integrator,,,,,,,,,,,,,,,,) = btcPair.orders(1);
@@ -2995,39 +3199,41 @@ contract BazaarPairTest is Test {
         // Create first order
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            POSITION_SIZE / 2,
-            true,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE / 2,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
-            0,
-            0,
-            0,
-            ""
+            0, 0, 0, ""
         );
 
         // Create second order
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE,
-            0,
-            POSITION_SIZE / 2,
-            false,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE / 2,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
-            0,
-            0,
-            0,
-            ""
+            0, 0, 0, ""
         );
 
         // First order is ID 1, second is ID 2
@@ -3111,8 +3317,10 @@ contract BazaarPairTest is Test {
 
     function testCancelOrders_MultipleLimitOrders() public {
         _depositCollateral(btcPair, user1, 30_000 * BAZAAR_SCALE);
+        // Non-crossing prices: a bid and ask at the same price would self-match on arrival.
         uint256 orderId1 = _createLimitOrder(user1, USER1_PK, true, POSITION_SIZE / 2, BTC_SPOT_PRICE);
-        uint256 orderId2 = _createLimitOrder(user1, USER1_PK, false, POSITION_SIZE / 2, BTC_SPOT_PRICE);
+        uint256 orderId2 =
+            _createLimitOrder(user1, USER1_PK, false, POSITION_SIZE / 2, BTC_SPOT_PRICE + 1_000 * BAZAAR_SCALE);
 
         uint256[] memory ids = new uint256[](2);
         ids[0] = orderId1;
@@ -3198,7 +3406,7 @@ contract BazaarPairTest is Test {
         ids[0] = orderId;
 
         uint256 nonce = btcPair.metaTxNonces(user1);
-        uint256 deadline = block.timestamp + 30 seconds;
+        uint256 deadline = block.timestamp + 10 seconds;
         uint256 relayerFee = 1 * BAZAAR_SCALE; // 1 USDC
 
         bytes memory sig = _signCancelOrders(btcPair, USER1_PK, ids, nonce, deadline, relayerFee);
@@ -3226,7 +3434,7 @@ contract BazaarPairTest is Test {
         ids[0] = orderId;
 
         uint256 nonce = btcPair.metaTxNonces(user1);
-        uint256 deadline = block.timestamp + 30 seconds;
+        uint256 deadline = block.timestamp + 10 seconds;
         uint256 relayerFee = 5e17; // 0.5 USDC (under MAX_RELAYER_FEE of 1e18)
 
         bytes memory sig = _signCancelOrders(btcPair, USER1_PK, ids, nonce, deadline, relayerFee);
@@ -3235,7 +3443,7 @@ contract BazaarPairTest is Test {
         btcPair.cancelOrders(ids, nonce, deadline, relayerFee, sig);
 
         // Collateral reduced by relayer fee
-        (,,, uint256 collateral,,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, deposit - relayerFee);
     }
 
@@ -3247,7 +3455,7 @@ contract BazaarPairTest is Test {
         ids[0] = orderId;
 
         uint256 nonce = btcPair.metaTxNonces(user1);
-        uint256 deadline = block.timestamp + 30 seconds;
+        uint256 deadline = block.timestamp + 10 seconds;
         uint256 relayerFee = 2 * BAZAAR_SCALE; // exceeds MAX_RELAYER_FEE (1e18)
 
         bytes memory sig = _signCancelOrders(btcPair, USER1_PK, ids, nonce, deadline, relayerFee);
@@ -3278,24 +3486,25 @@ contract BazaarPairTest is Test {
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.TakeProfit,
-            0,
-            BTC_SPOT_PRICE + 5_000 * BAZAAR_SCALE,
-            0,
-            POSITION_SIZE,
-            false,
-            false,
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.TakeProfit,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE + 5_000 * BAZAAR_SCALE,
+                maxSlippageBp: 0,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
-            0,
-            0,
-            0,
-            ""
+            0, 0, 0, ""
         );
 
         // Verify TP order ID set on bucket
-        (,,,,, uint256 tpBefore,,,,) = btcPair.positionBuckets(user1);
+        (,,,,, uint256 tpBefore,,,) = btcPair.positionBuckets(user1);
         assertTrue(tpBefore != 0);
 
         // Cancel TP
@@ -3305,7 +3514,7 @@ contract BazaarPairTest is Test {
         btcPair.cancelOrders(ids, 0, 0, 0, "");
 
         // Verify TP order ID cleared on bucket
-        (,,,,, uint256 tpAfter,,,,) = btcPair.positionBuckets(user1);
+        (,,,,, uint256 tpAfter,,,) = btcPair.positionBuckets(user1);
         assertEq(tpAfter, 0);
     }
 
@@ -3318,24 +3527,25 @@ contract BazaarPairTest is Test {
         uint256 triggerPrice = BTC_SPOT_PRICE - 5_000 * BAZAAR_SCALE;
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.StopLoss,
-            triggerPrice,
-            0,
-            500,
-            POSITION_SIZE,
-            false,
-            false,
-            0,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.StopLoss,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: triggerPrice,
+                limitPrice: 0,
+                maxSlippageBp: 500,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
-            0,
-            0,
-            0,
-            ""
+            0, 0, 0, ""
         );
 
         // Verify SL order ID set on bucket
-        (,,,,,, uint256 slBefore,,,) = btcPair.positionBuckets(user1);
+        (,,,,,, uint256 slBefore,,) = btcPair.positionBuckets(user1);
         assertTrue(slBefore != 0);
 
         // Cancel SL
@@ -3345,7 +3555,7 @@ contract BazaarPairTest is Test {
         btcPair.cancelOrders(ids, 0, 0, 0, "");
 
         // Verify SL order ID cleared on bucket
-        (,,,,,, uint256 slAfter,,,) = btcPair.positionBuckets(user1);
+        (,,,,,, uint256 slAfter,,) = btcPair.positionBuckets(user1);
         assertEq(slAfter, 0);
     }
 
@@ -3368,9 +3578,11 @@ contract BazaarPairTest is Test {
         usdc.mint(user1, 100_000 * USDC_SCALE); // ensure enough balance
         _depositCollateral(btcPair, user1, 100_000 * BAZAAR_SCALE);
 
+        // All same-side: alternating sides at one price would self-match on arrival instead of
+        // resting, leaving nothing to cancel.
         uint256[] memory ids = new uint256[](10);
         for (uint256 i; i < 10; i++) {
-            ids[i] = _createLimitOrder(user1, USER1_PK, i % 2 == 0, POSITION_SIZE / 10, BTC_SPOT_PRICE);
+            ids[i] = _createLimitOrder(user1, USER1_PK, true, POSITION_SIZE / 10, BTC_SPOT_PRICE);
         }
 
         uint256 gasBefore = gasleft();
@@ -3396,50 +3608,67 @@ contract BazaarPairTest is Test {
 
     // ==================== Per-User Order Cap Tests ====================
     //
-    // MAX_ACTIVE_LIMIT_ORDERS_PER_USER = 100 — Limit + StopLimit share one set.
-    // Market orders are bounded to 1 active per user via positionBuckets.activeMarketOrderId.
+    // MAX_ACTIVE_LIMIT_ORDERS_PER_USER = 100 — Limit + StopLimit share one set. Market orders
+    // are terminal within their own transaction and count against no cap.
 
     /// @dev Create one tiny long limit order at $25,000 (half of spot) — keeps notional and
-    ///      IMR low so we can fit 100 of them under a moderate deposit.
+    ///      IMR low so we can fit 100 of them under a moderate deposit. The tail hint and price
+    ///      bytes are built BEFORE the prank: both make external calls, which would consume it.
     function _createSmallLimitOrder(address user) internal {
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
+        BazaarTypes.MatchHints memory tailHint = BazaarTypes.MatchHints(_bidTail(), 0, 0, 0, 0);
         vm.prank(user);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0, // triggerPrice (unused)
-            BTC_SPOT_PRICE / 2, // limitPrice = $25,000 (below spot, won't aggress)
-            0, // maxSlippageBp
-            BAZAAR_SCALE / 1000, // size = 0.001 BTC → $25 notional
-            true,
-            false, // isLong, isPostOnly
-            uint64(block.number + 500_000),
-            address(0), // integrator
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: BAZAAR_SCALE / 1000,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE / 2,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            tailHint,
             priceUpdate,
-            0,
-            0,
-            0,
-            "" // direct call
+            0, 0, 0, ""
         );
+    }
+
+    /// @dev The current tail of the bid list — the exact predecessor hint for appending another
+    ///      order at or below the worst bid price. Same-price orders queue strictly behind their
+    ///      elders, so filling the 100-order cap at one price needs real hints: a zero-hint
+    ///      insert walks from the head and the repair budget covers only MAX_WALK_STEPS nodes.
+    function _bidTail() internal view returns (uint64 tail) {
+        (uint64 cur,,,) = btcPair.book();
+        while (cur != 0) {
+            tail = cur;
+            (,,,,,,,,,,,,,,,,, uint64 nxt) = btcPair.orders(cur);
+            cur = nxt;
+        }
     }
 
     function _createSmallStopLimitOrder(address user) internal {
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
         vm.prank(user);
         btcPair.createOrder(
-            BazaarTypes.OrderType.StopLimit,
-            BTC_SPOT_PRICE * 2, // triggerPrice = $100k
-            BTC_SPOT_PRICE * 2, // limitPrice = $100k
-            0,
-            BAZAAR_SCALE / 1000,
-            true,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.StopLimit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: BAZAAR_SCALE / 1000,
+                triggerPrice: BTC_SPOT_PRICE * 2,
+                limitPrice: BTC_SPOT_PRICE * 2,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
-            0,
-            0,
-            0,
-            ""
+            0, 0, 0, ""
         );
     }
 
@@ -3465,20 +3694,21 @@ contract BazaarPairTest is Test {
         vm.expectRevert(OrderManagementLib.OrderManagementLib__TooManyActiveLimitOrders.selector);
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            BTC_SPOT_PRICE / 2,
-            0,
-            BAZAAR_SCALE / 1000,
-            true,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Limit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: BAZAAR_SCALE / 1000,
+                triggerPrice: 0,
+                limitPrice: BTC_SPOT_PRICE / 2,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
-            0,
-            0,
-            0,
-            ""
+            0, 0, 0, ""
         );
     }
 
@@ -3498,20 +3728,21 @@ contract BazaarPairTest is Test {
         vm.expectRevert(OrderManagementLib.OrderManagementLib__TooManyActiveLimitOrders.selector);
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.StopLimit,
-            BTC_SPOT_PRICE * 2,
-            BTC_SPOT_PRICE * 2,
-            0,
-            BAZAAR_SCALE / 1000,
-            true,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.StopLimit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: BAZAAR_SCALE / 1000,
+                triggerPrice: BTC_SPOT_PRICE * 2,
+                limitPrice: BTC_SPOT_PRICE * 2,
+                maxSlippageBp: 0,
+                expirationBlock: uint64(block.number + 500_000),
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
-            0,
-            0,
-            0,
-            ""
+            0, 0, 0, ""
         );
     }
 
@@ -3543,22 +3774,25 @@ contract BazaarPairTest is Test {
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
         uint64 shortExpiry = uint64(block.number + 100);
         for (uint256 i = 0; i < 100; i++) {
+            // Hint built BEFORE the prank — its external book reads would consume it.
+            BazaarTypes.MatchHints memory tailHint = BazaarTypes.MatchHints(_bidTail(), 0, 0, 0, 0);
             vm.prank(user1);
             btcPair.createOrder(
-                BazaarTypes.OrderType.Limit,
-                0,
-                BTC_SPOT_PRICE / 2,
-                0,
-                BAZAAR_SCALE / 1000,
-                true,
-                false,
-                shortExpiry,
-                address(0),
+                BazaarTypes.OrderSpec({
+                    orderType: BazaarTypes.OrderType.Limit,
+                    isLong: true,
+                    isPostOnly: false,
+                    isIoc: false,
+                    size: BAZAAR_SCALE / 1000,
+                    triggerPrice: 0,
+                    limitPrice: BTC_SPOT_PRICE / 2,
+                    maxSlippageBp: 0,
+                    expirationBlock: shortExpiry,
+                    integrator: address(0)
+                }),
+                tailHint,
                 priceUpdate,
-                0,
-                0,
-                0,
-                ""
+                0, 0, 0, ""
             );
         }
 
@@ -3590,74 +3824,20 @@ contract BazaarPairTest is Test {
         assertEq(u2.length, 1);
     }
 
-    function testCreateOrder_MarketCap_RevertsWhenAlreadyActive() public {
-        _depositCollateral(btcPair, user1, 15_000 * BAZAAR_SCALE);
-        _createMarketOrder(user1, true, BAZAAR_SCALE / 1000, 100);
-
-        bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
-        vm.expectRevert(OrderManagementLib.OrderManagementLib__ActiveMarketOrderExists.selector);
-        vm.prank(user1);
-        btcPair.createOrder(
-            BazaarTypes.OrderType.Market,
-            0,
-            0,
-            100,
-            BAZAAR_SCALE / 1000,
-            true,
-            false,
-            0,
-            address(0),
-            priceUpdate,
-            0,
-            0,
-            0,
-            ""
-        );
-    }
-
-    function testCreateOrder_MarketCap_NewOrderAfterFirstExpires() public {
-        _depositCollateral(btcPair, user1, 15_000 * BAZAAR_SCALE);
-        _createMarketOrder(user1, true, BAZAAR_SCALE / 1000, 100);
-
-        // Roll past MARKET_ORDER_LIFETIME_BLOCKS = 12
-        vm.roll(block.number + 13);
-        vm.warp(block.timestamp + 5);
-
-        // Should succeed — old market is expired
-        _createMarketOrder(user1, true, BAZAAR_SCALE / 1000, 100);
-    }
-
-    function testCreateOrder_MarketCap_NewOrderAfterCancellation() public {
-        _depositCollateral(btcPair, user1, 15_000 * BAZAAR_SCALE);
-        _createMarketOrder(user1, true, BAZAAR_SCALE / 1000, 100);
-
-        (,,,,,,,, uint256 mOrderId,) = btcPair.positionBuckets(user1);
-        assertGt(mOrderId, 0);
-
-        uint256[] memory toCancel = new uint256[](1);
-        toCancel[0] = mOrderId;
-        vm.prank(user1);
-        btcPair.cancelOrders(toCancel, 0, 0, 0, "");
-
-        // activeMarketOrderId cleared by cancelOrder
-        (,,,,,,,, uint256 mAfter,) = btcPair.positionBuckets(user1);
-        assertEq(mAfter, 0);
-
-        _createMarketOrder(user1, true, BAZAAR_SCALE / 1000, 100);
-    }
-
-    function testCreateOrder_MarketCap_LimitOrdersDontBlockMarket() public {
+    function testCreateOrder_MarketOrders_NotBoundByLimitCap() public {
         _depositCollateral(btcPair, user1, 50_000 * BAZAAR_SCALE);
 
         for (uint256 i = 0; i < 100; i++) {
             _createSmallLimitOrder(user1);
         }
 
-        // Market is a separate cap — should still succeed
+        // Market orders are terminal within their own transaction and count against no cap:
+        // creating them at a full limit-order cap succeeds, back to back.
+        _createMarketOrder(user1, true, BAZAAR_SCALE / 1000, 100);
         _createMarketOrder(user1, true, BAZAAR_SCALE / 1000, 100);
 
-        (,,,,,,,, uint256 mOrderId,) = btcPair.positionBuckets(user1);
-        assertGt(mOrderId, 0);
+        (uint256[] memory ids,,,) = btcPair.getUserActiveLimitOrders(user1);
+        assertEq(ids.length, 100, "market orders never enter the active-limit set");
     }
 
     // ==================== OrderUpdated Event — Non-Limit Paths ====================
@@ -3668,8 +3848,8 @@ contract BazaarPairTest is Test {
 
         uint256 size = POSITION_SIZE;
         uint256 maxSlip = 100;
-        // Market: triggerPrice set to currentPrice, limitPrice cleared,
-        // expiry = currentBlock + MARKET_ORDER_LIFETIME_BLOCKS = block.number + 12
+        // Market: triggerPrice set to currentPrice, limitPrice cleared, and expiry stamped at
+        // the creation block — the order is terminal within its own transaction.
         vm.expectEmit(true, true, true, true, address(btcPair));
         emit BazaarTypes.OrderUpdated(
             btcPair.pairId(),
@@ -3687,14 +3867,28 @@ contract BazaarPairTest is Test {
                 maxSlippageBp: maxSlip,
                 canceledBlock: 0,
                 filledBlock: 0,
-                expiryBlock: uint64(block.number + 12),
+                expiryBlock: uint64(block.number),
                 creationBlock: uint64(block.number)
             })
         );
 
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.Market, 0, 0, maxSlip, size, true, false, 0, address(0), priceUpdate, 0, 0, 0, ""
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.Market,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: size,
+                triggerPrice: 0,
+                limitPrice: 0,
+                maxSlippageBp: maxSlip,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
+            priceUpdate,
+            0, 0, 0, ""
         );
     }
 
@@ -3731,20 +3925,21 @@ contract BazaarPairTest is Test {
 
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.StopLimit,
-            trigger,
-            limit,
-            0,
-            size,
-            true,
-            false,
-            expiry,
-            address(0),
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.StopLimit,
+                isLong: true,
+                isPostOnly: false,
+                isIoc: false,
+                size: size,
+                triggerPrice: trigger,
+                limitPrice: limit,
+                maxSlippageBp: 0,
+                expirationBlock: expiry,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
             priceUpdate,
-            0,
-            0,
-            0,
-            ""
+            0, 0, 0, ""
         );
     }
 
@@ -3781,7 +3976,21 @@ contract BazaarPairTest is Test {
 
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.TakeProfit, 0, limit, 0, size, false, false, 0, address(0), priceUpdate, 0, 0, 0, ""
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.TakeProfit,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: size,
+                triggerPrice: 0,
+                limitPrice: limit,
+                maxSlippageBp: 0,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
+            priceUpdate,
+            0, 0, 0, ""
         );
     }
 
@@ -3795,11 +4004,25 @@ contract BazaarPairTest is Test {
 
         vm.prank(user1);
         btcPair.createOrder(
-            BazaarTypes.OrderType.TakeProfit, 0, limit, 0, size, false, false, 0, address(0), priceUpdate, 0, 0, 0, ""
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.TakeProfit,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: size,
+                triggerPrice: 0,
+                limitPrice: limit,
+                maxSlippageBp: 0,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
+            priceUpdate,
+            0, 0, 0, ""
         );
 
         // Pre-cancel: bucket has takeProfitOrderId set
-        (,,,,, uint256 tpBefore,,,,) = btcPair.positionBuckets(user1);
+        (,,,,, uint256 tpBefore,,,) = btcPair.positionBuckets(user1);
         assertEq(tpBefore, 1);
 
         uint256[] memory ids = new uint256[](1);
@@ -3831,7 +4054,7 @@ contract BazaarPairTest is Test {
         btcPair.cancelOrders(ids, 0, 0, 0, "");
 
         // Post-cancel: bucket pointer cleared
-        (,,,,, uint256 tpAfter,,,,) = btcPair.positionBuckets(user1);
+        (,,,,, uint256 tpAfter,,,) = btcPair.positionBuckets(user1);
         assertEq(tpAfter, 0);
     }
 

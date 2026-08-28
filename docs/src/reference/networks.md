@@ -9,7 +9,6 @@ This page is the **canonical registry of official Bazaar deployments**. If an ad
 | Contract | Address |
 |---|---|
 | `BazaarFactory` | *TBD* |
-| `BazaarSequencer` | *TBD* |
 | `BazaarPairTerminator` | *TBD* |
 | `BazaarOracle` | *TBD* |
 | `BazaarPairLens` | *TBD* |
@@ -32,7 +31,6 @@ External dependencies on Arbitrum One:
 | Contract | Address |
 |---|---|
 | `BazaarFactory` | *TBD* |
-| `BazaarSequencer` | *TBD* |
 | `BazaarPairTerminator` | *TBD* |
 | `BazaarOracle` | *TBD* |
 | `BazaarPairLens` | *TBD* |

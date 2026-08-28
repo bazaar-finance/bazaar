@@ -5,7 +5,6 @@ import {IntegrationBase} from "./IntegrationBase.sol";
 import {StdStorage, stdStorage} from "forge-std/Test.sol";
 import {BazaarPair} from "../../src/BazaarPair.sol";
 import {BazaarPairTerminator} from "../../src/BazaarPairTerminator.sol";
-import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 
 /// @title CrisisBackstopIntegrationTest
 /// @notice The protocol's last-resort insolvency backstops, end-to-end: a recorded deficit
@@ -82,31 +81,16 @@ contract CrisisBackstopIntegrationTest is IntegrationBase {
         assertGt(pair.settlementPriceFixedTs(), 0, "deficit opened the settlement window");
         assertEq(pair.scheduledTerminationTs(), vm.getBlockTimestamp(), "future cutoff pulled back to the fix time");
 
-        // Matching and order creation are halted for the whole window.
+        // Order creation (the arrival-matching path) and the keeper matching entry points are
+        // halted for the whole window.
         bytes[] memory noPu = new bytes[](0);
-        uint64 obs = uint64(vm.getBlockNumber()) - 1;
-        vm.prank(seq);
-        vm.expectRevert(BazaarPair.BazaarPair__PairScheduledForTermination.selector);
-        pair.matchBatch(_lists(_empty(), _empty(), _empty(), _empty()), 1, noPu, obs);
-
         vm.prank(carol);
         vm.expectRevert(BazaarPair.BazaarPair__PairScheduledForTermination.selector);
-        pair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            49_000 * BAZAAR_SCALE,
-            0,
-            BAZAAR_SCALE / 10,
-            true,
-            false,
-            uint64(vm.getBlockNumber() + 500_000),
-            address(0),
-            noPu,
-            0,
-            0,
-            0,
-            ""
-        );
+        pair.createOrder(_limitSpec(true, BAZAAR_SCALE / 10, 49_000 * BAZAAR_SCALE), _hintsNone(), noPu, 0, 0, 0, "");
+
+        vm.prank(seq);
+        vm.expectRevert(BazaarPair.BazaarPair__PairScheduledForTermination.selector);
+        pair.unloadVault(0, noPu);
 
         // Both deposit paths refuse new principal.
         vm.startPrank(carol);
@@ -128,19 +112,14 @@ contract CrisisBackstopIntegrationTest is IntegrationBase {
     ///         price-driven insolvency — the next health check settles the pair via the equity path
     ///         instead of leaving trading frozen forever.
     function test_e2e_AdlTimeout_TerminatesPairViaEquityPath() public {
-        // --- reproduce the proven ADL trigger (same scenario as AdlIntegrationTest) ---
-        vm.startPrank(seq);
-        usdc.approve(address(sequencer), 20_000 * USDC_SCALE);
-        sequencer.deposit(20_000 * USDC_SCALE);
-        vm.stopPrank();
-
+        // --- reproduce the proven deep-liquidation ADL trigger ---
         _deposit(alice, 60_000 * BAZAAR_SCALE);
         _deposit(bob, 60_000 * BAZAAR_SCALE);
         uint256 size = 5 * BAZAAR_SCALE;
-        uint256 aL = _placeLimit(alice, true, size, 51_000 * BAZAAR_SCALE);
-        uint256 bS = _placeLimit(bob, false, size, 49_000 * BAZAAR_SCALE);
+        _placeLimit(alice, true, size, 51_000 * BAZAAR_SCALE);
         _roll(2);
-        assertEq(_match(_lists(_one(aL), _one(bS), _empty(), _empty()), 10), 1, "5 BTC opened");
+        _placeLimit(bob, false, size, 49_000 * BAZAAR_SCALE);
+        assertEq(_posSize(alice), size, "5 BTC opened");
         _assertBooksSettled("adltimeout: after open");
 
         _deposit(dave, 10 * BAZAAR_SCALE);

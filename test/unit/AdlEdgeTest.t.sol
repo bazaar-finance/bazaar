@@ -8,6 +8,7 @@ import {AdlLib} from "../../src/libraries/AdlLib.sol";
 /// @dev Copy of the AdlHarness pattern (LiquidationVaultTest) for the untested AdlLib arms.
 contract AdlEdgeHarness {
     mapping(uint256 => BazaarTypes.Order) public orders;
+    BazaarTypes.OrderBook internal book;
     mapping(address => BazaarTypes.PositionBucket) public positionBuckets;
     BazaarTypes.Vault public vault;
 
@@ -64,7 +65,7 @@ contract AdlEdgeHarness {
         returns (BazaarTypes.AdlResult memory)
     {
         return AdlLib.executeAdlCore(
-            orders, positionBuckets, vault, winners, params, adlEpoch, adlDepositEpoch, adlWindowDeposits
+            orders, book, positionBuckets, vault, winners, params, adlEpoch, adlDepositEpoch, adlWindowDeposits
         );
     }
 

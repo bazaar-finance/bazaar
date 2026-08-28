@@ -10,8 +10,9 @@ import {BazaarTypes} from "./BazaarTypes.sol";
 library MmrSampleLib {
     /// @notice Records `currentMmrBp` into the ring buffer, at most once per MMR_SAMPLE_INTERVAL.
     /// @dev No-op when less than one interval has elapsed since the last sample. The first ever
-    ///      call always records (lastSampleTs == 0). Sampling is driven by matchBatch, the only
-    ///      writer of MMR; quiet periods simply leave gaps, which laggedMmr() tolerates.
+    ///      call always records (lastSampleTs == 0). Sampling rides _refreshMarginCurve, which
+    ///      every matching entry point, liquidation, ADL, and refreshPrice call; quiet periods
+    ///      simply leave gaps, which laggedMmr() tolerates.
     /// @param buf          The pair's sample ring buffer (storage).
     /// @param currentMmrBp The pair's current maintenance-margin rate.
     function record(BazaarTypes.MmrSampleBuffer storage buf, uint256 currentMmrBp) internal {

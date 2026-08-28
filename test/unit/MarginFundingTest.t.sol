@@ -650,6 +650,7 @@ contract FundingIndexTest is Test {
 contract ApplyFillHarness {
     mapping(uint256 => BazaarTypes.Order) internal orders;
     mapping(address => BazaarTypes.PositionBucket) public positionBuckets;
+    BazaarTypes.OrderBook internal book;
 
     function setBucket(
         address user,
@@ -681,12 +682,12 @@ contract ApplyFillHarness {
         BazaarTypes.PositionBucket memory bucketMem = positionBuckets[user];
         BazaarTypes.BucketState memory state =
             BucketLib.calculateState(bucketMem, currentPrice, currentFundingIndex, reqs);
-        BazaarTypes.MatchContext memory ctx;
+        BazaarTypes.ArrivalContext memory ctx;
         ctx.cachedPrice = currentPrice;
         ctx.cachedFundingIdx = currentFundingIndex;
         ctx.marginReqs = reqs;
         return MatchingEngineLib._applyFillWithState(
-            user, state, orderIsLong, fillSize, executionPrice, 0, ctx, orders, positionBuckets
+            user, state, orderIsLong, fillSize, executionPrice, 0, ctx, orders, positionBuckets, book
         );
     }
 

@@ -167,7 +167,7 @@ contract AdlInsuranceShortfallTest is IntegrationBase {
         // Second winner untouched: still open at full size with entry and collateral intact.
         assertEq(_posSize(carol), WINNER_SIZE, "second winner still open");
         assertEq(_posCollateral(carol), WINNER_COLLATERAL, "second winner collateral untouched");
-        (,, uint256 carolEntryAfter,,,,,,,) = pair.positionBuckets(carol);
+        (,, uint256 carolEntryAfter,,,,,,) = pair.positionBuckets(carol);
         assertEq(carolEntryAfter, carolEntry, "second winner entry untouched");
 
         assertGt(pair.settlementPriceFixedTs(), 0, "deficit fixed the settlement price");

@@ -1,6 +1,6 @@
 # Self-Deployment
 
-> **You do not need this page to use Bazaar.** The canonical deployment's addresses are in [Deployments](../reference/networks.md), and [Using Bazaar](using-bazaar.md) covers trading, LPing, sequencing, and integrating against it. This page is for protocol developers and for anyone standing up an independent deployment — in which case note the [AGPL-3.0 network clause](../license.md): a fork operated as a service must publish its modified source.
+> **You do not need this page to use Bazaar.** The canonical deployment's addresses are in [Deployments](../reference/networks.md), and [Using Bazaar](using-bazaar.md) covers trading, LPing, running keepers, and integrating against it. This page is for protocol developers and for anyone standing up an independent deployment — in which case note the [AGPL-3.0 network clause](../license.md): a fork operated as a service must publish its modified source.
 
 Deployment is **two-step** because the heavy logic lives in externally deployed libraries that are linked by address (see [Architecture](../protocol/architecture.md#code-size-strategy)).
 
@@ -26,9 +26,9 @@ The target passes that chain's recorded flags to `forge` and refuses to run if t
 
 The per-chain file only helps if the RPC alias actually serves the chain the target names — the args path is chosen by the make target, not read off the network. Both scripts therefore assert `block.chainid` against the `EXPECTED_CHAIN_ID` the target passes and abort before broadcasting on a mismatch. The failure this closes is silent: `DELEGATECALL` into an address with no code *succeeds* with empty returndata, so a wrongly-linked deployment would pass its own wiring checks and then do nothing on every library call. (The guard is skipped on Anvil and in dry runs, where the variable is unset.)
 
-`script/DeployBazaar.s.sol` deploys, in order: `BazaarOracle` → `BazaarPairLens` → the `BazaarPair` implementation → `BazaarSequencer` and `BazaarPairTerminator` (constructed against the factory address *predicted* via `vm.computeCreateAddress`) → `BazaarFactory`, then asserts the prediction held. The factory constructor independently re-checks the wiring (`Factory__WiringMismatch`), so a bad prediction cannot deploy a half-wired system.
+`script/DeployBazaar.s.sol` deploys, in order: `BazaarOracle` → `BazaarPairLens` → the `BazaarPair` implementation → `BazaarPairTerminator` (constructed against the factory address *predicted* via `vm.computeCreateAddress`, one nonce ahead) → `BazaarFactory`, then asserts the prediction held. The factory constructor independently re-checks the wiring (`Factory__WiringMismatch`), so a bad prediction cannot deploy a half-wired system.
 
-The sequencer and terminator are pre-deployed against the predicted address because inlining their deployment in the factory constructor would push its initcode past the EIP-3860 limit.
+The terminator is pre-deployed against the predicted address because inlining its deployment in the factory constructor would push the factory's initcode past the EIP-3860 limit.
 
 ## The genesis UMA identifier
 

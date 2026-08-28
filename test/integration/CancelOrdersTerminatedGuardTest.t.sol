@@ -41,7 +41,7 @@ contract CancelOrdersTerminatedGuardTest is IntegrationBase {
     ///      preceding vm.expectRevert. See the sibling suite for the full note.
     function _buildRelayedCancel(address user, uint256 pk, uint256[] memory ids) internal returns (CancelReq memory r) {
         r.nonce = pair.metaTxNonces(user);
-        r.deadline = vm.getBlockTimestamp() + 30;
+        r.deadline = vm.getBlockTimestamp() + MetaTxLib.MAX_DEADLINE_WINDOW;
         r.fee = MetaTxLib.MAX_RELAYER_FEE;
         bytes32 structHash = keccak256(
             abi.encode(MetaTxLib.CANCEL_ORDERS_TYPEHASH, keccak256(abi.encodePacked(ids)), r.nonce, r.deadline, r.fee)

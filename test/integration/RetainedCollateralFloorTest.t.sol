@@ -18,18 +18,6 @@ import {CollateralLib} from "../../src/libraries/CollateralLib.sol";
 ///         the BTC pair and covers the continuous branch; the session-bound branch is covered in
 ///         BazaarPairTest on the AAPL pair.
 contract RetainedCollateralFloorTest is IntegrationBase {
-    /// @dev IntegrationBase seeds only a 5,000 USDC sequencer bond = 70,000 of volume capacity,
-    ///      which the opening match nearly exhausts. Without this top-up the walk hits the capacity
-    ///      cap and these tests would measure that instead of the retention constraint they are
-    ///      about.
-    function setUp() public override {
-        super.setUp();
-        vm.startPrank(seq);
-        usdc.approve(address(sequencer), 200_000 * USDC_SCALE);
-        sequencer.deposit(200_000 * USDC_SCALE);
-        vm.stopPrank();
-    }
-
     /// @dev The floor the withdrawal path enforces for a long on this continuously traded pair:
     ///      mmrBp of notional, with the position valued at the conservative (low) edge of the
     ///      confidence band, which _priceUpdateFor sets 0.1% below spot.
@@ -90,9 +78,8 @@ contract RetainedCollateralFloorTest is IntegrationBase {
         pair.withdrawCollateral(col - floorAmt, pu, 0, 0, 0, "");
 
         uint256 aliceClose = _placeLimit(alice, false, 1 * BAZAAR_SCALE, 90_000 * BAZAAR_SCALE);
-        uint256 carolBuy = _placeLimit(carol, true, 1 * BAZAAR_SCALE, 110_000 * BAZAAR_SCALE);
         _roll(2);
-        _matchAtPrice(_lists(_one(carolBuy), _one(aliceClose), _empty(), _empty()), 10, 100_000);
+        _placeLimitAt(carol, true, 1 * BAZAAR_SCALE, 110_000 * BAZAAR_SCALE, 100_000);
 
         assertEq(_canceledBlock(aliceClose), 0, "close is NOT auto-canceled");
         assertGt(_filledSize(aliceClose), 0, "and it fills");
@@ -105,11 +92,11 @@ contract RetainedCollateralFloorTest is IntegrationBase {
         _deposit(bob, 2_000 * BAZAAR_SCALE);
         _deposit(carol, 20_000 * BAZAAR_SCALE);
 
-        // 0.002 BTC: ~$200 notional at $100k.
-        uint256 aOpen = _placeLimit(alice, true, BAZAAR_SCALE / 500, 51_000 * BAZAAR_SCALE);
-        uint256 bOpen = _placeLimit(bob, false, BAZAAR_SCALE / 500, 49_000 * BAZAAR_SCALE);
+        // 0.002 BTC: ~$200 notional at $100k. Alice's bid rests; bob's crossing short fills it.
+        _placeLimit(alice, true, BAZAAR_SCALE / 500, 51_000 * BAZAAR_SCALE);
         _roll(2);
-        _match(_lists(_one(aOpen), _one(bOpen), _empty(), _empty()), 10);
+        _placeLimit(bob, false, BAZAAR_SCALE / 500, 49_000 * BAZAAR_SCALE);
+        assertEq(_posSize(alice), BAZAAR_SCALE / 500, "small position opened");
 
         vm.warp(vm.getBlockTimestamp() + 3);
         bytes[] memory pu = _priceUpdate(100_000, uint64(vm.getBlockTimestamp()));
@@ -120,9 +107,8 @@ contract RetainedCollateralFloorTest is IntegrationBase {
         assertEq(_posCollateral(alice), floorAmt, "retains mmrBp of a small notional");
 
         uint256 aliceClose = _placeLimit(alice, false, BAZAAR_SCALE / 500, 90_000 * BAZAAR_SCALE);
-        uint256 carolBuy = _placeLimit(carol, true, BAZAAR_SCALE / 500, 110_000 * BAZAAR_SCALE);
         _roll(2);
-        _matchAtPrice(_lists(_one(carolBuy), _one(aliceClose), _empty(), _empty()), 10, 100_000);
+        _placeLimitAt(carol, true, BAZAAR_SCALE / 500, 110_000 * BAZAAR_SCALE, 100_000);
 
         assertEq(_canceledBlock(aliceClose), 0, "small position: close is not auto-canceled");
         assertGt(_filledSize(aliceClose), 0, "and it fills");

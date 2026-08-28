@@ -40,7 +40,7 @@ contract CancelOrdersRelayerFeeGuardsTest is IntegrationBase {
     ///      cancelOrders call itself, never before this.
     function _buildRelayedCancel(address user, uint256 pk, uint256[] memory ids) internal returns (CancelReq memory r) {
         r.nonce = pair.metaTxNonces(user);
-        r.deadline = vm.getBlockTimestamp() + 30;
+        r.deadline = vm.getBlockTimestamp() + MetaTxLib.MAX_DEADLINE_WINDOW;
         r.fee = MetaTxLib.MAX_RELAYER_FEE;
         bytes32 structHash = keccak256(
             abi.encode(MetaTxLib.CANCEL_ORDERS_TYPEHASH, keccak256(abi.encodePacked(ids)), r.nonce, r.deadline, r.fee)
@@ -56,23 +56,22 @@ contract CancelOrdersRelayerFeeGuardsTest is IntegrationBase {
         usdc.mint(user, 200_000 * USDC_SCALE);
     }
 
-    /// @dev Drive the pair into a REAL ADL window (isAdlPending is packed at slot 26 byte 20, so
-    ///      there is no stdstore shortcut). Mirrors NegativePathsTest's deep-underwater
-    ///      inheritance scenario. Any order the test needs must already exist — order creation
-    ///      is frozen once ADL is pending.
+    /// @dev Drive the pair into a REAL ADL window (isAdlPending is packed with the pair's other
+    ///      lifecycle flags, so there is no stdstore shortcut): liquidate a deep-underwater
+    ///      phantom long whose vault-inherited loss (~$4,950 at the $50k mark) exceeds the ADL
+    ///      trigger share of the ~$5k genesis insurance fund. Any order a test needs must
+    ///      already exist — order creation is frozen once ADL is pending — and must rest on the
+    ///      ASK side: liquidate crosses the inherited long into resting bids before judging
+    ///      vault health, so a resting bid would be filled by that unload instead of surviving
+    ///      to the cancel under test.
     function _triggerRealAdl() internal {
-        vm.startPrank(seq);
-        usdc.approve(address(sequencer), 20_000 * USDC_SCALE);
-        sequencer.deposit(20_000 * USDC_SCALE);
-        vm.stopPrank();
-
         _deposit(alice, 60_000 * BAZAAR_SCALE);
         _deposit(bob, 60_000 * BAZAAR_SCALE);
         uint256 size = 5 * BAZAAR_SCALE;
-        uint256 aL = _placeLimit(alice, true, size, 51_000 * BAZAAR_SCALE);
-        uint256 bS = _placeLimit(bob, false, size, 49_000 * BAZAAR_SCALE);
+        _placeLimit(alice, true, size, 51_000 * BAZAAR_SCALE);
         _roll(2);
-        assertEq(_match(_lists(_one(aL), _one(bS), _empty(), _empty()), 10), 1, "position opened");
+        _placeLimit(bob, false, size, 49_000 * BAZAAR_SCALE); // crosses alice's resting bid on arrival
+        assertEq(_posSize(alice), size, "position opened");
 
         _deposit(dave, 10 * BAZAAR_SCALE);
         _writePosition(dave, true, size, 254_960 * BAZAAR_SCALE);
@@ -189,8 +188,9 @@ contract CancelOrdersRelayerFeeGuardsTest is IntegrationBase {
     function test_relayedCancel_blockedDuringAdl() public {
         (address user, uint256 pk, address relayerEoa) = _actor("adlGuard");
         _deposit(user, 20_000 * BAZAAR_SCALE);
-        // Placed BEFORE the trigger: order creation is frozen once ADL is pending.
-        uint256 orderId = _placeLimit(user, true, BAZAAR_SCALE / 10, 51_000 * BAZAAR_SCALE);
+        // Placed BEFORE the trigger (order creation is frozen once ADL is pending), on the ask
+        // side so the liquidation's inline unload of the inherited long cannot fill it.
+        uint256 orderId = _placeLimit(user, false, BAZAAR_SCALE / 10, 55_000 * BAZAAR_SCALE);
 
         _triggerRealAdl();
 
@@ -210,7 +210,8 @@ contract CancelOrdersRelayerFeeGuardsTest is IntegrationBase {
     function test_selfSubmittedCancel_allowedDuringAdl() public {
         (address user,,) = _actor("adlSelf");
         _deposit(user, 20_000 * BAZAAR_SCALE);
-        uint256 orderId = _placeLimit(user, true, BAZAAR_SCALE / 10, 51_000 * BAZAAR_SCALE);
+        // Ask side: survives the liquidation's inline unload of the inherited long.
+        uint256 orderId = _placeLimit(user, false, BAZAAR_SCALE / 10, 55_000 * BAZAAR_SCALE);
 
         _triggerRealAdl();
 

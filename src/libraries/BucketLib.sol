@@ -124,8 +124,9 @@ library BucketLib {
     }
 
     /// @notice Emits the PositionBucketUpdated event for off-chain indexers.
-    /// @dev Emit-only: no bucket-state checkpoint is written on-chain, because omission challenges
-    ///      do not require solvency proofs (see BazaarSequencer.challengeOmission).
+    /// @dev Emit-only: no bucket-state checkpoint is written on-chain. Margin correctness needs
+    ///      none — every fill re-derives solvency from the live bucket via _checkMargin against
+    ///      the transaction's oracle price, so a historical snapshot would have no reader.
     function emitBucketUpdate(
         address user,
         BazaarTypes.PositionBucket storage bucket,

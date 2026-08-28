@@ -40,7 +40,7 @@ contract TerminalSweepTest is IntegrationBase {
         view
         returns (bool isLong, uint256 size, uint256 entryValue, uint256 collateral)
     {
-        (isLong, size, entryValue, collateral,,,,,,) = pair.positionBuckets(u);
+        (isLong, size, entryValue, collateral,,,,,) = pair.positionBuckets(u);
     }
 
     /// @dev Withdraw a user's entire terminal entitlement. The registered-profit / junior credit
@@ -176,10 +176,10 @@ contract TerminalSweepTest is IntegrationBase {
     ///         is fully paid and profits are shared at one uniform ratio — no FCFS drain, no
     ///         ledger underflow, and the loser's deposit floor holds.
     function test_e2e_insolventLoser_winnerPrincipalSafe_profitsProRata() public {
-        _openPosition(alice, bob, true, BAZAAR_SCALE); // 1 BTC, ~$50k entries, ~20k collateral each
+        _openPosition(alice, bob, true, BAZAAR_SCALE); // 1 BTC, $51k entries, ~20k collateral each
 
         (,, uint256 aliceEntry, uint256 aliceColl) = _bucket(alice);
-        _fix(23_000); // alice (long) loss ~27k >> her ~20k collateral: deep insolvency
+        _fix(23_000); // alice (long) loss ~28k >> her ~20k collateral: deep insolvency
         assertGt(aliceEntry - 23_000 * BAZAAR_SCALE, aliceColl, "setup: alice negative equity");
 
         // Bots settle both sides during the window (permissionless, batched).
@@ -190,8 +190,8 @@ contract TerminalSweepTest is IntegrationBase {
 
         _finalize();
 
-        // Winner (bob): full principal + profit at the frozen ratio (85.67% here). His registered
-        // 28k profit claim (short from 51k to 23k) is credited on withdraw and paid pro-rata.
+        // Winner (bob): full principal + profit at the frozen ratio. His registered 28k profit
+        // claim (short from 51k to 23k) is credited on withdraw and paid pro-rata.
         uint256 ratioBp = pair.auxState().normalTerminalWinnersPayoutRatioBp;
         assertGt(ratioBp, 8_000, "meaningful pro-rata ratio");
         assertLe(ratioBp, 10_000, "ratio <= 100%");
@@ -211,7 +211,7 @@ contract TerminalSweepTest is IntegrationBase {
     ///         Solvent book -> they still collect in full from the leftover surplus.
     function test_e2e_unsettledWinner_selfSettlesAtWithdraw() public {
         _openPosition(alice, bob, true, BAZAAR_SCALE);
-        _fix(60_000); // alice (long) wins ~10k; solvent (bob's collateral covers it)
+        _fix(60_000); // alice (long, $51k entry) wins ~9k; solvent (bob's collateral covers it)
 
         // Nobody settles bob's counterpart loss or alice's win during the window.
         _finalize();

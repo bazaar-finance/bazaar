@@ -2,33 +2,23 @@
 
 All constants live in `src/libraries/BazaarTypes.sol`, `src/libraries/RiskParamsLib.sol`, and the contracts that use them. Values below are verified against the code.
 
-## Orders & matching
+## Order book & matching
 
 | Parameter | Value |
 |---|---|
 | `MIN_ORDER_AMOUNT` | $5 notional (full closes exempt) |
 | `MAX_SLIPPAGE_BP` | 500 (5%) — market/stop-loss slippage cap |
-| `MARKET_ORDER_LIFETIME_BLOCKS` | 12 L2 blocks (~3 s) |
 | `MIN_ORDER_LIFETIME_BLOCKS` / max | 12 blocks (~3 s) / ~1 year |
 | `MAX_ACTIVE_LIMIT_ORDERS_PER_USER` | 100 (Limit + StopLimit) |
-| Active market orders per user | 1 · TP/SL: 1 each per position |
+| TP/SL per position | 1 each |
 | `MAX_CANCELS_PER_CALL` | 200 |
-| `MAX_OBSERVATION_BLOCK_AGE` | 12 L2 blocks |
-| `LIQ_MAX_SLIPPAGE_BP` | 500 — cap on the Pass-A band; effective band is ±min(5%, current MMR) |
+| `MAX_WALK_STEPS` | 64 — ceiling on a walk's node budget (`MatchHints.maxSteps`; 0 selects the default) and on the insertion-hint repair walk |
+| Insertion hints | up to 4 predecessor candidates (`MatchHints.pred..pred4`), outside the EIP-712 payload |
+| `MAX_TRIGGER_EXECS_PER_CALL` | 20 stops per `executeTriggeredOrders` call |
+| `TRIGGER_TIP` | $0.25 per fired stop, charged to the stop's owner |
+| `LIQ_MAX_SLIPPAGE_BP` | 500 — cap on the liquidation-unload band; effective band is ±min(5%, current MMR) |
+| `LIQ_INLINE_UNLOAD_STEPS` | 16 — node budget for the unload walk inside `liquidate()` |
 | Integrator fee | 0.25 bp maker + 0.25 bp taker — only on orders naming an integrator |
-
-## Sequencers
-
-| Parameter | Value |
-|---|---|
-| `MIN_BOND` | $1,000 |
-| `VOLUME_CAP_MULTIPLIER` | 14× bond per rolling 30 min (`NUM_BUCKETS` × `BUCKET_DURATION`) |
-| Challenge window | 29 min (`SEQUENCER_WINDOW`), strictly inside the 30-min volume window |
-| `OMISSION_PENALTY_BP` | 700 (7%), min $20 — 1% challenger / 6% insurance |
-| `STALE_PENALTY_BP` | 100 (1%), min $20 — 50/50 challenger / insurance |
-| Maker sequencer fee | 0.25 bp |
-| Taker sequencer fee | 0.75 bp (≤ 50% util) → 3.75 bp (≥ 90%) |
-| `SEQUENCER_FLAT_FEE_PER_SIDE` | $0.03 per side, on top of bps fees |
 
 ## Margin
 
@@ -53,7 +43,7 @@ All constants live in `src/libraries/BazaarTypes.sol`, `src/libraries/RiskParams
 |---|---|
 | `FUNDING_INTERVAL` / cap | 1 h / ±0.5% per hour |
 | Premium dampening | ÷ 8 |
-| Mark EMA alpha | 0 … 10% per batch, volume-scaled (no floor) |
+| Mark EMA alpha | 0 … 10% per update (one per matching transaction, fed the walk's VWAP), volume-scaled (no floor) |
 | `MAX_MARK_DEVIATION_BP` | 500 — fills clamped to ±5% of index before entering the mark EMA |
 | `MARK_DECAY_PERIOD` | 1 h to index with no trades |
 | Oracle-gap guards | ≤ 30 min accrual on old ticks; > 12 h gap skips the dark period |
@@ -63,6 +53,7 @@ All constants live in `src/libraries/BazaarTypes.sol`, `src/libraries/RiskParams
 | Parameter | Value |
 |---|---|
 | Liquidation keeper reward | max($0.10, 2 bp of notional) |
+| Vault-unload keeper reward | max($0.10, 2 bp of unloaded notional), paid from insurance only when ≥ $100 notional unloads (`UNLOAD_BOUNTY_MIN_NOTIONAL`); all-or-nothing on insurance coverage |
 | ADL trigger / cancel | expected loss > 80% / < 60% of fund |
 | ADL auction | 25× score → ~0, quadratic, 10 min; ≤ 25 winners per call |
 | ADL timeout | 24 h → settlement window opens at the live price |
@@ -79,13 +70,16 @@ All constants live in `src/libraries/BazaarTypes.sol`, `src/libraries/RiskParams
 |---|---|
 | `MAX_PRICE_STALENESS` | 2 s, every submission path |
 | `MAX_CONFIDENCE_BP` | 200 (2% confidence cap) |
+| `REFRESH_BOUNTY` | $0.25 per `refreshPrice` call, paid from insurance |
+| `REFRESH_BOUNTY_MIN_GAP` | 10 min — the pre-refresh stored price must be older than this |
+| Refresh bounty floors | insurance fund > $10,000 and OI notional > $10,000 (`REFRESH_BOUNTY_MIN_INSURANCE` / `REFRESH_BOUNTY_MIN_OI_NOTIONAL`) |
 
 ## Meta-transactions
 
 | Parameter | Value |
 |---|---|
 | `MAX_RELAYER_FEE` | $1 per meta-transaction |
-| `MAX_DEADLINE_WINDOW` | 30 s max signature deadline |
+| `MAX_DEADLINE_WINDOW` | 10 s max signature deadline |
 
 ## Listing & termination
 

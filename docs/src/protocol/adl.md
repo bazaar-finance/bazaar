@@ -4,7 +4,7 @@ ADL is the backstop for the backstop: when the vault's inherited liquidation inv
 
 ## Trigger & freeze
 
-After every batch, liquidation, withdrawal, and ADL step, the pair computes the vault's **expected loss** (bankruptcy notional vs. current notional on the aggregate). When it exceeds **80% of the insurance fund**, ADL goes pending:
+After every matching transaction, liquidation, unload, withdrawal, and ADL step, the pair computes the vault's **expected loss** (bankruptcy notional vs. current notional on the aggregate). When it exceeds **80% of the insurance fund**, ADL goes pending:
 
 - All trading and order creation freeze; position-holders' withdrawals freeze (flat users may still exit — their cash can't affect scores or margin).
 - The trigger price and funding index are snapshotted — the whole auction ranks against this frozen book, so a keeper's off-chain sort and on-chain execution agree; the target side is the *opposite* of the vault's inventory (the winners).

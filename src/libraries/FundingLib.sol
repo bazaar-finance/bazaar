@@ -37,7 +37,7 @@ library FundingLib {
     ///      fill's share of recent volume (so big fills move the mark more than tiny ones), capped
     ///      at MAX_ALPHA = 1000 (10% of BP_SCALE): even a fill that dominates recent volume can't
     ///      move the mark more than 10% toward its print — the protocol's resistance to single-
-    ///      batch manipulation. There is no lower floor, so a dust fill against deep volume gets
+    ///      update manipulation. There is no lower floor, so a dust fill against deep volume gets
     ///      ~0 weight and the mark just keeps decaying toward index; a tiny wash trade cannot
     ///      nudge the mark. The exec price is additionally clamped to ±MAX_MARK_DEVIATION_BP
     ///      of the index before it enters the EMA, so an implausible print can't move the mark and
@@ -76,9 +76,9 @@ library FundingLib {
         uint256 alpha = (fillNotional * BASE_ALPHA * 100) / newVolume;
         alpha = Math.min(alpha, MAX_ALPHA);
 
-        // Clamp the print to a band around the index before it enters the EMA, so a self-crossed
-        // wash trade at an arbitrary price (a fresh-oracle Pass C cross skips the matching band)
-        // can't inject that price into the mark.
+        // Clamp the print to a band around the index before it enters the EMA, so a wash trade
+        // between two resting limits at an arbitrary price (fresh-oracle limit fills carry no
+        // price band of their own) can't inject that price into the mark.
         uint256 bandHigh = indexPrice * (BP_SCALE + MAX_MARK_DEVIATION_BP) / BP_SCALE;
         uint256 bandLow = indexPrice * (BP_SCALE - MAX_MARK_DEVIATION_BP) / BP_SCALE;
         uint256 boundedExec = Math.min(Math.max(execPrice, bandLow), bandHigh);

@@ -13,7 +13,7 @@ contract MaxWithdrawableTest is IntegrationBase {
     ///         the mock feed's 0.1% conf makes that $49,950 at $50k spot), so the preview is
     ///         queried at that same conservative price.
     function test_maxWithdrawable_isExactBoundary() public {
-        _openPosition(alice, bob, true, BAZAAR_SCALE); // 1 BTC long, ~$50k entry, $20k collateral
+        _openPosition(alice, bob, true, BAZAAR_SCALE); // 1 BTC long, $51k entry, $20k collateral
 
         uint256 maxW = lens.getMaxWithdrawable(address(pair), alice, 49_950 * BAZAAR_SCALE);
         assertGt(maxW, 0, "healthy position has withdrawable slack");

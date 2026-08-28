@@ -8,8 +8,8 @@ import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 /// @notice End-to-end funding-rate lifecycle: open a matched long/short (which seeds the mark-price
 ///         EMA from the fill), move the index away from the mark, let time elapse, and verify the
 ///         cumulative funding index moves in the right direction and transfers value long↔short,
-///         zero-sum. Divergence is driven by refreshPrice (moving the index) rather than by matching
-///         away from oracle, so no matching deviation guard is involved.
+///         zero-sum. Divergence is driven by refreshPrice moving the index while the mark stays
+///         pinned at the fill price.
 contract FundingIntegrationTest is IntegrationBase {
     /// @dev Push a fresh BTC index price through refreshPrice, paying the Pyth fee.
     function _refreshIndex(uint256 priceUsd) internal {
@@ -23,11 +23,11 @@ contract FundingIntegrationTest is IntegrationBase {
     ///         index rises → longs PAY, shorts RECEIVE.
     function test_e2e_Funding_LongPaysWhenMarkAboveIndex() public {
         uint256 size = 1 * BAZAAR_SCALE;
-        _openPosition(alice, bob, true, size); // alice long / bob short at $50k → mark seeded ~$50k
+        _openPosition(alice, bob, true, size); // alice long / bob short, filled at her $51k limit → mark seeded ~$51k
 
         int256 idxBefore = pair.currentFundingIndex();
 
-        // Drop the index to $48k while the mark is still near $50k, then accrue over 30 min.
+        // Drop the index to $48k while the mark is still near $51k, then accrue over 30 min.
         vm.warp(vm.getBlockTimestamp() + 30 minutes);
         _refreshIndex(48_000);
 

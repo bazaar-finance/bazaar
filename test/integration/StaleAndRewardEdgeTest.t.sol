@@ -19,23 +19,14 @@ contract StaleAndRewardEdgeTest is IntegrationBase {
     }
 
     function _placeLimitAapl(address user, uint256 size, uint256 limitPrice, bytes[] memory pu) internal {
+        BazaarTypes.OrderSpec memory s;
+        s.orderType = BazaarTypes.OrderType.Limit;
+        s.isLong = true;
+        s.size = size;
+        s.limitPrice = limitPrice;
+        s.expirationBlock = uint64(vm.getBlockNumber() + 500_000);
         vm.prank(user);
-        aaplPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            limitPrice,
-            0,
-            size,
-            true,
-            false,
-            uint64(vm.getBlockNumber() + 500_000),
-            address(0),
-            pu,
-            0,
-            0,
-            0,
-            ""
-        );
+        aaplPair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
     }
 
     // ============================ stale creation margin ============================
@@ -59,23 +50,7 @@ contract StaleAndRewardEdgeTest is IntegrationBase {
         vm.prank(alice);
         aaplPair.cancelOrders(ids, 0, 0, 0, "");
         vm.warp(vm.getBlockTimestamp() + 30);
-        vm.prank(alice);
-        aaplPair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            200 * BAZAAR_SCALE,
-            0,
-            1 * BAZAAR_SCALE,
-            true,
-            false,
-            uint64(vm.getBlockNumber() + 500_000),
-            address(0),
-            new bytes[](0),
-            0,
-            0,
-            0,
-            ""
-        );
+        _placeLimitAapl(alice, 1 * BAZAAR_SCALE, 200 * BAZAAR_SCALE, new bytes[](0));
         (uint256[] memory staleIds,,,) = aaplPair.getUserActiveLimitOrders(alice);
         assertEq(staleIds.length, 1, "stale-price creation succeeds at the same 1x IMR");
     }

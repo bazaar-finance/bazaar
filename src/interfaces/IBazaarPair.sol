@@ -2,32 +2,6 @@
 pragma solidity 0.8.34;
 
 interface IBazaarPair {
-    function batchHashes(uint256 batchId) external view returns (bytes32);
-
-    function orders(uint256 orderId)
-        external
-        view
-        returns (
-            address creator,
-            address integrator,
-            uint256 triggerPrice,
-            uint256 limitPrice,
-            uint256 maxSlippageBp,
-            uint256 size,
-            uint256 filledSize,
-            uint8 orderType,
-            bool isLong,
-            bool isPostOnly,
-            bool isIoc,
-            bool inBook,
-            uint64 creationBlock,
-            uint64 expiryBlock,
-            uint64 canceledBlock,
-            uint64 filledBlock,
-            uint64 prevInBook,
-            uint64 nextInBook
-        );
-
     // ---- State getters used by BazaarPairTerminator ----
     function pairId() external view returns (bytes32);
     function baseFeedId() external view returns (bytes32);
@@ -56,9 +30,8 @@ interface IBazaarPair {
     function fixSettlementPrice(uint256 settlementPrice) external;
 
     /// @notice Credits already-transferred USDC into the insurance fund bookkeeping.
-    /// @dev Called by BazaarPairTerminator (forfeited insurer-termination bonds) or
-    ///      BazaarSequencer (stale-batch-challenge slash shares) after the caller has already
-    ///      `safeTransfer`'d the matching USDC to the pair, keeping the contract's USDC balance
-    ///      and the insurance accounting in sync.
+    /// @dev Called by BazaarPairTerminator (forfeited insurer-termination bonds) after it has
+    ///      already `safeTransfer`'d the matching USDC to the pair, keeping the contract's USDC
+    ///      balance and the insurance accounting in sync.
     function creditInsurance(uint256 amountBazaarPrecision) external;
 }

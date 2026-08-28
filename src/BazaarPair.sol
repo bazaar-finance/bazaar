@@ -6,7 +6,6 @@ import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.s
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {BazaarOracle} from "./BazaarOracle.sol";
-import {BazaarSequencer} from "./BazaarSequencer.sol";
 import {BazaarTypes} from "./libraries/BazaarTypes.sol";
 import {BazaarMathLib} from "./libraries/BazaarMathLib.sol";
 import {MmrSampleLib} from "./libraries/MmrSampleLib.sol";
@@ -55,13 +54,10 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     error BazaarPair__EthRefundFailed();
     error BazaarPair__TradingHalted();
     error BazaarPair__TradingFrozenAdlPending();
-    error BazaarPair__NoMatchesProvided();
     error BazaarPair__ExceedsMaxCancelsPerCall();
-    error BazaarPair__NoVolumeCapacity();
     error BazaarPair__AdlNotPending();
     error BazaarPair__AdlRetargetPending();
     error BazaarPair__RewardTransferFailed();
-    error BazaarPair__MarketOrderBlockedOracleStale();
     error BazaarPair__InsufficientCollateralForRelayerFee();
     error BazaarPair__AmountLteRelayerFee();
     error BazaarPair__AlreadyTerminated();
@@ -89,8 +85,9 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     mapping(address => bool) internal terminalHaircutApplied;
     mapping(address => EnumerableSet.UintSet) internal userActiveLimitOrders; // user => set of active limit order IDs
 
-    /// @notice Scalar state variables shared with MatchingEngineLib via DELEGATECALL
-    BazaarTypes.MatchingState public matchingState;
+    /// @notice The resting order book's heads and per-side counts. The lists themselves are
+    ///         threaded through `orders` via Order.prevInBook/nextInBook (see OrderBookLib).
+    BazaarTypes.OrderBook public book;
 
     BazaarTypes.Vault public pairVault; // vault aggregates for the pair
 
@@ -106,7 +103,6 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     BazaarOracle public oracle;
     bool public isContinuouslyTraded; // if false, IMR is 2x the larger of the vol curve and the observed reopen gap (jumps across non-trading hours)
     address internal bugBountyAddress; // recipient for bug bounty share of trading fees
-    BazaarSequencer public sequencerContract; // volume capacity enforcement
 
     // -------------------- Pair State --------------------
     bool public isAdlPending = false; // if true, all trading and order creation is frozen until ADL settles and Check 1 passes
@@ -201,7 +197,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     ///      inherits them; ungated, a relayed call could strip margin, move adlScore mid-ADL, or
     ///      escape the terminal haircut. Only relayed calls are affected: both sites call this
     ///      inside `effRelayerFee > 0`, and a self-submitted call carries no signature and hence
-    ///      no fee, so users can always cancel by paying their own gas. matchBatch is halted in
+    ///      no fee, so users can always cancel by paying their own gas. Matching is halted in
     ///      all these states, so nothing fillable is trapped.
     function _chargeRelayerFee(address user, uint256 fee) internal {
         _requireNotHalted();
@@ -280,7 +276,6 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         bytes32 pairId;
         address oracle;
         address usdc;
-        address sequencer;
         address bugBountyAddress;
         bytes32 baseFeedId;
         address umaContract;
@@ -293,15 +288,14 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     /// @dev Called once by the factory immediately after cloning. Cannot be called again.
     function initialize(InitParams calldata p) external initializer {
         if (
-            p.oracle == address(0) || p.usdc == address(0) || p.sequencer == address(0)
-                || p.bugBountyAddress == address(0) || p.umaContract == address(0) || p.deployer == address(0)
+            p.oracle == address(0) || p.usdc == address(0) || p.bugBountyAddress == address(0)
+                || p.umaContract == address(0) || p.deployer == address(0)
         ) revert BazaarPair__ZeroAddress();
         if (p.seedAmount < MIN_INSURANCE_SEED) revert BazaarPair__SeedBelowMinimum();
 
         pairId = p.pairId;
         oracle = BazaarOracle(p.oracle);
         usdc = IERC20(p.usdc);
-        sequencerContract = BazaarSequencer(p.sequencer);
         bugBountyAddress = p.bugBountyAddress;
         baseFeedId = p.baseFeedId;
         umaContract = p.umaContract;
@@ -325,7 +319,6 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         });
 
         // Initialize ID counters at 1
-        matchingState.nextBatchId = 1;
         nextOrderId = 1;
         nextAdlId = 1;
 
@@ -360,17 +353,16 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     error BazaarPair__UnauthorizedInsuranceCreditor();
 
     /// @notice Externally transferred USDC was credited into the insurance fund bookkeeping.
-    ///         `from` identifies the source: the terminator books forfeited insurer-termination
-    ///         bonds, the sequencer books stale-batch-challenge slash shares.
+    ///         `from` identifies the source (the terminator books forfeited insurer-termination
+    ///         bonds).
     event InsuranceCredited(bytes32 indexed pairId, address indexed from, uint256 amountBazaarPrecision);
 
     /// @notice Credits already-transferred USDC into the insurance fund bookkeeping.
-    /// @dev Pure bookkeeping, callable only by the terminator or the registered sequencer.
-    ///      Both transfer the matching USDC immediately before calling, so the contract's USDC
-    ///      balance and the insurance accounting stay in sync; mismatched amounts get caught by
-    ///      isVaultHealthy reason 3.
+    /// @dev Pure bookkeeping, callable only by the terminator, which transfers the matching USDC
+    ///      immediately before calling so the contract's USDC balance and the insurance
+    ///      accounting stay in sync; mismatched amounts get caught by isVaultHealthy reason 3.
     function creditInsurance(uint256 amountBazaarPrecision) external {
-        if (msg.sender != umaContract && msg.sender != address(sequencerContract)) {
+        if (msg.sender != umaContract) {
             revert BazaarPair__UnauthorizedInsuranceCreditor();
         }
         pairVault.insuranceFundBalance += amountBazaarPrecision;
@@ -913,6 +905,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         BazaarTypes.LiquidateResult memory result = LiquidationLib.processLiquidations(
             usersToLiquidate,
             orders,
+            book,
             positionBuckets,
             pairVault,
             BazaarTypes.LiquidateParams({
@@ -929,14 +922,32 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         // (insurance-debited, soft-fail) — moved to the lib for EIP-170 relief.
         liquidatedCount = result.liquidatedCount;
 
-        // Re-evaluate vault health after liquidations (live pair only; terminal settlement
-        // never routes here).
         if (liquidatedCount > 0) {
+            // Cross the freshly seized inventory into the book BEFORE judging vault health, so
+            // exposure the book can absorb right now never false-latches an ADL window. Bounded
+            // by a fixed node budget to keep the liquidator's gas predictable; the
+            // permissionless unloadVault finishes anything deeper. Skipped while ADL is already
+            // pending — matching is frozen then and executeAdl owns the resolution.
+            if (!isAdlPending) {
+                BazaarTypes.WalkSummary memory sum = MatchingEngineLib.unloadBook(
+                    orders,
+                    positionBuckets,
+                    userActiveLimitOrders,
+                    pairVault,
+                    book,
+                    BazaarTypes.LIQ_INLINE_UNLOAD_STEPS,
+                    false,
+                    _buildArrivalCtx(currentPrice, isPriceStale, liqMarginReqs)
+                );
+                _postWalk(sum, currentPrice, isPriceStale);
+            }
+            // Re-evaluate vault health after liquidations (live pair only; terminal settlement
+            // never routes here).
             isVaultHealthy(currentPrice, isPriceStale);
             // Refresh IMR/MMR + sample the curve so a mass liquidation (which burns insurance via
             // collateral seizure and liquidator rewards) feeds the instantaneous insurance
-            // multiplier immediately, rather than waiting for the next matchBatch. The helper
-            // skips if the health re-eval just terminated the pair.
+            // multiplier immediately. The helper skips if the health re-eval just terminated the
+            // pair.
             _refreshMarginCurve(currentPrice);
         }
 
@@ -1010,6 +1021,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             // DELEGATECALL to keep this contract under the code-size limit), so it needs the adlId.
             BazaarTypes.AdlResult memory r = AdlLib.executeAdlCore(
                 orders,
+                book,
                 positionBuckets,
                 pairVault,
                 winners,
@@ -1061,7 +1073,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
 
         // On ADL completion (no longer pending and the pair survived), refresh IMR/MMR + sample so
         // the post-ADL insurance level feeds the margin curve immediately, not only on the next
-        // matchBatch. While ADL is still pending the state is mid-resolution, so we wait.
+        // arrival. While ADL is still pending the state is mid-resolution, so we wait.
         if (!isAdlPending) {
             _refreshMarginCurve(currentPrice);
         }
@@ -1083,25 +1095,20 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     uint256 internal constant MAX_SLIPPAGE_BP = BazaarTypes.MAX_SLIPPAGE_BP; // 5% max slippage for market-type orders
     uint256 internal constant MAX_CANCELS_PER_CALL = 200;
 
-    // -------------------- State Variables --------------------
-    /// @notice Mapping from batch ID to batch info hash
-    /// @dev Full BatchInfo preimage emitted in BatchRecorded event; stored hash is rehashed
-    ///      during omission challenges to authenticate the supplied preimage.
-    mapping(uint256 => bytes32) public batchHashes;
-
     // -------------------- Functions --------------------
 
-    /// @notice Creates a new order (delegates to OrderManagementLib)
+    /// @notice Creates a new order and matches it against the book in the same transaction:
+    ///         the arrival walk fills whatever crosses at each resting maker's price, then rests
+    ///         the remainder (GTC limits, positioned by `hints`) or cancels it (Market/IOC,
+    ///         post-only violation, self-match, step-cap, dust). Untriggered stops rest outside
+    ///         the book awaiting executeTriggeredOrders.
+    /// @param spec The signed order intent (covered by the EIP-712 payload).
+    /// @param hints Execution aids — insertion predecessors and the walk's node budget. Outside
+    ///        the signature (like priceUpdate): a relayer attaches fresh ones at submission, and
+    ///        every hint is verified on-chain against the actual neighbors before linking.
     function createOrder(
-        BazaarTypes.OrderType orderType,
-        uint256 triggerPrice,
-        uint256 limitPrice,
-        uint256 maxSlippageBp,
-        uint256 size,
-        bool isLong,
-        bool isPostOnly,
-        uint64 expirationBlock,
-        address integrator,
+        BazaarTypes.OrderSpec calldata spec,
+        BazaarTypes.MatchHints calldata hints,
         bytes[] calldata priceUpdate,
         uint256 nonce,
         uint256 deadline,
@@ -1111,15 +1118,16 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         bytes32 structHash = keccak256(
             abi.encode(
                 MetaTxLib.CREATE_ORDER_TYPEHASH,
-                orderType,
-                triggerPrice,
-                limitPrice,
-                maxSlippageBp,
-                size,
-                isLong,
-                isPostOnly,
-                expirationBlock,
-                integrator,
+                spec.orderType,
+                spec.triggerPrice,
+                spec.limitPrice,
+                spec.maxSlippageBp,
+                spec.size,
+                spec.isLong,
+                spec.isPostOnly,
+                spec.isIoc,
+                spec.expirationBlock,
+                spec.integrator,
                 nonce,
                 deadline,
                 relayerFee
@@ -1127,13 +1135,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         );
         (address user, uint256 effRelayerFee) = _resolveUser(structHash, nonce, deadline, relayerFee, signature);
 
-        _requireNotHalted();
-        if (scheduledTerminationTs != 0 && block.timestamp >= scheduledTerminationTs) {
-            revert BazaarPair__PairScheduledForTermination();
-        }
-        // Keyed to the settlement latch itself, independent of the cutoff stamp (and of the
-        // relayer-fee branch below, which is skipped when the fee is zero).
-        _requireNoSweepWindow();
+        _requireLiveTrading();
 
         // Deduct relayer fee from collateral before margin check so the check accounts for it.
         // Debits both the bucket and D (see _chargeRelayerFee); the USDC leaves via _payRelayer below.
@@ -1144,30 +1146,24 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         (BazaarTypes.PairPrice memory priceStruct, uint256 ethRefund, bool _isOracleStale) =
             _getCurrentPairPrice(priceUpdate, msg.value);
 
-        if (_isOracleStale && orderType == BazaarTypes.OrderType.Market) {
-            revert BazaarPair__MarketOrderBlockedOracleStale();
-        }
+        // Refresh the margin curve + MMR sample ring on every arrival (both callees self-gate),
+        // so the creation gate and the walk both judge against current parameters and the
+        // 24h-lagged liquidation threshold keeps getting fed.
+        _refreshMarginCurve(priceStruct.spotPrice);
 
         uint64 currentBlock = _l2Block();
 
         // Clean up expired limit orders and get directional exposure for margin calculation
         (uint256 longOrderExposure, uint256 shortOrderExposure) = _cleanupExpiredLimitOrders(user, currentBlock);
 
-        uint256 newNextOrderId = OrderManagementLib.createOrder(
+        uint256 orderId = nextOrderId;
+        nextOrderId = OrderManagementLib.createOrder(
             orders,
             positionBuckets,
             userActiveLimitOrders,
             BazaarTypes.CreateOrderParams({
                 pairId: pairId,
-                isLong: isLong,
-                size: size,
-                triggerPrice: triggerPrice,
-                limitPrice: limitPrice,
-                maxSlippageBp: maxSlippageBp,
-                orderType: orderType,
-                expirationBlock: expirationBlock,
-                isPostOnly: isPostOnly,
-                integrator: integrator,
+                spec: spec,
                 // Spot values both legs the order is judged on: the existing bucket's notional and,
                 // for a market order, the estimated execution price. A bracket edge would value the
                 // position at a mark no other gate uses — the fill-time check and every later
@@ -1179,7 +1175,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
                 // it never reads the MMR-derived minRequiredCollateral, so the lagged walk-back
                 // would be computed and discarded. Pass the plain (un-lagged) requirements.
                 marginReqs: marginRequirements,
-                nextOrderId: nextOrderId,
+                nextOrderId: orderId,
                 outstandingLongOrderExposure: longOrderExposure,
                 outstandingShortOrderExposure: shortOrderExposure,
                 currentBlock: currentBlock
@@ -1187,7 +1183,17 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             user
         );
 
-        nextOrderId = newNextOrderId;
+        BazaarTypes.WalkSummary memory sum = MatchingEngineLib.executeArrival(
+            orders,
+            positionBuckets,
+            userActiveLimitOrders,
+            pairVault,
+            book,
+            orderId,
+            hints,
+            _buildArrivalCtx(priceStruct.spotPrice, _isOracleStale, _marginReqsWithLag())
+        );
+        _postWalk(sum, priceStruct.spotPrice, _isOracleStale);
 
         // Send relayer fee from contract balance (already deducted from user's collateral above)
         if (effRelayerFee > 0) {
@@ -1229,7 +1235,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
                 revert BazaarPair__RequestorIsNotOrderOwner();
             }
             OrderManagementLib.cancelOrder(
-                orders, positionBuckets, userActiveLimitOrders, orderIds[i], pairId, currentBlock
+                orders, positionBuckets, userActiveLimitOrders, book, orderIds[i], pairId, currentBlock
             );
         }
 
@@ -1268,8 +1274,19 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         // Sweep logic lives in OrderManagementLib (EIP-170 extraction).
         return
             OrderManagementLib.cleanupExpiredLimitOrders(
-                userActiveLimitOrders[user], orders, pairId, user, currentBlock
+                userActiveLimitOrders[user], orders, book, pairId, user, currentBlock
             );
+    }
+
+    /// @notice Permissionless expiry janitor: cancels + unlinks any of the given orders that
+    ///         expired without reaching a terminal state; every other id is skipped silently.
+    ///         The walk removes expired makers on contact and owners sweep their own during
+    ///         create/withdraw — this lets anyone clear dead nodes from the book proactively.
+    function sweepExpired(uint256[] calldata orderIds) external nonReentrant {
+        // Gated like every other book mutation; the guard-free cancelOrders path remains the
+        // owner's terminal-state escape hatch.
+        _requireLiveTrading();
+        OrderManagementLib.sweepExpired(orders, userActiveLimitOrders, book, orderIds, pairId, _l2Block());
     }
 
     /// @notice Read-only twin of _cleanupExpiredLimitOrders: a user's live limit-order exposure
@@ -1287,151 +1304,126 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     // ║                  SECTION 8: ORDER MATCHING                   ║
     // ╚══════════════════════════════════════════════════════════════╝
 
-    // -------------------- Constants --------------------
-    // Sequencer fees in EBP (paid directly to sequencer, before bug bounty tax)
-    uint256 internal constant MAKER_SEQUENCER_FEE_EBP = BazaarTypes.MAKER_SEQUENCER_FEE_EBP; // 0.25 bps
-    uint256 internal constant TAKER_SEQUENCER_FEE_EBP = BazaarTypes.TAKER_SEQUENCER_FEE_EBP; // 0.75 bps
-
-    // Integrator fees in EBP (paid directly to integrator, before bug bounty tax)
-    uint256 internal constant MAKER_INTEGRATOR_FEE_EBP = BazaarTypes.MAKER_INTEGRATOR_FEE_EBP; // 0.25 bps
-    uint256 internal constant TAKER_INTEGRATOR_FEE_EBP = BazaarTypes.TAKER_INTEGRATOR_FEE_EBP; // 0.25 bps
-
-    // Liquidation fee in EBP
-    uint256 internal constant LIQUIDATION_FEE_EBP = BazaarTypes.LIQUIDATION_FEE_EBP; // 2 bps — secondary liquidator reward (applied in LiquidationLib)
-
-    // Insurance fees in EBP (extended basis points, 1 EBP = 0.0001%)
-    // Maker: flat 0.5 bps always
-    // Taker base (f_base): scales linearly with target ratio from 0.5 bps (2% target) to 2 bps (10% target)
-    // Taker deficit scaling: fee = f_base × (1 + 49 × δ²), capped at 45 bps
-    //   where δ = (target - current) / target, quadratic convexity
-    // Taker surplus scaling: f_base × (1 - surplus/target) down to 0 when fund is 2x target
-    uint256 internal constant MAKER_INSURANCE_FEE_EBP = BazaarTypes.MAKER_INSURANCE_FEE_EBP; // 0.5 bps flat
-    // Taker insurance fee curve constants live in RiskParamsLib.
-
-    // Bug bounty tax: deducted from sequencer, integrator, and insurance totals at batch end
-    uint256 internal constant BUG_BOUNTY_TAX_BP = BazaarTypes.BUG_BOUNTY_TAX_BP; // 1% of all fees
-
-    uint256 internal constant MAX_OBSERVATION_BLOCK_AGE = 12; // max age of sequencer's observation block relative to _l2Block() (~4s on Arbitrum)
-
     // -------------------- Functions --------------------
 
-    /// @notice Matches orders on-chain via three-pass walk over sequencer-provided sorted lists.
-    /// @dev List sort orders (verified inline during the walk):
-    ///        longLimits   — limitPrice DESC, orderId ASC
-    ///        shortLimits  — limitPrice ASC,  orderId ASC
-    ///        longMarkets  — maxSlippageBp DESC, orderId ASC
-    ///        shortMarkets — maxSlippageBp DESC, orderId ASC
-    ///      Pass A: vault liquidations vs limits.
-    ///      Pass B: markets vs limits (long-markets first, then short-markets).
-    ///      Pass C: limits vs limits.
-    ///      `maxMatches` is the sequencer's gas-safety circuit breaker — walk halts when
-    ///      `successCount >= maxMatches`. There is no protocol ceiling on maxMatches or on
-    ///      calldata length (totalIds): the effective bound for both is the L2 transaction
-    ///      gas limit, which rises with chain upgrades instead of being frozen here forever.
-    ///      Engine buffers are sized from min(maxMatches, totalIds), so an oversized
-    ///      maxMatches cannot inflate allocations.
-    error BazaarPair__ObservationBlockTooOld();
-    error BazaarPair__ObservationBlockInFuture();
-    error BazaarPair__InvalidMaxMatches();
-
-    function matchBatch(
-        BazaarTypes.OrderLists calldata lists,
-        uint256 maxMatches,
-        bytes[] calldata priceUpdate,
-        uint64 observationBlock
-    ) external payable nonReentrant returns (uint256 successCount) {
-        uint64 currentBlock = _l2Block();
-        if (observationBlock >= currentBlock) {
-            revert BazaarPair__ObservationBlockInFuture();
-        }
-        if (currentBlock - observationBlock > MAX_OBSERVATION_BLOCK_AGE) {
-            revert BazaarPair__ObservationBlockTooOld();
-        }
-        if (_isTerminated()) revert BazaarPair__TradingHalted();
-        if (isAdlPending) revert BazaarPair__TradingFrozenAdlPending();
-        if (scheduledTerminationTs != 0 && block.timestamp >= scheduledTerminationTs) {
-            revert BazaarPair__PairScheduledForTermination();
-        }
-        // Keyed to the settlement latch itself, independent of the cutoff stamp: a fill at the
-        // live oracle price would trade against a book that already exits at the frozen price.
-        _requireNoSweepWindow();
-
-        if (maxMatches == 0) revert BazaarPair__InvalidMaxMatches();
-
-        uint256 totalIds =
-            lists.longLimits.length + lists.shortLimits.length + lists.longMarkets.length + lists.shortMarkets.length;
-        if (totalIds == 0) revert BazaarPair__NoMatchesProvided();
-
-        // Get current price: prefer freshest available.
-        BazaarTypes.PairPrice memory priceStruct;
-        uint256 ethRefund;
-        bool _isOracleStale;
-        (priceStruct, ethRefund, _isOracleStale) = _getCurrentPairPrice(priceUpdate, msg.value);
-
-        uint256 cachedPrice = priceStruct.spotPrice;
-
-        _calculateIMRandMMR(cachedPrice);
-        // Sample the (possibly just-updated) MMR into the ring buffer; self-gated to at most once
-        // per MMR_SAMPLE_INTERVAL. matchBatch is the only writer of MMR, so this is the only place
-        // the curve needs to be captured — quiet periods leave gaps that laggedMmr() tolerates.
-        MmrSampleLib.record(mmrBuffer, marginRequirements.mmrBp);
-
-        (, uint256 remainingCapacity) = sequencerContract.checkVolumeCapacity(msg.sender, 0);
-        if (remainingCapacity == 0) revert BazaarPair__NoVolumeCapacity();
-        uint256 takerSeqFeeEbp = sequencerContract.getDynamicTakerSequencerFee();
-
-        BazaarTypes.MatchContext memory ctx;
-        ctx.cachedPrice = cachedPrice;
+    /// @dev Snapshot the tx-wide matching context: price, funding index, both insurance fee
+    ///      rates, stale flag, and margin requirements (with the 24h-lagged MMR resolved by the
+    ///      caller). Built once per entry point so every fill in the transaction judges against
+    ///      the same basis.
+    function _buildArrivalCtx(uint256 spot, bool stale, BazaarTypes.MarginRequirements memory mr)
+        internal
+        returns (BazaarTypes.ArrivalContext memory ctx)
+    {
+        ctx.cachedPrice = spot;
         ctx.cachedFundingIdx = currentFundingIndex;
         uint256 reopenGapBp = isContinuouslyTraded ? 0 : uint256(reopenGapEma.gapEmaBp);
         ctx.insuranceFeeEbp =
-            RiskParamsLib.getTakerInsuranceFeeEbp(pairVault, lastPairPrice, liquidationGapEma, cachedPrice, reopenGapBp);
-        ctx.takerSequencerFeeEbp = takerSeqFeeEbp;
-        ctx.remainingCapacity = remainingCapacity;
+            RiskParamsLib.getTakerInsuranceFeeEbp(pairVault, lastPairPrice, liquidationGapEma, spot, reopenGapBp);
         ctx.closingFeeEbp = RiskParamsLib.getClosingFeeEbp(lastPairPrice, liquidationGapEma, reopenGapBp);
-        ctx.isOracleStale = _isOracleStale;
-        ctx.marginReqs = _marginReqsWithLag();
+        ctx.isOracleStale = stale;
+        ctx.marginReqs = mr;
         ctx.pairId = pairId;
-        ctx.observationBlock = observationBlock;
-        ctx.currentBlock = currentBlock;
+        ctx.currentBlock = _l2Block();
         ctx.usdc = address(usdc);
         ctx.bugBountyAddress = bugBountyAddress;
-        ctx.sequencer = msg.sender;
-        ctx.bugBountyTaxBp = BUG_BOUNTY_TAX_BP;
-        ctx.maxMatches = maxMatches;
+    }
 
-        BazaarTypes.BatchResult memory batchResult = MatchingEngineLib.executeBatch(
-            orders, positionBuckets, batchHashes, matchingState, userActiveLimitOrders, pairVault, lists, ctx
+    /// @dev Shared prologue for the matching entry points: trading not halted (terminated or ADL
+    ///      pending), not at/past the scheduled termination cutoff, no terminal sweep window.
+    function _requireLiveTrading() internal view {
+        _requireNotHalted();
+        if (scheduledTerminationTs != 0 && block.timestamp >= scheduledTerminationTs) {
+            revert BazaarPair__PairScheduledForTermination();
+        }
+        _requireNoSweepWindow();
+    }
+
+    /// @dev Post-walk bookkeeping shared by every matching entry point, all fill-gated: fold the
+    ///      walk's VWAP into the mark price, its liquidation fills into the gap EMA, and
+    ///      re-evaluate vault health against the same price basis the fills settled at.
+    function _postWalk(BazaarTypes.WalkSummary memory sum, uint256 spot, bool stale) internal {
+        if (sum.totalFillSize == 0) return;
+        // totalMatchedVolume IS Σ(price × size): exact VWAP numerator and exact total
+        // notional, so no re-derivation through an average price is needed.
+        uint256 vwap = Math.mulDiv(sum.totalMatchedVolume, BAZAAR_SCALE, sum.totalFillSize);
+        _updateMarkPrice(vwap, sum.totalMatchedVolume, spot);
+        if (sum.liqCount != 0) {
+            RiskParamsLib.updateLiquidationGapEmaBatch(
+                liquidationGapEma, sum.sumLiqGapTimesSize, sum.totalLiqFillSize, sum.liqCount
+            );
+        }
+        isVaultHealthy(spot, stale);
+    }
+
+    /// @notice Permissionless keeper entry point: fire triggered StopLimit/StopLoss orders
+    ///         against a fresh oracle price. Each fired stop pays the caller TRIGGER_TIP from
+    ///         its owner's collateral; owners who cannot cover it have the stop auto-canceled.
+    ///         Ineligible ids (untriggered, dead, wrong type, already armed) are skipped
+    ///         silently so racing keepers never revert each other.
+    function executeTriggeredOrders(BazaarTypes.TriggerExec[] calldata execs, bytes[] calldata priceUpdate)
+        external
+        payable
+        nonReentrant
+        returns (uint256 executedCount)
+    {
+        _requireLiveTrading();
+
+        // Staleness is rejected inside the walk library (trigger evaluation and StopLoss pricing
+        // are oracle-derived), so the ctx carries the flag through unmodified.
+        (BazaarTypes.PairPrice memory priceStruct, uint256 ethRefund, bool _isOracleStale) =
+            _getCurrentPairPrice(priceUpdate, msg.value);
+
+        _refreshMarginCurve(priceStruct.spotPrice);
+
+        BazaarTypes.WalkSummary memory sum;
+        (executedCount, sum) = MatchingEngineLib.executeTriggers(
+            orders,
+            positionBuckets,
+            userActiveLimitOrders,
+            pairVault,
+            book,
+            execs,
+            _buildArrivalCtx(priceStruct.spotPrice, _isOracleStale, _marginReqsWithLag())
         );
+        _postWalk(sum, priceStruct.spotPrice, _isOracleStale);
 
-        successCount = batchResult.successCount;
+        _refundEth(ethRefund);
+    }
 
-        // Record matched volume with sequencer contract
-        if (batchResult.totalMatchedVolume > 0) {
-            sequencerContract.recordVolume(msg.sender, batchResult.totalMatchedVolume);
-        }
+    /// @notice Permissionless keeper entry point: cross the vault's pending liquidation
+    ///         inventory into the book within the liquidation band. The caller's reward —
+    ///         max(MIN_LIQUIDATOR_REWARD, LIQUIDATION_FEE_EBP of unloaded notional) from
+    ///         insurance, gated by UNLOAD_BOUNTY_MIN_NOTIONAL — is paid inside the walk library.
+    /// @param maxSteps Node budget for the walk (0 = protocol default; clamped to
+    ///        MAX_WALK_STEPS).
+    function unloadVault(uint256 maxSteps, bytes[] calldata priceUpdate)
+        external
+        payable
+        nonReentrant
+        returns (uint256 unloadedSize)
+    {
+        _requireLiveTrading();
 
-        if (successCount != 0) {
-            if (batchResult.totalFillSize > 0) {
-                // totalMatchedVolume IS Σ(price × size): exact VWAP numerator and exact total
-                // notional, so no re-derivation through an average price is needed.
-                uint256 vwap = Math.mulDiv(batchResult.totalMatchedVolume, BAZAAR_SCALE, batchResult.totalFillSize);
-                _updateMarkPrice(vwap, batchResult.totalMatchedVolume, cachedPrice);
-            }
+        // The stale fallback is allowed: liquidation flow is forced, and the unload band
+        // (min(LIQ_MAX_SLIPPAGE_BP, MMR) around the reference price) sits inside the stale
+        // fill band.
+        (BazaarTypes.PairPrice memory priceStruct, uint256 ethRefund, bool _isOracleStale) =
+            _getCurrentPairPrice(priceUpdate, msg.value);
 
-            // Pass A liquidation gap EMA update
-            if (batchResult.liqCount != 0) {
-                RiskParamsLib.updateLiquidationGapEmaBatch(
-                    liquidationGapEma,
-                    batchResult.sumLiqGapTimesSize,
-                    batchResult.totalLiqFillSize,
-                    batchResult.liqCount
-                );
-            }
+        _refreshMarginCurve(priceStruct.spotPrice);
 
-            // Re-evaluate vault health
-            isVaultHealthy(cachedPrice, _isOracleStale);
-        }
+        BazaarTypes.WalkSummary memory sum = MatchingEngineLib.unloadBook(
+            orders,
+            positionBuckets,
+            userActiveLimitOrders,
+            pairVault,
+            book,
+            maxSteps,
+            true,
+            _buildArrivalCtx(priceStruct.spotPrice, _isOracleStale, _marginReqsWithLag())
+        );
+        unloadedSize = sum.totalFillSize;
+        _postWalk(sum, priceStruct.spotPrice, _isOracleStale);
 
         _refundEth(ethRefund);
     }
@@ -1843,8 +1835,8 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     ///         whose refresh ends a stale gap on an active pair may earn a small insurance-funded
     ///         bounty (RiskParamsLib.payRefreshBounty holds the gates and amount).
     /// @dev    Pays the Pyth fee from msg.value and refunds any unused ETH. The margin leg exists
-    ///         so the sample ring keeps advancing through trading gaps — matchBatch (the normal
-    ///         writer) needs fills and liquidate() only resamples after a successful liquidation,
+    ///         so the sample ring keeps advancing through trading gaps — the matching entry
+    ///         points only resample on arrivals and liquidate() after a successful liquidation,
     ///         so a quiet pair would otherwise freeze laggedMmr() at an arbitrarily old value.
     ///         On a halted pair only the price refresh runs (margin params are moot then), and
     ///         the bounty is withheld from the moment any terminal latch is set — terminated

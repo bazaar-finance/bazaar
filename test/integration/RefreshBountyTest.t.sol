@@ -104,7 +104,7 @@ contract RefreshBountyTest is IntegrationBase {
 
     function test_RefreshBounty_NotPaidWhenInsuranceBelowFloor() public {
         // OI qualifies but the fund sits under the $10,000 floor. A fresh pair starts with the
-        // ~$4,500 deployment seed in insurance, so the balance is written down directly (a
+        // ~$4,000 deployment seed in insurance, so the balance is written UP to $9,000 directly (a
         // withheld path transfers nothing, so the unbacked bookkeeping is harmless here).
         _openPosition(alice, bob, true, BAZAAR_SCALE / 2);
         _stdstore.target(address(pair)).sig("pairVault()").depth(5).checked_write(9_000 * BAZAAR_SCALE);

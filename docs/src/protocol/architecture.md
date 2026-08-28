@@ -7,12 +7,12 @@
                     └─────────┬──────────┘
                               │ deploys EIP-1167 clones
                               ▼
- ┌──────────────────┐   ┌────────────────────┐   ┌──────────────────────┐
- │ BazaarSequencer  │◄─►│     BazaarPair     │◄─►│ BazaarPairTerminator │
- │ bonds · volume   │   │ one per market:    │   │ scheduled · cessation│
- │ caps · fraud     │   │ orders · matching  │   │ stale-oracle · vote  │
- │ proofs           │   │ margin · funding   │   │ wind-down paths      │
- └──────────────────┘   │ ADL · insurance    │   └──────────────────────┘
+                        ┌────────────────────┐   ┌──────────────────────┐
+                        │     BazaarPair     │◄─►│ BazaarPairTerminator │
+                        │ one per market:    │   │ scheduled · cessation│
+                        │ book · matching    │   │ stale-oracle · vote  │
+                        │ margin · funding   │   │ wind-down paths      │
+                        │ ADL · insurance    │   └──────────────────────┘
                         └───┬────────────┬───┘
                             │            │
                             ▼            ▼
@@ -22,17 +22,17 @@
                    └──────────────┘  └────────────────┘
 ```
 
-One `BazaarPair` clone = one market. Each clone holds its own order book, positions, collateral ledger, insurance fund, funding state, and lifecycle flags. The factory, sequencer registry, terminator, oracle adapter, and lens are shared protocol-wide singletons. See [Contracts](../reference/contracts.md) for the per-contract API surface.
+One `BazaarPair` clone = one market. Each clone holds its own order book, positions, collateral ledger, insurance fund, funding state, and lifecycle flags. The factory, terminator, oracle adapter, and lens are shared protocol-wide singletons. See [Contracts](../reference/contracts.md) for the per-contract API surface.
 
 ## Code-size strategy
 
 `BazaarPair` would blow past the EIP-170 24 KB limit many times over, so the logic is split three ways:
 
 - **External DELEGATECALL libraries** — deployed once, linked by address, and executed in the pair's storage context: `MatchingEngineLib`, `OrderManagementLib`, `CollateralLib`, `LiquidationLib`, `AdlLib`, `InsuranceVaultLib`, `RiskParamsLib`, `FundingLib`, `TerminationLib`, `MetaTxLib`. Their bytecode does not count toward the pair's limit. All ten carry link references in `BazaarPair` and must be deployed on the target chain and passed as `--libraries` flags before it can be deployed — see [Self-Deployment](../guide/deployment.md).
-- **Inlined internal libraries** — small, hot helpers compiled into callers: `BazaarTypes` (structs/constants), `BucketLib` (solvency math), `VaultHealthLib` (ADL/termination triggers), `MmrSampleLib` (lagged-MMR ring buffer), `BazaarMathLib` (fixed-point + effective prices).
+- **Inlined internal libraries** — small, hot helpers compiled into callers: `BazaarTypes` (structs/constants), `OrderBookLib` (the sorted doubly-linked book lists), `BucketLib` (solvency math), `VaultHealthLib` (ADL/termination triggers), `MmrSampleLib` (lagged-MMR ring buffer), `BazaarMathLib` (fixed-point + effective prices).
 - **`BazaarPairLens`** — computed views (solvency checks, share prices, ADL thresholds, EIP-712 constants) that never needed to be in the pair.
 
-Even split three ways the budget is tight: `BazaarPair` and `MatchingEngineLib` both exceed EIP-170 at the repo's default `optimizer_runs = 220`, so `foundry.toml` compiles that import chain at 150 runs instead (solc treats it as one unit, so restricting the library pulls the pair and factory down with it). The gas cost is modest — `matchBatch` is storage-dominated, where optimizer runs matter least. The limits are enforced as a test (`test/unit/ContractSizeTest.t.sol`, production contracts only) rather than via `forge build --sizes`, whose gate would also fail on test-only harnesses.
+Even split three ways the budget is tight: `BazaarPair` and `MatchingEngineLib` are the two artifacts nearest the EIP-170 ceiling, and `foundry.toml` compiles everything at a single global `optimizer_runs = 150` so the artifact the size gate measures is identical to the artifact that ships. The gas cost is modest — the hot paths (the matching walk, liquidation, settlement) are storage-dominated, where optimizer runs matter least. The limits are enforced as a test (`test/unit/ContractSizeTest.t.sol`, production contracts only) rather than via `forge build --sizes`, whose gate would also fail on test-only harnesses.
 
 ## Units & conventions
 
@@ -47,4 +47,4 @@ Even split three ways the budget is tight: `BazaarPair` and `MatchingEngineLib` 
 
 ## Accounting invariant
 
-The pair tracks two ledgers — `totalCollateralDeposited` (D, sum of every position bucket's collateral) and `insuranceFundBalance` (I). All internal value movements (vault PnL, ADL credits, fee flows) are booked as **I↔D transfers**, never bare credits, so `I + D` always equals the USDC the contract should hold. Every batch, liquidation, ADL execution, and withdrawal re-checks `balanceOf(pair) ≥ I + D` within a 0.1% tolerance; a shortfall triggers autonomous [emergency termination](termination.md). This is the protocol's tamper-evident seal: if value ever leaks, the market freezes into pro-rata withdrawal mode rather than letting a first-mover drain it.
+The pair tracks two ledgers — `totalCollateralDeposited` (D, sum of every position bucket's collateral) and `insuranceFundBalance` (I). All internal value movements (vault PnL, ADL credits, fee flows) are booked as **I↔D transfers**, never bare credits, so `I + D` always equals the USDC the contract should hold. Every matching transaction, liquidation, unload, ADL execution, and withdrawal re-checks `balanceOf(pair) ≥ I + D` within a 0.1% tolerance; a shortfall triggers autonomous [emergency termination](termination.md). This is the protocol's tamper-evident seal: if value ever leaks, the market freezes into pro-rata withdrawal mode rather than letting a first-mover drain it.

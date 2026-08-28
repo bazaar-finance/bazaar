@@ -5,9 +5,10 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import {BazaarTypes} from "./BazaarTypes.sol";
 import {BucketLib} from "./BucketLib.sol";
+import {OrderBookLib} from "./OrderBookLib.sol";
 
 /// @title OrderManagementLib
-/// @notice External library for order creation and cancellation logic.
+/// @notice External library for order creation, cancellation, and expiry cleanup.
 ///         Runs via DELEGATECALL from BazaarPair — has direct storage access.
 library OrderManagementLib {
     using EnumerableSet for EnumerableSet.UintSet;
@@ -17,7 +18,6 @@ library OrderManagementLib {
     uint256 internal constant MIN_ORDER_AMOUNT = BazaarTypes.MIN_ORDER_AMOUNT;
     uint256 internal constant MAX_SLIPPAGE_BP = BazaarTypes.MAX_SLIPPAGE_BP;
     uint64 internal constant MIN_ORDER_LIFETIME_BLOCKS = BazaarTypes.MIN_ORDER_LIFETIME_BLOCKS;
-    uint64 internal constant MARKET_ORDER_LIFETIME_BLOCKS = BazaarTypes.MARKET_ORDER_LIFETIME_BLOCKS;
     uint64 internal constant MAX_ORDER_LIFETIME_BLOCKS = BazaarTypes.MAX_ORDER_LIFETIME_BLOCKS;
     uint64 internal constant NEVER_EXPIRE_BLOCK = BazaarTypes.NEVER_EXPIRE_BLOCK;
 
@@ -32,6 +32,7 @@ library OrderManagementLib {
     error OrderManagementLib__ZeroSize();
     error OrderManagementLib__ZeroLimitPrice();
     error OrderManagementLib__PostOnlyNotAllowed();
+    error OrderManagementLib__InvalidTimeInForce();
     error OrderManagementLib__InvalidSlippage(uint256 maxSlippageBp);
     error OrderManagementLib__ZeroTriggerPrice();
     error OrderManagementLib__StopLimitPriceOnWrongSide();
@@ -42,14 +43,18 @@ library OrderManagementLib {
     error OrderManagementLib__TpSlSizeExceedsPosition(uint256 orderSize, uint256 positionSize);
     error OrderManagementLib__TpSlOrderAlreadyExists();
     error OrderManagementLib__TooManyActiveLimitOrders();
-    error OrderManagementLib__ActiveMarketOrderExists();
 
     // -------------------- External Functions --------------------
 
-    /// @notice Creates a new order and stores it in the orders mapping.
-    /// @dev Expiry is absolute-block based. Caller supplies `params.expirationBlock`
-    ///      which must satisfy: currentBlock + MIN_ORDER_LIFETIME_BLOCKS <= exp <= currentBlock + MAX_ORDER_LIFETIME_BLOCKS.
-    ///      TP/SL orders use NEVER_EXPIRE_BLOCK sentinel; market orders get a short fixed lifetime.
+    /// @notice Creates a new order and stores it in the orders mapping. Matching against the
+    ///         book happens afterwards in MatchingEngineLib.executeArrival — this function only
+    ///         validates and records.
+    /// @dev Expiry is absolute-block based. The caller supplies `spec.expirationBlock`, which
+    ///      must satisfy: currentBlock + MIN_ORDER_LIFETIME_BLOCKS <= exp <= currentBlock +
+    ///      MAX_ORDER_LIFETIME_BLOCKS. TP/SL orders use the NEVER_EXPIRE_BLOCK sentinel. Market
+    ///      orders are terminal within their own transaction (the arrival walk fills them and
+    ///      cancels any remainder), so they are stamped expired-at-creation for every later
+    ///      observer.
     function createOrder(
         mapping(uint256 => BazaarTypes.Order) storage orders,
         mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
@@ -57,69 +62,71 @@ library OrderManagementLib {
         BazaarTypes.CreateOrderParams memory params,
         address caller
     ) external returns (uint256 newNextOrderId) {
-        if (params.size == 0) revert OrderManagementLib__ZeroSize();
+        BazaarTypes.OrderSpec memory spec = params.spec;
+        if (spec.size == 0) revert OrderManagementLib__ZeroSize();
 
-        // Per-user caps: Limit + StopLimit share the userActiveLimitOrders set with cap = 100.
-        // Market is bounded to 1 active per user via positionBuckets[caller].activeMarketOrderId.
+        // Per-user caps: Limit + StopLimit share the userActiveLimitOrders set with cap = 100,
+        // bounding both the exposure-tally iteration and a user's worst-case book footprint.
         // TP/SL are bounded to 1 each per position via takeProfitOrderId/stopLossOrderId.
-        BazaarTypes.OrderType ot = params.orderType;
+        // Market orders need no cap: they never rest and are terminal within their own tx.
+        BazaarTypes.OrderType ot = spec.orderType;
         if (ot == BazaarTypes.OrderType.Limit || ot == BazaarTypes.OrderType.StopLimit) {
             if (userActiveLimitOrders[caller].length() >= BazaarTypes.MAX_ACTIVE_LIMIT_ORDERS_PER_USER) {
                 revert OrderManagementLib__TooManyActiveLimitOrders();
             }
-        } else if (ot == BazaarTypes.OrderType.Market) {
-            uint256 existingId = positionBuckets[caller].activeMarketOrderId;
-            if (existingId != 0) {
-                BazaarTypes.Order storage existing = orders[existingId];
-                bool stillAlive = existing.canceledBlock == 0 && existing.filledBlock == 0
-                    && params.currentBlock <= existing.expiryBlock;
-                if (stillAlive) revert OrderManagementLib__ActiveMarketOrderExists();
-            }
+        }
+
+        // IOC is a Limit-only time-in-force and contradicts post-only (one demands an immediate
+        // taking fill, the other forbids taking at all). Market/StopLoss are IOC by construction
+        // and stops/TP have their own lifecycle, so the flag is meaningless elsewhere.
+        if (spec.isIoc && (ot != BazaarTypes.OrderType.Limit || spec.isPostOnly)) {
+            revert OrderManagementLib__InvalidTimeInForce();
         }
 
         uint256 currentPrice = params.currentPrice;
-        uint256 orderTriggerPrice = params.triggerPrice;
-        uint256 orderLimitPrice = params.limitPrice;
-        uint256 orderMaxSlippageBp = params.maxSlippageBp;
+        uint256 orderTriggerPrice = spec.triggerPrice;
+        uint256 orderLimitPrice = spec.limitPrice;
+        uint256 orderMaxSlippageBp = spec.maxSlippageBp;
 
-        if (params.orderType == BazaarTypes.OrderType.Limit) {
-            if (params.limitPrice == 0) revert OrderManagementLib__ZeroLimitPrice();
+        if (ot == BazaarTypes.OrderType.Limit) {
+            if (spec.limitPrice == 0) revert OrderManagementLib__ZeroLimitPrice();
             orderMaxSlippageBp = 0;
             orderTriggerPrice = 0;
-        } else if (params.orderType == BazaarTypes.OrderType.Market) {
-            if (params.isPostOnly) revert OrderManagementLib__PostOnlyNotAllowed();
-            if (params.maxSlippageBp == 0 || params.maxSlippageBp > MAX_SLIPPAGE_BP) {
-                revert OrderManagementLib__InvalidSlippage(params.maxSlippageBp);
+        } else if (ot == BazaarTypes.OrderType.Market) {
+            if (spec.isPostOnly) revert OrderManagementLib__PostOnlyNotAllowed();
+            if (spec.maxSlippageBp == 0 || spec.maxSlippageBp > MAX_SLIPPAGE_BP) {
+                revert OrderManagementLib__InvalidSlippage(spec.maxSlippageBp);
             }
             orderTriggerPrice = currentPrice;
             orderLimitPrice = 0;
-        } else if (params.orderType == BazaarTypes.OrderType.StopLimit) {
-            if (params.isPostOnly) revert OrderManagementLib__PostOnlyNotAllowed();
-            if (params.triggerPrice == 0) revert OrderManagementLib__ZeroTriggerPrice();
-            if (params.limitPrice == 0) revert OrderManagementLib__ZeroLimitPrice();
-            // The limit must be on the fillable side of the trigger. The trigger is re-evaluated
-            // against the settlement price every batch (buy fires at price >= trigger, sell at
-            // price <= trigger), so a buy with limit < trigger (or a sell with limit > trigger)
-            // can never fill: whenever it is triggered the limit is on the wrong side of the
-            // market, and whenever the limit would be marketable the trigger is no longer met.
-            // Reject these dead configs at creation rather than let them sit consuming exposure.
-            if (params.isLong && params.limitPrice < params.triggerPrice) {
+        } else if (ot == BazaarTypes.OrderType.StopLimit) {
+            if (spec.isPostOnly) revert OrderManagementLib__PostOnlyNotAllowed();
+            if (spec.triggerPrice == 0) revert OrderManagementLib__ZeroTriggerPrice();
+            if (spec.limitPrice == 0) revert OrderManagementLib__ZeroLimitPrice();
+            // The limit must be on the fillable side of the trigger. The trigger is evaluated
+            // against a fresh oracle price (immediately at creation, or by executeTriggeredOrders
+            // later; buy fires at price >= trigger, sell at price <= trigger), so a buy with
+            // limit < trigger (or a sell with limit > trigger) can never fill: whenever it is
+            // triggered the limit is on the wrong side of the market, and whenever the limit
+            // would be marketable the trigger is no longer met. Reject these dead configs at
+            // creation rather than let them sit consuming exposure.
+            if (spec.isLong && spec.limitPrice < spec.triggerPrice) {
                 revert OrderManagementLib__StopLimitPriceOnWrongSide();
             }
-            if (!params.isLong && params.limitPrice > params.triggerPrice) {
+            if (!spec.isLong && spec.limitPrice > spec.triggerPrice) {
                 revert OrderManagementLib__StopLimitPriceOnWrongSide();
             }
             orderMaxSlippageBp = 0;
-        } else if (params.orderType == BazaarTypes.OrderType.TakeProfit) {
-            if (params.isPostOnly) revert OrderManagementLib__PostOnlyNotAllowed();
-            if (params.limitPrice == 0) revert OrderManagementLib__ZeroLimitPrice();
+        } else if (ot == BazaarTypes.OrderType.TakeProfit) {
+            if (spec.isPostOnly) revert OrderManagementLib__PostOnlyNotAllowed();
+            if (spec.limitPrice == 0) revert OrderManagementLib__ZeroLimitPrice();
             orderMaxSlippageBp = 0;
             orderTriggerPrice = 0;
-        } else if (params.orderType == BazaarTypes.OrderType.StopLoss) {
-            if (params.isPostOnly) revert OrderManagementLib__PostOnlyNotAllowed();
-            if (params.triggerPrice == 0) revert OrderManagementLib__ZeroTriggerPrice();
-            if (params.maxSlippageBp == 0 || params.maxSlippageBp > MAX_SLIPPAGE_BP) {
-                revert OrderManagementLib__InvalidSlippage(params.maxSlippageBp);
+        } else if (ot == BazaarTypes.OrderType.StopLoss) {
+            if (spec.isPostOnly) revert OrderManagementLib__PostOnlyNotAllowed();
+            if (spec.triggerPrice == 0) revert OrderManagementLib__ZeroTriggerPrice();
+            if (spec.maxSlippageBp == 0 || spec.maxSlippageBp > MAX_SLIPPAGE_BP) {
+                revert OrderManagementLib__InvalidSlippage(spec.maxSlippageBp);
             }
             orderLimitPrice = 0;
         } else {
@@ -130,7 +137,7 @@ library OrderManagementLib {
         // Use limitPrice for Limit orders, triggerPrice for others, fallback to currentPrice for Market orders
         uint256 refPriceForMinCheck =
             orderLimitPrice > 0 ? orderLimitPrice : (orderTriggerPrice > 0 ? orderTriggerPrice : currentPrice);
-        uint256 orderNotionalValue = Math.mulDiv(params.size, refPriceForMinCheck, BazaarTypes.BAZAAR_SCALE);
+        uint256 orderNotionalValue = Math.mulDiv(spec.size, refPriceForMinCheck, BazaarTypes.BAZAAR_SCALE);
         if (orderNotionalValue < MIN_ORDER_AMOUNT) {
             // Full-close exemption: an opposite-direction order for exactly the whole position is
             // always creatable, even under the floor — otherwise a position whose notional drifted
@@ -138,18 +145,17 @@ library OrderManagementLib {
             // reduces stay floored so sub-minimum residuals can't be minted deliberately.
             BazaarTypes.PositionBucket storage closeBucket = positionBuckets[caller];
             bool isFullClose =
-                closeBucket.size > 0 && closeBucket.isLong != params.isLong && params.size == closeBucket.size;
+                closeBucket.size > 0 && closeBucket.isLong != spec.isLong && spec.size == closeBucket.size;
             if (!isFullClose) revert OrderManagementLib__NotionalBelowMinimum(orderNotionalValue, MIN_ORDER_AMOUNT);
         }
 
         // TP/SL orders require an existing position and opposite direction (to close)
-        if (params.orderType == BazaarTypes.OrderType.TakeProfit || params.orderType == BazaarTypes.OrderType.StopLoss)
-        {
+        if (ot == BazaarTypes.OrderType.TakeProfit || ot == BazaarTypes.OrderType.StopLoss) {
             BazaarTypes.PositionBucket memory bucket = positionBuckets[caller];
             if (bucket.size == 0) revert OrderManagementLib__NoPositionForTpSl();
-            if (bucket.isLong == params.isLong) revert OrderManagementLib__TpSlMustBeOppositeDirection();
-            if (params.size > bucket.size) {
-                revert OrderManagementLib__TpSlSizeExceedsPosition(params.size, bucket.size);
+            if (bucket.isLong == spec.isLong) revert OrderManagementLib__TpSlMustBeOppositeDirection();
+            if (spec.size > bucket.size) {
+                revert OrderManagementLib__TpSlSizeExceedsPosition(spec.size, bucket.size);
             }
         }
 
@@ -157,32 +163,28 @@ library OrderManagementLib {
             positionBuckets[caller], currentPrice, params.currentFundingIndex, params.marginReqs
         );
 
-        if (params.orderType != BazaarTypes.OrderType.TakeProfit && params.orderType != BazaarTypes.OrderType.StopLoss)
-        {
+        if (ot != BazaarTypes.OrderType.TakeProfit && ot != BazaarTypes.OrderType.StopLoss) {
             BazaarTypes.PositionBucket memory bucket = positionBuckets[caller];
 
             uint256 executionPrice;
-            if (params.orderType == BazaarTypes.OrderType.Limit) {
+            if (ot == BazaarTypes.OrderType.Limit) {
                 executionPrice = orderLimitPrice;
-            } else if (params.orderType == BazaarTypes.OrderType.Market) {
-                // Both sides margin at the upper slippage bound. The fill price is the maker's, so
-                // it isn't known here — maxSlippageBp only states how far from currentPrice the
-                // order will execute, and it doubles as the market-order priority key in the
-                // matching walk, where a wider tolerance sorts ahead. Pricing a short at
-                // currentPrice * (BP_SCALE - slip) would let maximum slippage buy that queue
-                // position for less required margin than a tight tolerance; charging the upper
-                // bound on both sides keeps a wider tolerance strictly more expensive.
+            } else if (ot == BazaarTypes.OrderType.Market) {
+                // Both sides margin at the upper slippage bound. The fill price is the maker's,
+                // so it isn't known here — maxSlippageBp only states how far from currentPrice
+                // the walk may execute. Margining the worst-case notional on both sides keeps a
+                // wider tolerance strictly more expensive than a tight one.
                 executionPrice = currentPrice * (BazaarTypes.BP_SCALE + orderMaxSlippageBp) / BazaarTypes.BP_SCALE;
             } else {
                 executionPrice = orderTriggerPrice > orderLimitPrice ? orderTriggerPrice : orderLimitPrice;
             }
 
-            uint256 orderNotional = Math.mulDiv(params.size, executionPrice, BazaarTypes.BAZAAR_SCALE);
+            uint256 orderNotional = Math.mulDiv(spec.size, executionPrice, BazaarTypes.BAZAAR_SCALE);
 
             uint256 newTotalNotional;
             if (bucket.size == 0) {
                 newTotalNotional = orderNotional;
-            } else if (bucket.isLong == params.isLong) {
+            } else if (bucket.isLong == spec.isLong) {
                 newTotalNotional = currentState.currentNotional + orderNotional;
             } else {
                 if (orderNotional > currentState.currentNotional) {
@@ -194,9 +196,9 @@ library OrderManagementLib {
 
             {
                 uint256 posNotional = newTotalNotional;
-                bool posIsLong = bucket.size == 0 ? params.isLong : bucket.isLong;
-                if (bucket.size > 0 && bucket.isLong != params.isLong && orderNotional > currentState.currentNotional) {
-                    posIsLong = params.isLong;
+                bool posIsLong = bucket.size == 0 ? spec.isLong : bucket.isLong;
+                if (bucket.size > 0 && bucket.isLong != spec.isLong && orderNotional > currentState.currentNotional) {
+                    posIsLong = spec.isLong;
                 }
 
                 uint256 sameDirectionExposure =
@@ -222,22 +224,21 @@ library OrderManagementLib {
         }
 
         // Block-based expiration.
-        // TP/SL never expire; market orders get a fixed short lifetime;
-        // user-supplied expiry for Limit/StopLimit must fall within [min, max] window.
+        // TP/SL never expire; market orders are terminal in their own tx; user-supplied expiry
+        // for Limit/StopLimit must fall within [min, max] window.
         uint64 expiryBlock;
         uint64 cb = params.currentBlock;
-        if (params.orderType == BazaarTypes.OrderType.TakeProfit || params.orderType == BazaarTypes.OrderType.StopLoss)
-        {
+        if (ot == BazaarTypes.OrderType.TakeProfit || ot == BazaarTypes.OrderType.StopLoss) {
             expiryBlock = NEVER_EXPIRE_BLOCK;
-        } else if (params.orderType == BazaarTypes.OrderType.Market) {
-            expiryBlock = cb + MARKET_ORDER_LIFETIME_BLOCKS;
+        } else if (ot == BazaarTypes.OrderType.Market) {
+            expiryBlock = cb;
         } else {
             uint64 minExp = cb + MIN_ORDER_LIFETIME_BLOCKS;
             uint64 maxExp = cb + MAX_ORDER_LIFETIME_BLOCKS;
-            if (params.expirationBlock < minExp) {
-                revert OrderManagementLib__InvalidOrderExpiration(params.expirationBlock);
+            if (spec.expirationBlock < minExp) {
+                revert OrderManagementLib__InvalidOrderExpiration(spec.expirationBlock);
             }
-            expiryBlock = params.expirationBlock > maxExp ? maxExp : params.expirationBlock;
+            expiryBlock = spec.expirationBlock > maxExp ? maxExp : spec.expirationBlock;
         }
 
         // create order
@@ -246,16 +247,16 @@ library OrderManagementLib {
 
         orders[orderId] = BazaarTypes.Order({
             creator: caller,
-            integrator: params.integrator,
+            integrator: spec.integrator,
             triggerPrice: orderTriggerPrice,
             limitPrice: orderLimitPrice,
             maxSlippageBp: orderMaxSlippageBp,
-            size: params.size,
+            size: spec.size,
             filledSize: 0,
-            orderType: params.orderType,
-            isLong: params.isLong,
-            isPostOnly: params.isPostOnly,
-            isIoc: false,
+            orderType: ot,
+            isLong: spec.isLong,
+            isPostOnly: spec.isPostOnly,
+            isIoc: spec.isIoc,
             inBook: false,
             creationBlock: cb,
             expiryBlock: expiryBlock,
@@ -265,20 +266,17 @@ library OrderManagementLib {
             nextInBook: 0
         });
 
-        if (params.orderType == BazaarTypes.OrderType.TakeProfit) {
+        if (ot == BazaarTypes.OrderType.TakeProfit) {
             if (positionBuckets[caller].takeProfitOrderId != 0) revert OrderManagementLib__TpSlOrderAlreadyExists();
             positionBuckets[caller].takeProfitOrderId = orderId;
-        } else if (params.orderType == BazaarTypes.OrderType.StopLoss) {
+        } else if (ot == BazaarTypes.OrderType.StopLoss) {
             if (positionBuckets[caller].stopLossOrderId != 0) revert OrderManagementLib__TpSlOrderAlreadyExists();
             positionBuckets[caller].stopLossOrderId = orderId;
-        } else if (params.orderType == BazaarTypes.OrderType.Market) {
-            // 1-active-market cap (already validated above; this records the slot)
-            positionBuckets[caller].activeMarketOrderId = orderId;
         }
 
         // Limit + StopLimit are tracked together in userActiveLimitOrders for the 100-order cap
         // and for exposure tally during deposit/withdraw margin checks.
-        if (params.orderType == BazaarTypes.OrderType.Limit || params.orderType == BazaarTypes.OrderType.StopLimit) {
+        if (ot == BazaarTypes.OrderType.Limit || ot == BazaarTypes.OrderType.StopLimit) {
             userActiveLimitOrders[caller].add(orderId);
         }
 
@@ -288,10 +286,10 @@ library OrderManagementLib {
             caller,
             BazaarTypes.OrderUpdatePayload({
                 action: BazaarTypes.OrderAction.Created,
-                orderType: params.orderType,
-                isLong: params.isLong,
-                isPostOnly: params.isPostOnly,
-                size: params.size,
+                orderType: ot,
+                isLong: spec.isLong,
+                isPostOnly: spec.isPostOnly,
+                size: spec.size,
                 filledSize: 0,
                 triggerPrice: orderTriggerPrice,
                 limitPrice: orderLimitPrice,
@@ -304,11 +302,14 @@ library OrderManagementLib {
         );
     }
 
-    /// @notice Cancel an order — callable by order creator via BazaarPair
+    /// @notice Cancel an order — callable by order creator via BazaarPair. Unlinks it from the
+    ///         book in the same write, so a canceled order is out of the matching walk's reach
+    ///         within its own transaction.
     function cancelOrder(
         mapping(uint256 => BazaarTypes.Order) storage orders,
         mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
         mapping(address => EnumerableSet.UintSet) storage userActiveLimitOrders,
+        BazaarTypes.OrderBook storage book,
         uint256 orderId,
         bytes32 pairId,
         uint64 currentBlock
@@ -321,6 +322,7 @@ library OrderManagementLib {
         if (currentBlock > order.expiryBlock) revert OrderManagementLib__OrderAlreadyExpired(orderId);
 
         order.canceledBlock = currentBlock;
+        OrderBookLib.unlink(orders, book, orderId);
 
         // Clear position-bucket order-slot pointer for slot-bound types
         BazaarTypes.OrderType ot = order.orderType;
@@ -328,8 +330,6 @@ library OrderManagementLib {
             positionBuckets[order.creator].takeProfitOrderId = 0;
         } else if (ot == BazaarTypes.OrderType.StopLoss) {
             positionBuckets[order.creator].stopLossOrderId = 0;
-        } else if (ot == BazaarTypes.OrderType.Market) {
-            positionBuckets[order.creator].activeMarketOrderId = 0;
         }
 
         // Remove from active limit orders set (Limit + StopLimit share this set)
@@ -360,11 +360,15 @@ library OrderManagementLib {
     }
 
     /// @notice Sweeps a user's active-limit-order set: drops expired/canceled/filled entries
-    ///         (cancel-emitting expired ones) and totals the remaining directional exposure.
-    /// @dev Called via BazaarPair's _cleanupExpiredLimitOrders wrapper.
+    ///         (cancel-emitting and unlinking expired ones) and totals the remaining directional
+    ///         exposure.
+    /// @dev Called via BazaarPair's _cleanupExpiredLimitOrders wrapper. Canceled/filled entries
+    ///      were already unlinked at their terminal write; only the expired-but-live case still
+    ///      holds a book position here.
     function cleanupExpiredLimitOrders(
         EnumerableSet.UintSet storage orderSet,
         mapping(uint256 => BazaarTypes.Order) storage orders,
+        BazaarTypes.OrderBook storage book,
         bytes32 pairId,
         address user,
         uint64 currentBlock
@@ -382,6 +386,7 @@ library OrderManagementLib {
             if (isExpired || isCanceled || isFilled) {
                 if (isExpired && !isCanceled && !isFilled) {
                     order.canceledBlock = currentBlock;
+                    OrderBookLib.unlink(orders, book, orderId);
                     emit BazaarTypes.OrderUpdated(
                         pairId,
                         orderId,
@@ -416,6 +421,56 @@ library OrderManagementLib {
                 }
                 i++;
             }
+        }
+    }
+
+    /// @notice Permissionless expiry janitor: cancels + unlinks any of the given orders that
+    ///         have expired without reaching a terminal state. Non-expired, already-terminal,
+    ///         and unknown ids are skipped silently so racing keepers never revert each other.
+    /// @dev Expired orders are otherwise removed lazily — by the matching walk on contact or by
+    ///      the owner's sweeps during create/withdraw — so this exists to let anyone clear dead
+    ///      nodes from the book front proactively. Only Limit/StopLimit can expire (TP/SL carry
+    ///      the never-expire sentinel; Market orders are terminal in their creation tx), so the
+    ///      set removal below covers every sweepable type.
+    function sweepExpired(
+        mapping(uint256 => BazaarTypes.Order) storage orders,
+        mapping(address => EnumerableSet.UintSet) storage userActiveLimitOrders,
+        BazaarTypes.OrderBook storage book,
+        uint256[] calldata orderIds,
+        bytes32 pairId,
+        uint64 currentBlock
+    ) external {
+        for (uint256 i; i < orderIds.length; ++i) {
+            uint256 orderId = orderIds[i];
+            BazaarTypes.Order storage order = orders[orderId];
+            if (order.creator == address(0)) continue;
+            if (order.canceledBlock != 0 || order.filledBlock != 0) continue;
+            if (currentBlock <= order.expiryBlock) continue;
+
+            order.canceledBlock = currentBlock;
+            OrderBookLib.unlink(orders, book, orderId);
+            userActiveLimitOrders[order.creator].remove(orderId);
+
+            emit BazaarTypes.OrderUpdated(
+                pairId,
+                orderId,
+                order.creator,
+                BazaarTypes.OrderUpdatePayload({
+                    action: BazaarTypes.OrderAction.Canceled,
+                    orderType: order.orderType,
+                    isLong: order.isLong,
+                    isPostOnly: order.isPostOnly,
+                    size: order.size,
+                    filledSize: order.filledSize,
+                    triggerPrice: order.triggerPrice,
+                    limitPrice: order.limitPrice,
+                    maxSlippageBp: order.maxSlippageBp,
+                    canceledBlock: currentBlock,
+                    filledBlock: order.filledBlock,
+                    expiryBlock: order.expiryBlock,
+                    creationBlock: order.creationBlock
+                })
+            );
         }
     }
 

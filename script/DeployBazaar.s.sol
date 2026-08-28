@@ -7,7 +7,6 @@ import {BazaarFactory} from "../src/BazaarFactory.sol";
 import {BazaarPair} from "../src/BazaarPair.sol";
 import {BazaarOracle} from "../src/BazaarOracle.sol";
 import {BazaarPairLens} from "../src/BazaarPairLens.sol";
-import {BazaarSequencer} from "../src/BazaarSequencer.sol";
 import {BazaarPairTerminator} from "../src/BazaarPairTerminator.sol";
 import {HelperConfig} from "./HelperConfig.s.sol";
 
@@ -90,16 +89,13 @@ contract DeployBazaar is Script {
         BazaarPair pairImplementation = new BazaarPair();
         console.log("BazaarPair implementation:", address(pairImplementation));
 
-        // 2. Deploy BazaarSequencer + BazaarPairTerminator against the CREATE-predicted factory
-        //    address (their `factory` fields are immutable). Deploying them inside the factory
-        //    constructor would push its initcode past the EIP-3860 limit. The factory constructor
-        //    re-checks the wiring on-chain (Factory__WiringMismatch), so a wrong prediction
-        //    cannot deploy a mis-wired system — it just reverts.
+        // 2. Deploy BazaarPairTerminator against the CREATE-predicted factory address (its
+        //    `factory` field is immutable). Deploying it inside the factory constructor would
+        //    push the initcode past the EIP-3860 limit. The factory constructor re-checks the
+        //    wiring on-chain (Factory__WiringMismatch), so a wrong prediction cannot deploy a
+        //    mis-wired system — it just reverts.
         (, address broadcaster,) = vm.readCallers();
-        address predictedFactory = vm.computeCreateAddress(broadcaster, vm.getNonce(broadcaster) + 2);
-
-        BazaarSequencer sequencer = new BazaarSequencer(usdcContract, predictedFactory);
-        console.log("BazaarSequencer:         ", address(sequencer));
+        address predictedFactory = vm.computeCreateAddress(broadcaster, vm.getNonce(broadcaster) + 1);
 
         BazaarPairTerminator pairTerminator = new BazaarPairTerminator(predictedFactory);
         console.log("BazaarPairTerminator:    ", address(pairTerminator));
@@ -112,7 +108,6 @@ contract DeployBazaar is Script {
             bugBountyAddress,
             optimisticOracleV3,
             address(pairImplementation),
-            address(sequencer),
             address(pairTerminator),
             UMA_IDENTIFIER
         );

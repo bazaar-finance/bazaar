@@ -7,12 +7,14 @@ import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
 /// @notice Drives OrderManagementLib.cancelOrder over real storage: order map, position buckets,
-///         and the active-limit-order set. Covers slot-pointer clearing, set removal, and reverts.
+///         the active-limit-order set, and the resting order book. Covers slot-pointer clearing,
+///         set removal, book unlinking, and reverts.
 contract OrderCancelHarness {
     using EnumerableSet for EnumerableSet.UintSet;
     mapping(uint256 => BazaarTypes.Order) internal orders;
     mapping(address => BazaarTypes.PositionBucket) internal positionBuckets;
     mapping(address => EnumerableSet.UintSet) internal userActiveLimitOrders;
+    BazaarTypes.OrderBook internal book;
 
     function seed(uint256 id, BazaarTypes.Order calldata o) external {
         orders[id] = o;
@@ -23,13 +25,23 @@ contract OrderCancelHarness {
             positionBuckets[o.creator].takeProfitOrderId = id;
         } else if (ot == BazaarTypes.OrderType.StopLoss) {
             positionBuckets[o.creator].stopLossOrderId = id;
-        } else if (ot == BazaarTypes.OrderType.Market) {
-            positionBuckets[o.creator].activeMarketOrderId = id;
+        }
+    }
+
+    /// @dev Installs a seeded order (inBook = true, prev/next already set in the literal) as a
+    ///      side's head so cancel can exercise the unlink path.
+    function setBookHead(bool bid, uint64 head, uint64 count) external {
+        if (bid) {
+            book.bidHead = head;
+            book.bidCount = count;
+        } else {
+            book.askHead = head;
+            book.askCount = count;
         }
     }
 
     function cancel(uint256 id, bytes32 pid, uint64 cb) external {
-        OrderManagementLib.cancelOrder(orders, positionBuckets, userActiveLimitOrders, id, pid, cb);
+        OrderManagementLib.cancelOrder(orders, positionBuckets, userActiveLimitOrders, book, id, pid, cb);
     }
 
     function canceledBlock(uint256 id) external view returns (uint64) {
@@ -48,8 +60,12 @@ contract OrderCancelHarness {
         return positionBuckets[u].stopLossOrderId;
     }
 
-    function mktId(address u) external view returns (uint256) {
-        return positionBuckets[u].activeMarketOrderId;
+    function inBook(uint256 id) external view returns (bool) {
+        return orders[id].inBook;
+    }
+
+    function bookState() external view returns (uint64 bidHead, uint64 askHead, uint64 bidCount, uint64 askCount) {
+        return (book.bidHead, book.askHead, book.bidCount, book.askCount);
     }
 }
 
@@ -97,10 +113,21 @@ contract OrderCancelTest is Test {
         assertEq(h.slId(alice), 0);
     }
 
-    function test_cancelMarket_clearsSlotPointer() public {
-        h.seed(5, _order(BazaarTypes.OrderType.Market, 1000));
+    function test_cancelRestingLimit_unlinksFromBook() public {
+        BazaarTypes.Order memory o = _order(BazaarTypes.OrderType.Limit, 1000);
+        o.isLong = true; // bid side
+        o.inBook = true; // sole resting node: prevInBook/nextInBook stay 0
+        h.seed(5, o);
+        h.setBookHead(true, 5, 1);
+
         h.cancel(5, PID, 10);
-        assertEq(h.mktId(alice), 0);
+
+        assertEq(h.canceledBlock(5), 10);
+        assertFalse(h.inBook(5), "membership flag cleared");
+        (uint64 bidHead,, uint64 bidCount,) = h.bookState();
+        assertEq(bidHead, 0, "bid head cleared");
+        assertEq(bidCount, 0, "bid count decremented");
+        assertFalse(h.isActiveLimit(alice, 5), "removed from active set");
     }
 
     function test_cancel_orderNotFoundReverts() public {

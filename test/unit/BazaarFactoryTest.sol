@@ -6,7 +6,6 @@ import {DeployBazaar} from "../../script/DeployBazaar.s.sol";
 import {HelperConfig} from "../../script/HelperConfig.s.sol";
 import {BazaarFactory} from "../../src/BazaarFactory.sol";
 import {BazaarOracle} from "../../src/BazaarOracle.sol";
-import {BazaarSequencer} from "../../src/BazaarSequencer.sol";
 import {BazaarPairLens} from "../../src/BazaarPairLens.sol";
 import {BazaarPairTerminator} from "../../src/BazaarPairTerminator.sol";
 import {BazaarPair} from "../../src/BazaarPair.sol";
@@ -39,9 +38,8 @@ contract BazaarFactoryTest is Test {
     // Core contracts
     BazaarFactory public factory;
 
-    // Sub-contracts deployed by factory
+    // Sub-contracts referenced by the factory
     BazaarOracle public oracle;
-    BazaarSequencer public sequencer;
     BazaarPairLens public lens;
     BazaarPairTerminator public pairTerminator;
 
@@ -72,7 +70,6 @@ contract BazaarFactoryTest is Test {
 
         // Store sub-contract references
         oracle = factory.oracle();
-        sequencer = factory.sequencer();
         lens = factory.lens();
         pairTerminator = factory.pairTerminator();
 
@@ -806,8 +803,7 @@ contract BazaarFactoryTest is Test {
         assertTrue(pairAddr != address(0));
         assertTrue(factory.isPair(pairAddr));
 
-        // Verify pair is registered in sequencer and terminator
-        assertTrue(sequencer.isPair(pairAddr));
+        // Verify pair is registered in the terminator
         assertTrue(pairTerminator.isPair(pairAddr));
 
         // Verify seed USDC was transferred to pair
@@ -1128,7 +1124,6 @@ contract BazaarFactoryTest is Test {
         assertEq(address(pair.oracle()), address(oracle));
         assertTrue(pair.isContinuouslyTraded());
         assertEq(pair.auxState().bugBountyAddress, bugBountyAddress);
-        assertEq(address(pair.sequencerContract()), address(sequencer));
     }
 
     function testExecutePairDeployment_MultiplePairsTracked() public {
@@ -1274,45 +1269,19 @@ contract BazaarFactoryTest is Test {
         assertEq(factory.pairsCount(), 1);
     }
 
-    // ---------------- constructor wiring (sequencer/terminator deployed first) ----------------
+    // ---------------- constructor wiring (terminator deployed first) ----------------
 
-    /// @notice The deploy script bakes a CREATE-predicted factory address into the sequencer's
-    ///         and terminator's immutable `factory` fields; the factory constructor re-verifies
-    ///         both point back at it. Deployed system must be self-consistent.
+    /// @notice The deploy script bakes a CREATE-predicted factory address into the terminator's
+    ///         immutable `factory` field; the factory constructor re-verifies it points back at
+    ///         itself. Deployed system must be self-consistent.
     function test_wiring_DeployedSystemIsSelfConsistent() public view {
-        assertEq(sequencer.factory(), address(factory), "sequencer wired to factory");
         assertEq(pairTerminator.factory(), address(factory), "terminator wired to factory");
     }
 
-    /// @notice A factory constructed against a sequencer that points at a DIFFERENT factory
+    /// @notice A factory constructed against a terminator that points at a DIFFERENT factory
     ///         address (bad CREATE prediction, wrong args, hand-deploy) must be unconstructable.
-    function test_wiring_RevertsOnMisWiredSequencer() public {
-        MockUSDC u = new MockUSDC();
-        address wrongFactory = makeAddr("wrongFactory");
-        BazaarSequencer s = new BazaarSequencer(address(u), wrongFactory);
-        BazaarPairTerminator t = new BazaarPairTerminator(wrongFactory);
-
-        vm.expectRevert(BazaarFactory.Factory__WiringMismatch.selector);
-        new BazaarFactory(
-            address(u),
-            makeAddr("oracle"),
-            makeAddr("lens"),
-            makeAddr("bounty"),
-            makeAddr("oo"),
-            makeAddr("impl"),
-            address(s),
-            address(t),
-            bytes32("ASSERT_TRUTH2")
-        );
-    }
-
-    /// @notice Same for the terminator alone: sequencer correctly wired, terminator not.
     function test_wiring_RevertsOnMisWiredTerminator() public {
         MockUSDC u = new MockUSDC();
-        // Predict THIS test's next-next CREATE address the same way the script does:
-        // nonce+2 because the sequencer and terminator deploys consume two nonces first.
-        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 2);
-        BazaarSequencer s = new BazaarSequencer(address(u), predicted);
         BazaarPairTerminator t = new BazaarPairTerminator(makeAddr("wrongFactory"));
 
         vm.expectRevert(BazaarFactory.Factory__WiringMismatch.selector);
@@ -1323,7 +1292,6 @@ contract BazaarFactoryTest is Test {
             makeAddr("bounty"),
             makeAddr("oo"),
             makeAddr("impl"),
-            address(s),
             address(t),
             bytes32("ASSERT_TRUTH2")
         );
@@ -1337,8 +1305,10 @@ contract BazaarFactoryTest is Test {
         MockOptimisticOracleV3 oo3 = new MockOptimisticOracleV3(address(u), 7200);
         oo3.setIdentifierSupported("DEAD_ID", false);
 
-        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 2);
-        BazaarSequencer s = new BazaarSequencer(address(u), predicted);
+        // Predict THIS test's next CREATE address the same way the script does: nonce+1 because
+        // the terminator deploy consumes one nonce first. The wiring check runs before the
+        // whitelist gate, so the terminator must be correctly wired for this test to reach it.
+        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
         BazaarPairTerminator t = new BazaarPairTerminator(predicted);
 
         vm.expectRevert(
@@ -1351,7 +1321,6 @@ contract BazaarFactoryTest is Test {
             makeAddr("bounty"),
             address(oo3),
             makeAddr("impl"),
-            address(s),
             address(t),
             bytes32("DEAD_ID")
         );
@@ -1415,8 +1384,8 @@ contract BazaarFactoryTest is Test {
         MockOptimisticOracleV3 oo3 = new MockOptimisticOracleV3(address(u), 7200);
         // Deliberately left whitelisted: only the ASSERT_TRUTH rule can reject this.
 
-        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 2);
-        BazaarSequencer s = new BazaarSequencer(address(u), predicted);
+        // nonce+1: the terminator deploy consumes one nonce before the factory's CREATE.
+        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
         BazaarPairTerminator t = new BazaarPairTerminator(predicted);
 
         vm.expectRevert(
@@ -1429,7 +1398,6 @@ contract BazaarFactoryTest is Test {
             makeAddr("bounty"),
             address(oo3),
             makeAddr("impl"),
-            address(s),
             address(t),
             bytes32("EURUSD")
         );

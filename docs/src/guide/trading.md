@@ -12,13 +12,13 @@ A practical guide to trading on Bazaar. Plain language first; every section link
 
 | You want to… | Use | Behavior |
 |---|---|---|
-| Fill now at market | `Market` | fills against resting limits at up to your slippage cap (max 5%); lives ~3 seconds; one at a time |
+| Fill now at market | `Market` | fills immediately against resting limits at up to your slippage cap (max 5%); never rests — whatever can't fill in your own transaction is canceled |
 | Rest at your price | `Limit` | sits on the book until filled, canceled, or expired (up to ~1 year); `postOnly` guarantees you're the maker |
 | Enter on a breakout | `StopLimit` | arms when price crosses your trigger, then acts as a limit |
 | Lock in profit | `TakeProfit` | reduce-only limit against your position; one per position |
 | Cap your loss | `StopLoss` | reduce-only market-style close when price crosses your trigger; one per position |
 
-Minimum order: **$5** notional (closing your whole position is always allowed). Stops trigger on the *oracle* price of the batch, so a sequencer can't fire your stop early.
+Minimum order: **$5** notional (closing your whole position is always allowed). Stops are fired by permissionless keepers, but only against a *proven, fresh oracle* price — a keeper cannot choose the price that triggers you, only prove the one Pyth published. The keeper who fires your stop earns a flat **$0.25** tip from your collateral, like a trading fee.
 
 ## Leverage & staying solvent
 
@@ -38,7 +38,7 @@ Honest list, in increasing order of severity:
 
 ## Fees you'll pay
 
-Roughly: **fractions of a basis point plus $0.03 per side**. Makers pay ~1 bp all-in; takers pay a utilization-priced sequencer fee (0.75–3.75 bp) plus an insurance fee that rises when the market's backstop is thin — and *closing* risk is always cheaper than opening it. Exact table: [Fees](../protocol/fees.md).
+Roughly: **a fraction of a basis point per side in a calm, well-capitalized market**. Makers pay a flat 0.5 bp insurance fee; takers pay a dynamic insurance fee (0.5–2 bp base) that rises when the market's backstop is thin and discounts to zero when it's overfull — and *closing* risk is always cheaper than opening it. Orders placed through a frontend may add 0.25 bp per side for its [integrator](integrators.md). Exact table: [Fees](../protocol/fees.md).
 
 ## Stocks & FX after hours
 

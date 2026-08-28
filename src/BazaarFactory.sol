@@ -10,7 +10,6 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {BazaarPair} from "./BazaarPair.sol";
 import {BazaarTypes} from "./libraries/BazaarTypes.sol";
 import {BazaarOracle} from "./BazaarOracle.sol";
-import {BazaarSequencer} from "./BazaarSequencer.sol";
 import {BazaarPairLens} from "./BazaarPairLens.sol";
 import {BazaarPairTerminator} from "./BazaarPairTerminator.sol";
 import {
@@ -204,7 +203,6 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
     BazaarOracle public immutable oracle;
     address public immutable bugBountyAddress;
     address public immutable pairImplementation;
-    BazaarSequencer public sequencer;
     BazaarPairLens public immutable lens;
     BazaarPairTerminator public pairTerminator;
 
@@ -264,10 +262,10 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
     EnumerableSet.AddressSet private _allPairs;
 
     // -------------------- Constructor --------------------
-    /// @dev `_sequencer` and `_pairTerminator` are deployed by the deploy script with THIS
-    ///      factory's (CREATE-predicted) address baked into their immutable `factory` fields —
-    ///      deploying them inline here would push the factory's initcode past EIP-3860.
-    ///      The script asserts the prediction matched after construction.
+    /// @dev `_pairTerminator` is deployed by the deploy script with THIS factory's
+    ///      (CREATE-predicted) address baked into its immutable `factory` field — deploying it
+    ///      inline here would push the factory's initcode past EIP-3860. The script asserts the
+    ///      prediction matched after construction.
     constructor(
         address _usdc,
         address _oracle,
@@ -275,7 +273,6 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
         address _bugBountyAddress,
         address _optimisticOracleV3,
         address _pairImplementation,
-        address _sequencer,
         address _pairTerminator,
         bytes32 _umaIdentifier
     ) {
@@ -285,18 +282,15 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
         if (_bugBountyAddress == address(0)) revert Factory__ZeroAddress();
         if (_optimisticOracleV3 == address(0)) revert Factory__ZeroAddress();
         if (_pairImplementation == address(0)) revert Factory__ZeroAddress();
-        if (_sequencer == address(0)) revert Factory__ZeroAddress();
         if (_pairTerminator == address(0)) revert Factory__ZeroAddress();
         if (_umaIdentifier == bytes32(0)) revert Factory__InvalidIdentifier();
-        // Wiring consistency: both must have been constructed pointing at this factory.
-        if (BazaarSequencer(_sequencer).factory() != address(this)) revert Factory__WiringMismatch();
+        // Wiring consistency: must have been constructed pointing at this factory.
         if (BazaarPairTerminator(_pairTerminator).factory() != address(this)) revert Factory__WiringMismatch();
         usdc = _usdc;
         oracle = BazaarOracle(_oracle);
         lens = BazaarPairLens(_lens);
         bugBountyAddress = _bugBountyAddress;
         pairImplementation = _pairImplementation;
-        sequencer = BazaarSequencer(_sequencer);
         oo = IOptimisticOracleV3(_optimisticOracleV3);
         pairTerminator = BazaarPairTerminator(_pairTerminator);
 
@@ -1007,7 +1001,6 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
                     pairId: p.pairId,
                     oracle: address(oracle),
                     usdc: usdc,
-                    sequencer: address(sequencer),
                     bugBountyAddress: bugBountyAddress,
                     baseFeedId: p.baseFeedId,
                     umaContract: address(pairTerminator),
@@ -1022,7 +1015,6 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
 
         pairAddressById[p.pairId] = pairAddr;
         _allPairs.add(pairAddr);
-        sequencer.registerPair(pairAddr);
         pairTerminator.registerPair(pairAddr);
 
         emit PairDeployed(p.pairId, pairAddr, p.baseFeedId);

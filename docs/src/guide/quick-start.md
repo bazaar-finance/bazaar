@@ -17,7 +17,7 @@ forge build
 forge test
 ```
 
-The suite is 844 tests across 74 suites — unit suites per library/mechanism plus end-to-end integration suites, including a zero-sum accounting invariant (`test/integration/ZeroSumInvariantTest.t.sol`). Note that `forge build` is the slow step, not the tests: `via_ir` plus the 150-runs compilation restriction compiles the `BazaarPair` closure twice, so a change to `MatchingEngineLib` costs minutes while the whole suite runs in about nine seconds.
+The suite has unit suites per library/mechanism plus end-to-end integration suites, including a zero-sum accounting invariant (`test/integration/ZeroSumInvariantTest.t.sol`). Note that `forge build` is the slow step, not the tests: everything compiles `via_ir` as one unit and the IR pipeline is memory-bound, so a clean build takes minutes while the tests themselves run in seconds (`dynamic_test_linking` in `foundry.toml` is what keeps a one-line library edit from re-running the pipeline over nearly the whole dependency graph).
 
 ## Local stack on Anvil
 

@@ -4,13 +4,17 @@ If you put an order-creation UI in front of users — a web frontend, a Telegram
 
 ## How to become one
 
-Put your address in the `integrator` parameter of every `createOrder` your product submits:
+Put your address in the `integrator` field of the `OrderSpec` of every `createOrder` your product submits:
 
 ```solidity
 pair.createOrder(
-    orderType, triggerPrice, limitPrice, maxSlippageBp, size,
-    isLong, isPostOnly, expirationBlock,
-    integrator,          // ← your address. That's the entire integration.
+    BazaarTypes.OrderSpec({
+        orderType: orderType, isLong: isLong, isPostOnly: isPostOnly, isIoc: isIoc,
+        size: size, triggerPrice: triggerPrice, limitPrice: limitPrice,
+        maxSlippageBp: maxSlippageBp, expirationBlock: expirationBlock,
+        integrator: integrator   // ← your address. That's the entire integration.
+    }),
+    hints,               // book-position hints, computed off-chain from the live book
     priceUpdate, nonce, deadline, relayerFee, signature
 );
 ```
@@ -28,7 +32,7 @@ That's it. You are now an integrator.
 | $100M | $2,500 |
 | $1B | $25,000 |
 
-Payment is **automatic and per-batch**: the matching engine accumulates your fees across each batch and transfers USDC to your address when the batch settles. No claiming, no escrow, no minimum.
+Payment is **automatic and per matching transaction**: the matching engine accumulates your fees across the transaction's fills and transfers USDC to your address as it settles. No claiming, no escrow, no minimum.
 
 ## Stack it with relayer fees
 
@@ -37,7 +41,7 @@ Integrators are naturally positioned to run the [meta-transaction relayer](../pr
 ## Fine print
 
 - The 1% protocol-wide [bug-bounty tax](../protocol/fees.md) applies to integrator fees like every other stream — you receive 99% of the 0.25 bp.
-- Payouts use a non-reverting transfer; if your address can't receive USDC (e.g. blacklisted), that batch's fee is forfeited to the pair's insurance fund. Use a boring, clean address.
+- Payouts use a non-reverting transfer; if your address can't receive USDC (e.g. blacklisted), that transaction's fee is forfeited to the pair's insurance fund. Use a boring, clean address.
 - The `integrator` field is per-order and immutable once set — users of your UI can't be siphoned retroactively, and you can't claim orders you didn't originate.
 - Setting `integrator = address(0)` charges no integrator fee at all — direct-to-contract traders skip the 0.25 bp entirely. Your referral fee is a real surcharge on your users' fills, so the convenience your product adds has to be worth a quarter of a basis point.
 
@@ -45,5 +49,5 @@ Integrators are naturally positioned to run the [meta-transaction relayer](../pr
 
 1. Set `integrator` on every order (and test that fills emit your address's transfers). `OrderFilled` is the only per-fill event — it carries `fillSize`, `executionPrice`, the total `fee` charged that side, and an `isMaker` flag, and a pair match emits one per side — so index that to attribute your revenue.
 2. Decide gasless vs. direct: every path needs a Pyth update at most 2 seconds old. Relaying is the dependable way to meet that, since `priceUpdate` is outside the signed payload and your relayer attaches a fresh price at submission. A direct-signing UI has to either land inside the window or send an empty `priceUpdate` and accept that the call reverts whenever the pair's cached price has aged out.
-3. Read [Orders](../protocol/orders.md) for the per-user caps your UI must respect (100 resting limits, 1 market order, 1 TP + 1 SL per position) and surface auto-cancel events (`OrderUpdated` with `Canceled`) to users.
+3. Read [Orders](../protocol/orders.md) for the per-user caps your UI must respect (100 active Limit+StopLimit orders, 1 TP + 1 SL per position) and surface auto-cancel events (`OrderUpdated` with `Canceled`) to users.
 4. Use `BazaarPairLens` for all read paths — solvency, margin, share prices — rather than re-deriving them client-side.

@@ -40,24 +40,29 @@ contract RelayerFeeSolvencyTest is IntegrationBase {
         assertEq(_ledgerBaz() / 1e12, _pairUsdc(), "baseline: I + D == contract USDC");
 
         uint256 fee = BAZAAR_SCALE / 2; // $0.50, under the $1 relayer-fee cap
-        uint256 size = BAZAAR_SCALE / 100; // 0.01 BTC
-        uint256 limitPrice = 50_000 * BAZAAR_SCALE;
-        uint64 exp = uint64(block.number + 500_000);
+        BazaarTypes.OrderSpec memory spec;
+        spec.orderType = BazaarTypes.OrderType.Limit;
+        spec.isLong = true;
+        spec.size = BAZAAR_SCALE / 100; // 0.01 BTC
+        spec.limitPrice = 50_000 * BAZAAR_SCALE;
+        spec.expirationBlock = uint64(block.number + 500_000);
         uint256 nonce = pair.metaTxNonces(u);
-        uint256 deadline = vm.getBlockTimestamp() + 30;
+        uint256 deadline = vm.getBlockTimestamp() + MetaTxLib.MAX_DEADLINE_WINDOW;
 
+        // Mirrors createOrder's struct-hash construction field for field.
         bytes32 structHash = keccak256(
             abi.encode(
                 MetaTxLib.CREATE_ORDER_TYPEHASH,
-                BazaarTypes.OrderType.Limit,
-                uint256(0),
-                limitPrice,
-                uint256(0),
-                size,
-                true,
-                false,
-                exp,
-                address(0),
+                spec.orderType,
+                spec.triggerPrice,
+                spec.limitPrice,
+                spec.maxSlippageBp,
+                spec.size,
+                spec.isLong,
+                spec.isPostOnly,
+                spec.isIoc,
+                spec.expirationBlock,
+                spec.integrator,
                 nonce,
                 deadline,
                 fee
@@ -69,24 +74,11 @@ contract RelayerFeeSolvencyTest is IntegrationBase {
         uint256 ledgerBefore = _ledgerBaz();
         uint256 usdcBefore = _pairUsdc();
 
+        // The book is empty, so this limit rests without filling; the fee debit is the only
+        // vault movement the call makes.
         bytes[] memory pu = _freshPrice(); // build BEFORE the prank (mockPyth call would consume it)
         vm.prank(relayer);
-        pair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            limitPrice,
-            0,
-            size,
-            true,
-            false,
-            exp,
-            address(0),
-            pu,
-            nonce,
-            deadline,
-            fee,
-            sig
-        );
+        pair.createOrder(spec, _hintsNone(), pu, nonce, deadline, fee, sig);
 
         // The fee left the contract as real USDC.
         assertEq(usdcBefore - _pairUsdc(), fee / 1e12, "fee left the contract as USDC");
@@ -113,7 +105,7 @@ contract RelayerFeeSolvencyTest is IntegrationBase {
         uint256[] memory ids = _one(orderId);
         uint256 fee = BAZAAR_SCALE / 2;
         uint256 nonce = pair.metaTxNonces(u);
-        uint256 deadline = vm.getBlockTimestamp() + 30;
+        uint256 deadline = vm.getBlockTimestamp() + MetaTxLib.MAX_DEADLINE_WINDOW;
 
         bytes32 structHash = keccak256(
             abi.encode(MetaTxLib.CANCEL_ORDERS_TYPEHASH, keccak256(abi.encodePacked(ids)), nonce, deadline, fee)

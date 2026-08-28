@@ -1204,12 +1204,12 @@ contract Phase4LogicTest is Test {
     /// @notice The typehash must reference expirationBlock, not the misleading expirationTs.
     function test_CreateOrderTypehash_UsesExpirationBlock() public {
         bytes32 expected = keccak256(
-            "CreateOrder(uint8 orderType,uint256 triggerPrice,uint256 limitPrice,uint256 maxSlippageBp,uint256 size,bool isLong,bool isPostOnly,uint256 expirationBlock,address integrator,uint256 nonce,uint256 deadline,uint256 relayerFee)"
+            "CreateOrder(uint8 orderType,uint256 triggerPrice,uint256 limitPrice,uint256 maxSlippageBp,uint256 size,bool isLong,bool isPostOnly,bool isIoc,uint256 expirationBlock,address integrator,uint256 nonce,uint256 deadline,uint256 relayerFee)"
         );
         assertEq(MetaTxLib.CREATE_ORDER_TYPEHASH, expected, "typehash uses expirationBlock");
 
         bytes32 expirationTsForm = keccak256(
-            "CreateOrder(uint8 orderType,uint256 triggerPrice,uint256 limitPrice,uint256 maxSlippageBp,uint256 size,bool isLong,bool isPostOnly,uint256 expirationTs,address integrator,uint256 nonce,uint256 deadline,uint256 relayerFee)"
+            "CreateOrder(uint8 orderType,uint256 triggerPrice,uint256 limitPrice,uint256 maxSlippageBp,uint256 size,bool isLong,bool isPostOnly,bool isIoc,uint256 expirationTs,address integrator,uint256 nonce,uint256 deadline,uint256 relayerFee)"
         );
         assertTrue(MetaTxLib.CREATE_ORDER_TYPEHASH != expirationTsForm, "typehash is not the expirationTs form");
     }

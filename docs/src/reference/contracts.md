@@ -9,16 +9,18 @@ One EIP-1167 clone per market. Initialized once by the factory.
 | Function | Access | Purpose |
 |---|---|---|
 | `depositCollateral` / `withdrawCollateral` | anyone / meta-tx | collateral in/out; withdrawal enforces IMR at bracket prices and, while a position is open, retention of `mmrBp` (continuously traded) or `imrBp` (session-bound) of notional in collateral proper |
-| `createOrder` / `cancelOrders` | anyone / meta-tx | see [Orders](../protocol/orders.md) |
-| `matchBatch` | bonded sequencer | three-pass batch matching |
+| `createOrder` / `cancelOrders` | anyone / meta-tx | matching happens on arrival, inside `createOrder` itself — see [Orders](../protocol/orders.md) and [Matching](../protocol/matching.md) |
+| `executeTriggeredOrders(execs[], …)` | anyone | fires triggered stops against a fresh Pyth price for a $0.25 tip per stop, charged to each stop's owner |
+| `unloadVault(maxSteps, …)` | anyone | crosses the vault's pending liquidation inventory into the book for a reward — see [Liquidations](../protocol/liquidations.md) |
+| `sweepExpired(orderIds[])` | anyone | janitor: cancels-and-unlinks expired orders that no walk has touched yet |
 | `liquidate(users[], …)` | anyone | full liquidation of insolvent buckets — and, once a settlement price is fixed, the terminal-settlement entry point (no price update, no ETH, no solvency threshold) |
 | `executeAdl(winners[], …)` | anyone | Dutch-auction deleveraging |
 | `depositToInsurance` / `requestInsuranceWithdrawal` / `executeInsuranceWithdrawal` | anyone / meta-tx | insurance LP flows |
 | `refreshPrice` | anyone | push a Pyth update, roll funding/margin state |
-| `creditInsurance` | wired (terminator or sequencer) | books forfeited insurer bonds and slash proceeds |
+| `creditInsurance` | wired (terminator) | books forfeited insurer bonds |
 | `setScheduledTermination` / `fixSettlementPrice` | wired (terminator) | lifecycle transitions (`finalizeTermination` is public after the 48 h settlement window; settling positions at the fixed price runs through `liquidate`) |
 
-Key views: `batchHashes`, `positionBuckets`, `orders`, `lastPairPrice`, `getSharesAsOf`, plus everything on the lens.
+Key views: `book` (list heads and counts), `positionBuckets`, `orders` (including each order's `prevInBook`/`nextInBook` links), `lastPairPrice`, `getSharesAsOf`, plus everything on the lens.
 
 ## BazaarFactory — `src/BazaarFactory.sol`
 
@@ -35,16 +37,6 @@ Key views: `batchHashes`, `positionBuckets`, `orders`, `lastPairPrice`, `getShar
 | `requiredDeploymentBond` / `requiredIdentifierUpgradeBond` | view — quote before approving; the constants are floors under UMA's live minimum |
 
 `oo` is immutable; `umaIdentifier` is the single governed parameter. See [Markets & Listing](../protocol/listing.md#the-only-governance-swapping-the-uma-identifier).
-
-## BazaarSequencer — `src/BazaarSequencer.sol`
-
-| Function | Access |
-|---|---|
-| `deposit` / `withdraw` | anyone (own bond) |
-| `challengeOmission` / `challengeStaleBatch` | anyone |
-| `recordVolume` | wired (registered pairs) |
-| `registerPair` | wired (factory) |
-| `checkVolumeCapacity` / `getRollingVolume` / `getDynamicTakerSequencerFee` | view |
 
 ## BazaarOracle — `src/BazaarOracle.sol`
 
@@ -67,7 +59,7 @@ Key views: `batchHashes`, `positionBuckets`, `orders`, `lastPairPrice`, `getShar
 
 ## BazaarPairLens — `src/BazaarPairLens.sol`
 
-Stateless views: `getPositionBucket`, `checkBucketSolvency`, `getInsuranceSharePrice`, `getInsuranceDepositValue`, `getAdlScoreThreshold`, `getAdlScore` (a candidate's auction score and eligibility, exactly as `executeAdl` ranks them — sort batches by it descending), `getTerminalEntitlement` (post-termination payout components: collateral, registered claim, frozen ratio), `getTerminalSettlementBounty` (a sweep keeper's reward for settling a position at the fixed price), `getMaxWithdrawable` (the largest withdrawal the margin/retention gates would accept — pass the conservative bracket price: spot − conf for a long, spot + conf for a short), `getPendingLiquidationExposure`, `getAuxState`, plus constant getters for EIP-712 domains/typehashes, order lifetimes, min collateral, insurance-withdrawal limits, vault-health thresholds, and the flat sequencer fee. Note: the pair's `getUserActiveLimitOrders` mutates (lazy cleanup) — `eth_call` it, don't index it as pure.
+Stateless views: `getPositionBucket`, `checkBucketSolvency`, `getInsuranceSharePrice`, `getInsuranceDepositValue`, `getAdlScoreThreshold`, `getAdlScore` (a candidate's auction score and eligibility, exactly as `executeAdl` ranks them — sort submissions by it descending), `getTerminalEntitlement` (post-termination payout components: collateral, registered claim, frozen ratio), `getTerminalSettlementBounty` (a sweep keeper's reward for settling a position at the fixed price), `getMaxWithdrawable` (the largest withdrawal the margin/retention gates would accept — pass the conservative bracket price: spot − conf for a long, spot + conf for a short), `getPendingLiquidationExposure`, `getAuxState`, `getBookDepth` (a head-to-tail page of one book side, read through the pair's `book()` heads and `orders()` links — for depth displays and hint computation), `findPredecessor` (the resume-able hint helper for `MatchHints.pred`), plus constant getters for EIP-712 domains/typehashes, order lifetimes, min collateral, insurance-withdrawal limits, and vault-health thresholds. Note: the pair's `getUserActiveLimitOrders` mutates (lazy cleanup) — `eth_call` it, don't index it as pure.
 
 ## External dependencies
 

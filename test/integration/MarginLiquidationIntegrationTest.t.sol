@@ -9,12 +9,13 @@ import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 ///         real pair, liquidation refreshing the margin curve, close/reduce round-trips realizing
 ///         PnL, and IMR-gated withdrawal solvency.
 contract MarginLiquidationIntegrationTest is IntegrationBase {
-    /// @dev Drive one hourly MMR sample into the pair's ring buffer by re-submitting a resting,
-    ///      non-crossing order through matchBatch (which records a sample before it processes fills).
-    function _sampleHour(uint256 restId) internal {
-        vm.warp(block.timestamp + 1 hours);
+    /// @dev Drive one hourly MMR sample into the pair's ring buffer: every order arrival refreshes
+    ///      the margin curve and records a sample (at most one per MMR_SAMPLE_INTERVAL), so a
+    ///      far-from-market resting bid placed each hour keeps the ring advancing.
+    function _sampleHour() internal {
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
         _roll(1);
-        _match(_lists(_one(restId), _empty(), _empty(), _empty()), 1);
+        _placeLimit(alice, true, BAZAAR_SCALE / 100, 40_000 * BAZAAR_SCALE);
     }
 
     // ============================ 24h-lagged MMR ============================
@@ -25,18 +26,18 @@ contract MarginLiquidationIntegrationTest is IntegrationBase {
     ///         historical MMR. This exercises MmrSampleLib.record + laggedMmr through the live pair.
     function test_e2e_LaggedMmr_BecomesAvailableAfter24hOfSamples() public {
         _deposit(alice, 20_000 * BAZAAR_SCALE);
-        // A resting long limit far below oracle — never crosses (no counterparty), so it just keeps
-        // the order live and lets each matchBatch record an MMR sample.
-        uint256 restId = _placeLimit(alice, true, BAZAAR_SCALE / 100, 40_000 * BAZAAR_SCALE);
-        vm.roll(block.number + 2);
+        // A resting long limit far below oracle — never crosses (no counterparty). The arrival
+        // itself records the first MMR sample; each hourly placement records another.
+        _placeLimit(alice, true, BAZAAR_SCALE / 100, 40_000 * BAZAAR_SCALE);
+        _roll(2);
 
-        // One sample laid; nothing is ≥24h old yet.
-        _sampleHour(restId);
+        // A second sample an hour later; nothing is ≥24h old yet.
+        _sampleHour();
         assertEq(pair.getLaggedMmrBp(), 0, "no >=24h-old sample yet");
 
         // Lay a full ring of hourly samples spanning >24h.
         for (uint256 i = 0; i < 25; i++) {
-            _sampleHour(restId);
+            _sampleHour();
         }
 
         uint256 lagged = pair.getLaggedMmrBp();
@@ -46,7 +47,7 @@ contract MarginLiquidationIntegrationTest is IntegrationBase {
     }
 
     /// @notice A liquidation refreshes the margin curve (lastUpdateTs = now) and records an MMR
-    ///         sample — so MMR sampling is not gated solely by matching activity. After 24h that
+    ///         sample — so MMR sampling is not gated solely on order arrivals. After 24h that
     ///         liquidation-time sample is exactly what `getLaggedMmrBp()` returns.
     function test_e2e_LaggedMmr_LiquidationRefreshesMarginAndSamples() public {
         _setupInsolventAlice();
@@ -64,25 +65,25 @@ contract MarginLiquidationIntegrationTest is IntegrationBase {
     }
 
     /// @notice refreshPrice() is the permissionless way to advance the MMR sample ring through a
-    ///         trading gap. With no fills and no liquidations the ring freezes, so laggedMmr()
+    ///         trading gap. With no arrivals and no liquidations the ring freezes, so laggedMmr()
     ///         keeps returning a sample with no ceiling on its age (here: a week old). Anyone can
     ///         then push a price refresh — it recomputes IMR/MMR and records a fresh sample, and
     ///         the lagged threshold catches up to reality once that sample ages past the grace
     ///         period, instead of never.
     function test_e2e_LaggedMmr_RefreshPriceAdvancesRingDuringTradingGap() public {
-        // Lay one real sample via matchBatch, then go quiet.
+        // Lay real samples via order arrivals, then go quiet.
         _deposit(alice, 20_000 * BAZAAR_SCALE);
-        uint256 restId = _placeLimit(alice, true, BAZAAR_SCALE / 100, 40_000 * BAZAAR_SCALE);
-        vm.roll(block.number + 2);
-        _sampleHour(restId);
+        _placeLimit(alice, true, BAZAAR_SCALE / 100, 40_000 * BAZAAR_SCALE);
+        _roll(2);
+        _sampleHour();
         (, uint256 mmrAtFreeze,,) = pair.marginRequirements();
 
         // A week of silence: the week-old sample still rules the lagged threshold (no staleness
-        // ceiling), and nothing on the matching/liquidation paths will ever advance it.
-        vm.warp(block.timestamp + 7 days);
+        // ceiling), and no arrival or liquidation runs that would advance it.
+        vm.warp(vm.getBlockTimestamp() + 7 days);
         assertEq(pair.getLaggedMmrBp(), mmrAtFreeze, "frozen ring: week-old sample still rules");
 
-        // Permissionless poke from a non-sequencer outsider.
+        // Permissionless poke from an outsider with no orders or position.
         bytes[] memory pu = _priceAt(50_000);
         uint256 fee = oracle.getUpdateFee(pu);
         vm.deal(bob, 1 ether);
@@ -90,10 +91,10 @@ contract MarginLiquidationIntegrationTest is IntegrationBase {
         pair.refreshPrice{value: fee}(pu);
 
         (, uint256 mmrNow, uint256 lastTs,) = pair.marginRequirements();
-        assertEq(lastTs, block.timestamp, "margin curve recomputed by the poke");
+        assertEq(lastTs, vm.getBlockTimestamp(), "margin curve recomputed by the poke");
 
         // The poke-time sample supersedes the frozen one once it clears the 24h grace.
-        vm.warp(block.timestamp + 24 hours + 1);
+        vm.warp(vm.getBlockTimestamp() + 24 hours + 1);
         assertEq(pair.getLaggedMmrBp(), mmrNow, "poke-time sample is the lagged MMR after 24h");
     }
 
@@ -107,19 +108,18 @@ contract MarginLiquidationIntegrationTest is IntegrationBase {
         _deposit(bob, 20_000 * BAZAAR_SCALE);
         uint256 size = BAZAAR_SCALE / 10; // 0.1 BTC
 
-        // Open: alice long / bob short, fills at the older order's price ($50k).
-        uint256 aL = _placeLimit(alice, true, size, 50_000 * BAZAAR_SCALE);
-        uint256 bS = _placeLimit(bob, false, size, 49_000 * BAZAAR_SCALE);
+        // Open: alice's bid rests, bob's crossing short fills at the resting maker's price ($50k).
+        _placeLimit(alice, true, size, 50_000 * BAZAAR_SCALE);
         _roll(2);
-        assertEq(_match(_lists(_one(aL), _one(bS), _empty(), _empty()), 10), 1, "opened");
+        _placeLimit(bob, false, size, 49_000 * BAZAAR_SCALE);
         assertEq(_posSize(alice), size, "alice long open");
         assertEq(_posSize(bob), size, "bob short open");
 
-        // Close: alice's opposing short vs bob's opposing long — both positions net to flat.
-        uint256 aS = _placeLimit(alice, false, size, 49_000 * BAZAAR_SCALE);
-        uint256 bL = _placeLimit(bob, true, size, 51_000 * BAZAAR_SCALE);
+        // Close: alice's opposing short rests at $49k; bob's opposing long crosses it — both
+        // positions net to flat at the $49k maker price.
+        _placeLimit(alice, false, size, 49_000 * BAZAAR_SCALE);
         _roll(2);
-        assertEq(_match(_lists(_one(bL), _one(aS), _empty(), _empty()), 10), 1, "closed");
+        _placeLimit(bob, true, size, 51_000 * BAZAAR_SCALE);
 
         assertEq(_posSize(alice), 0, "alice flat");
         assertEq(_posSize(bob), 0, "bob flat");
@@ -141,10 +141,10 @@ contract MarginLiquidationIntegrationTest is IntegrationBase {
         _deposit(bob, 20_000 * BAZAAR_SCALE);
         uint256 size = 1 * BAZAAR_SCALE; // 1 BTC → $50k notional
 
-        uint256 aL = _placeLimit(alice, true, size, 50_000 * BAZAAR_SCALE);
-        uint256 bS = _placeLimit(bob, false, size, 49_000 * BAZAAR_SCALE);
+        _placeLimit(alice, true, size, 50_000 * BAZAAR_SCALE);
         _roll(2);
-        assertEq(_match(_lists(_one(aL), _one(bS), _empty(), _empty()), 10), 1, "opened 1 BTC");
+        _placeLimit(bob, false, size, 49_000 * BAZAAR_SCALE);
+        assertEq(_posSize(alice), size, "opened 1 BTC");
 
         BazaarTypes.BucketState memory st = lens.checkBucketSolvency(address(pair), alice, 50_000 * BAZAAR_SCALE);
         (uint256 imrBp,,,) = pair.marginRequirements();

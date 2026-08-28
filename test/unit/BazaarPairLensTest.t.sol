@@ -114,7 +114,7 @@ contract MockPairForLens {
     function positionBuckets(address u)
         external
         view
-        returns (bool, uint256, uint256, uint256, int256, uint256, uint256, uint256, uint256, uint256)
+        returns (bool, uint256, uint256, uint256, int256, uint256, uint256, uint256, uint256)
     {
         BazaarTypes.PositionBucket storage b = buckets[u];
         return (
@@ -126,7 +126,6 @@ contract MockPairForLens {
             b.takeProfitOrderId,
             b.stopLossOrderId,
             b.entryMmrBp,
-            b.activeMarketOrderId,
             b.mmrUpdateTs
         );
     }
@@ -199,9 +198,8 @@ contract BazaarPairLensTest is Test {
     }
 
     function test_getOrderLifetimeConstants() public view {
-        (uint64 minL, uint64 mktL, uint64 maxL) = lens.getOrderLifetimeConstants();
+        (uint64 minL, uint64 maxL) = lens.getOrderLifetimeConstants();
         assertEq(minL, BazaarTypes.MIN_ORDER_LIFETIME_BLOCKS);
-        assertEq(mktL, BazaarTypes.MARKET_ORDER_LIFETIME_BLOCKS);
         assertEq(maxL, BazaarTypes.MAX_ORDER_LIFETIME_BLOCKS);
     }
 
@@ -226,10 +224,6 @@ contract BazaarPairLensTest is Test {
         assertEq(cancel, VaultHealthLib.ADL_CANCEL_THRESHOLD_BP);
         assertEq(timeout, VaultHealthLib.ADL_TIMEOUT_DURATION);
         assertEq(maxWinners, AdlLib.MAX_ADL_WINNERS_PER_BATCH);
-    }
-
-    function test_getSequencerFlatFeePerSide() public view {
-        assertEq(lens.getSequencerFlatFeePerSide(), BazaarTypes.SEQUENCER_FLAT_FEE_PER_SIDE);
     }
 
     // ---------------- computed getters (real logic, via the mock) ----------------

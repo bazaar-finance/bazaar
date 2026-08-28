@@ -70,7 +70,7 @@ contract GovernanceIntegrationTest is IntegrationBase {
         assertFalse(pair.isPairTerminatedNormal(), "scheduling is not termination");
 
         // Past the cutoff + 3h grace, anyone fixes the price using the stored-price fallback,
-        // then finalizes after the 1h terminal sweep window.
+        // then finalizes after the 48h terminal sweep window.
         vm.warp(lastTradingTs + 3 hours + 1);
         terminator.terminateScheduledPair(address(pair), new bytes[](0));
         assertFalse(pair.isPairTerminatedNormal(), "price fixed, sweep window still open");
@@ -86,9 +86,15 @@ contract GovernanceIntegrationTest is IntegrationBase {
     ///         on-chain-verified Pyth tick from that moment. Users with open positions can then
     ///         withdraw their settled collateral.
     function test_e2e_PostCessationTermination_UsersSettleAtVerifiedPrice() public {
-        // Open a matched 0.1 BTC long/short at $50k so both sides hold positions at termination.
+        // Open a matched 0.1 BTC long/short at $50k so both sides hold positions at termination:
+        // alice's $50k bid rests, bob's crossing short fills at her maker price.
         uint256 size = BAZAAR_SCALE / 10;
-        _openPosition(alice, bob, true, size);
+        _deposit(alice, 20_000 * BAZAAR_SCALE);
+        _deposit(bob, 20_000 * BAZAAR_SCALE);
+        _placeLimit(alice, true, size, 50_000 * BAZAAR_SCALE);
+        _roll(2);
+        _placeLimit(bob, false, size, 49_000 * BAZAAR_SCALE);
+        assertEq(_posSize(alice), size, "0.1 BTC opened at $50k");
 
         // The asset ceases trading: last valid print is $50k at cessationTs, noticed 2 days later.
         uint64 cessationTs = uint64(vm.getBlockTimestamp());
@@ -225,7 +231,7 @@ contract GovernanceIntegrationTest is IntegrationBase {
     ///         snapshot with mature shares, waits out the 7-day voting period, and executes — the pair
     ///         terminates at the live oracle price and the proposer's bond is refunded.
     function test_e2e_InsurerVoteTermination_MajorityExecutes() public {
-        // Carol becomes the majority insurer: 10,000 shares vs the 5,000-share deployment seed.
+        // Carol becomes the majority insurer: 10,000 shares vs the 4,000-share deployment seed.
         _depositInsurance(carol, 10_000 * BAZAAR_SCALE);
         uint256 carolShares = pair.insuranceShares(carol);
         assertEq(carolShares, 10_000 * BAZAAR_SCALE, "carol holds 10k shares");

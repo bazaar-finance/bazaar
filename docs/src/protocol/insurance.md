@@ -4,9 +4,9 @@ Each pair has its own insurance fund, held inside the pair contract and owned by
 
 ## Flows
 
-**In:** maker + taker insurance [fees](fees.md) · seized liquidatee collateral · vault unwind profits · slashed sequencer bonds · forfeited termination bonds · the listing seed (≥ $3,000)
+**In:** maker + taker insurance [fees](fees.md) · seized liquidatee collateral · vault unwind profits · forfeited termination bonds · the listing seed (≥ $3,000)
 
-**Out:** vault unwind losses · ADL winner credits · liquidation keeper rewards · ADL executor rewards · UMA termination-proposer rewards
+**Out:** vault unwind losses · ADL winner credits · keeper rewards (liquidation, vault unloading, price refresh, ADL execution) · UMA termination-proposer rewards
 
 Losses beyond the fund become `deficit` — realized bad debt — which [winds the pair down](termination.md) (the health check fixes the settlement price and opens the settlement window). The fund is the last cushion before winners get haircut: at finalize, terminal bad debt is charged against it first, and only the shortfall beyond it reduces the winners' payout ratio.
 

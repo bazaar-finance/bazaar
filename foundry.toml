@@ -15,12 +15,13 @@ remappings = [
 # DeployLibraries.s.sol records each chain's library addresses under deployments/<chainid>/.
 fs_permissions = [{ access = "read-write", path = "./deployments" }]
 
-# optimizer_runs is 150 for every contract. MatchingEngineLib and BazaarPair sit at the EIP-170
-# ceiling and only fit at this setting, and a single global value keeps the artifact that the test
-# suite and the size gate measure identical to the artifact that ships — a per-path restriction
-# would compile those two differently from everything else, so a green size gate would say nothing
-# about the bytecode actually deployed. The runtime cost is modest: the hot paths (matchBatch,
-# liquidation, settlement) are storage-dominated, where optimizer_runs matters least.
+# optimizer_runs is 150 for every contract. MatchingEngineLib and BazaarPair are the two
+# artifacts nearest the EIP-170 ceiling, and a single global value keeps the artifact that the
+# test suite and the size gate measure identical to the artifact that ships — a per-path
+# restriction would compile those two differently from everything else, so a green size gate
+# would say nothing about the bytecode actually deployed. The runtime cost is modest: the hot
+# paths (the matching walk, liquidation, settlement) are storage-dominated, where optimizer_runs
+# matters least.
 
 # dynamic_test_linking makes test contracts resolve library addresses at deploy time inside the test
 # EVM rather than at compile time. BazaarPair links the ten external libraries that

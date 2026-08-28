@@ -5,6 +5,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {BazaarTypes} from "./BazaarTypes.sol";
 import {BucketLib} from "./BucketLib.sol";
 import {BazaarMathLib} from "./BazaarMathLib.sol";
+import {OrderBookLib} from "./OrderBookLib.sol";
 
 /// @title LiquidationLib
 /// @notice External library for liquidation processing logic.
@@ -42,6 +43,7 @@ library LiquidationLib {
     function processLiquidations(
         address[] calldata usersToLiquidate,
         mapping(uint256 => BazaarTypes.Order) storage orders,
+        BazaarTypes.OrderBook storage book,
         mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
         BazaarTypes.Vault storage pairVault,
         BazaarTypes.LiquidateParams memory params
@@ -113,6 +115,7 @@ library LiquidationLib {
                 userToLiquidate,
                 bucket,
                 orders,
+                book,
                 params.currentFundingIndex,
                 params.marginReqs,
                 params.pairId,
@@ -332,35 +335,21 @@ library LiquidationLib {
     }
 
     /// @notice Resets a user's position bucket to zero state
-    /// @dev Cancels any active TP/SL/Market orders and resets all position fields to zero.
+    /// @dev Cancels any active TP/SL orders — unlinking a resting TakeProfit from the book, so
+    ///      no walk can fill an order whose backing position was just seized — and resets all
+    ///      position fields to zero.
     function _resetBucket(
         address user,
         BazaarTypes.PositionBucket storage bucket,
         mapping(uint256 => BazaarTypes.Order) storage orders,
+        BazaarTypes.OrderBook storage book,
         int256 currentFundingIndex,
         BazaarTypes.MarginRequirements memory marginReqs,
         bytes32 pairId,
         uint64 currentBlock
     ) internal {
-        // Cancel active TP/SL/Market orders for this user
-        if (bucket.takeProfitOrderId != 0) {
-            BazaarTypes.Order storage tpOrder = orders[bucket.takeProfitOrderId];
-            if (tpOrder.canceledBlock == 0 && tpOrder.filledBlock == 0) {
-                tpOrder.canceledBlock = currentBlock;
-            }
-        }
-        if (bucket.stopLossOrderId != 0) {
-            BazaarTypes.Order storage slOrder = orders[bucket.stopLossOrderId];
-            if (slOrder.canceledBlock == 0 && slOrder.filledBlock == 0) {
-                slOrder.canceledBlock = currentBlock;
-            }
-        }
-        if (bucket.activeMarketOrderId != 0) {
-            BazaarTypes.Order storage mktOrder = orders[bucket.activeMarketOrderId];
-            if (mktOrder.canceledBlock == 0 && mktOrder.filledBlock == 0) {
-                mktOrder.canceledBlock = currentBlock;
-            }
-        }
+        _cancelBucketOrder(orders, book, bucket.takeProfitOrderId, pairId, currentBlock);
+        _cancelBucketOrder(orders, book, bucket.stopLossOrderId, pairId, currentBlock);
 
         // Reset bucket fields (always reset collateral during liquidation)
         bucket.size = 0;
@@ -369,10 +358,45 @@ library LiquidationLib {
         bucket.entryFundingIndex = 0;
         bucket.takeProfitOrderId = 0;
         bucket.stopLossOrderId = 0;
-        bucket.activeMarketOrderId = 0;
         bucket.entryMmrBp = 0; // keep the "flat => no MMR grandfather" invariant
         bucket.mmrUpdateTs = 0; // and the "0 when flat" grace-clock invariant
 
         BucketLib.emitBucketUpdate(user, bucket, currentFundingIndex, marginReqs, pairId);
+    }
+
+    /// @dev Cancel one slot-anchored order (0 = none): stamp, unlink, emit. Already-terminal
+    ///      orders are left untouched.
+    function _cancelBucketOrder(
+        mapping(uint256 => BazaarTypes.Order) storage orders,
+        BazaarTypes.OrderBook storage book,
+        uint256 orderId,
+        bytes32 pairId,
+        uint64 currentBlock
+    ) private {
+        if (orderId == 0) return;
+        BazaarTypes.Order storage o = orders[orderId];
+        if (o.canceledBlock != 0 || o.filledBlock != 0) return;
+        o.canceledBlock = currentBlock;
+        OrderBookLib.unlink(orders, book, orderId);
+        emit BazaarTypes.OrderUpdated(
+            pairId,
+            orderId,
+            o.creator,
+            BazaarTypes.OrderUpdatePayload({
+                action: BazaarTypes.OrderAction.Canceled,
+                orderType: o.orderType,
+                isLong: o.isLong,
+                isPostOnly: o.isPostOnly,
+                size: o.size,
+                filledSize: o.filledSize,
+                triggerPrice: o.triggerPrice,
+                limitPrice: o.limitPrice,
+                maxSlippageBp: o.maxSlippageBp,
+                canceledBlock: currentBlock,
+                filledBlock: o.filledBlock,
+                expiryBlock: o.expiryBlock,
+                creationBlock: o.creationBlock
+            })
+        );
     }
 }

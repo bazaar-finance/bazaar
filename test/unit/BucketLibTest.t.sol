@@ -49,7 +49,7 @@ contract BucketLibTest is Test {
     }
 
     function test_updateFromState_persistsAndPreservesUntouchedFields() public {
-        // takeProfit/stopLoss/activeMarket order IDs and isLong must survive updateFromState.
+        // takeProfit/stopLoss order IDs and isLong must survive updateFromState.
         h.seed(
             BazaarTypes.PositionBucket({
                 isLong: true,
@@ -60,7 +60,6 @@ contract BucketLibTest is Test {
                 takeProfitOrderId: 55,
                 stopLossOrderId: 66,
                 entryMmrBp: 7,
-                activeMarketOrderId: 77,
                 mmrUpdateTs: 8
             })
         );
@@ -86,7 +85,6 @@ contract BucketLibTest is Test {
         assertTrue(g.isLong);
         assertEq(g.takeProfitOrderId, 55);
         assertEq(g.stopLossOrderId, 66);
-        assertEq(g.activeMarketOrderId, 77);
     }
 
     function test_emitBucketUpdate_emitsBucketAndMarginFields() public {
@@ -100,7 +98,6 @@ contract BucketLibTest is Test {
                 takeProfitOrderId: 0,
                 stopLossOrderId: 0,
                 entryMmrBp: 500,
-                activeMarketOrderId: 0,
                 mmrUpdateTs: 0
             })
         );

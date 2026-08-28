@@ -44,7 +44,7 @@ library MetaTxLib {
     // ---- Type hashes: functions with relayer fee pulled from user's wallet ----
 
     bytes32 internal constant CREATE_ORDER_TYPEHASH = keccak256(
-        "CreateOrder(uint8 orderType,uint256 triggerPrice,uint256 limitPrice,uint256 maxSlippageBp,uint256 size,bool isLong,bool isPostOnly,uint256 expirationBlock,address integrator,uint256 nonce,uint256 deadline,uint256 relayerFee)"
+        "CreateOrder(uint8 orderType,uint256 triggerPrice,uint256 limitPrice,uint256 maxSlippageBp,uint256 size,bool isLong,bool isPostOnly,bool isIoc,uint256 expirationBlock,address integrator,uint256 nonce,uint256 deadline,uint256 relayerFee)"
     );
 
     bytes32 internal constant CANCEL_ORDERS_TYPEHASH =
@@ -61,7 +61,7 @@ library MetaTxLib {
     error MetaTx__RelayerFeeExceedsMax(uint256 fee, uint256 max);
     error MetaTx__DeadlineTooFar(uint256 deadline, uint256 maxDeadline);
 
-    uint256 internal constant MAX_DEADLINE_WINDOW = 30 seconds;
+    uint256 internal constant MAX_DEADLINE_WINDOW = 10 seconds;
 
     // -------------------- Functions --------------------
 

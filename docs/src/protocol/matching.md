@@ -1,57 +1,99 @@
-# Batch Matching
+# Arrival Matching
 
-Matching runs in **batches**: a bonded sequencer snapshots the resting book off-chain, sorts it, and calls
+Bazaar keeps its limit order book **on-chain and sorted**: two doubly-linked lists per pair,
+threaded through the orders themselves (`prevInBook`/`nextInBook`), with the heads in one storage
+slot. Bids sort by `limitPrice` DESC, asks ASC, ties by `orderId` ASC — an order at an occupied
+price queues behind the orders already there, so price-time priority is a structural invariant,
+not a promise.
 
-```solidity
-matchBatch(
-    OrderLists calldata lists,      // {longLimits, shortLimits, longMarkets, shortMarkets}
-    uint256 maxMatches,             // sequencer's gas circuit-breaker (must be > 0; no protocol ceiling)
-    bytes[] calldata priceUpdate,   // Pyth update for the settlement price
-    uint64 observationBlock         // L2 block at which the book was snapshotted
-)
-```
+Matching happens **on arrival**, inside `createOrder` itself: the incoming order walks the
+opposing list from its head while it crosses, fills at each resting maker's limit price, and then
+either rests its remainder in the book or cancels it. There is no separate match transaction and
+no third party in the fill path — the taker pays for the liquidity it consumes.
 
-The contract does not trust the sorting — it re-verifies order, type, and tiebreaks inline while walking, and reverts on any violation.
+## The walk
 
-## Sort invariants
+For each node, in order:
 
-| List | Primary sort | Tiebreak |
-|---|---|---|
-| `longLimits` | `limitPrice` DESC | `orderId` ASC |
-| `shortLimits` | `limitPrice` ASC | `orderId` ASC |
-| `longMarkets` / `shortMarkets` | `maxSlippageBp` DESC | `orderId` ASC |
+1. **Re-read the head from storage.** A fill can cancel resting TP/SL orders anywhere in the book
+   (the oversize fence), so no pointer survives a settlement in memory.
+2. **Stop if the best price no longer crosses** the taker's bound (its limit price, or
+   oracle ± `maxSlippageBp` for Market/StopLoss).
+3. **Count the node** against the walk's step budget (`MatchHints.maxSteps`, clamped to
+   `MAX_WALK_STEPS` = 64; 0 selects the default). The budget counts *nodes visited*, skips
+   included, so expired dust cannot push a taker past their gas budget.
+4. **Expired maker** → canceled and unlinked on contact; walk continues.
+5. **Fill** `min(remaining, remaining)` at the **maker's** limit price. Both sides pass the margin
+   gate at the transaction's oracle price; a failing maker is auto-canceled (walk retries the next
+   head), a failing taker has its remainder canceled. Fees, PnL, and funding settle per fill
+   through the same bucket machinery as every other close.
 
-Price-time priority is therefore enforced with order IDs (per-pair monotonic counter) as the FIFO axis.
+## Remainder disposition
 
-## The three passes
+| Case | Outcome |
+|---|---|
+| GTC limit / TakeProfit, no longer crossing | rests in the book (positioned by insertion hints) |
+| Market, StopLoss execution, or IOC | canceled |
+| post-only that crossed a live maker | canceled before any fill |
+| self-match (maker is the taker's own order) | incoming remainder canceled; the resting order stays |
+| step budget hit while still crossing | canceled — the book must never rest crossed |
+| remainder notional < $5 | canceled, unless it is an exact full-close of the creator's position |
 
-| Pass | Who crosses | Maker rule | Notes |
-|---|---|---|---|
-| **A** | vault liquidation inventory × limits | vault has no order; limit's price fills | only inside a band of min(`LIQ_MAX_SLIPPAGE_BP` = 5%, current MMR) around oracle; runs even when the oracle is stale — liquidation flow is forced |
-| **B** | markets × limits | **limit is always maker**; fill at the limit's effective price | two deterministic sub-walks (long-markets first); skipped entirely when the oracle is stale |
-| **C** | limits × limits | **older orderId is maker**; fill at maker's price | post-only violations and self-matches auto-cancel the newer order |
+Every one of these writes a terminal state (`filledBlock` or `canceledBlock`) and unlinks the
+order from the book atomically, so a canceled order is out of every walk's reach within its own
+transaction.
 
-Market and StopLoss orders have an *effective price* of oracle ± their slippage cap; limit-typed orders use their limit price. The same `effectivePrice` function drives matching **and** omission challenges, so the two can never disagree.
+## Insertion hints
+
+Resting a remainder needs a position in the sorted list. The caller supplies up to four
+predecessor candidates (`MatchHints.pred..pred4`, computed off-chain from the live book); the
+contract verifies each against the actual neighbors and, if all are stale, repairs by walking from
+the first live candidate (or the head), capped at `MAX_WALK_STEPS` nodes. A wrong hint can only
+*fail* placement (typed revert, resubmit with fresh hints) — never mis-place an order. Hints ride
+**outside** the EIP-712 payload, like `priceUpdate`: they are execution aids a relayer attaches at
+submission time, not signed intent.
 
 ## Per-fill checks
 
-Each prospective fill re-checks the owner's margin at the batch's oracle price:
+Each prospective fill re-checks the owner's margin at the transaction's oracle price:
 
-- **Fails IMR** → the order is **auto-canceled** (stamped `canceledBlock`, event emitted). A user who drifted insolvent since creation cannot haunt the book. The requirement is identical in fresh and stale batches — gap risk is priced into the always-on IMR ([Margin](margin.md)), not into a stale-mode rate.
-- **Stale price band** (stale-only) — a fill priced more than ±10% (`MAX_STALE_DEVIATION_BP`) from the last oracle price is voided. The out-of-band price is always the *maker's* by construction (Pass B fills at the limit's price, Pass C at the older order's), so only the maker leg is retired, and only its ID goes into `staleSkippedIds[]` — the band is the sole feeder of that witness, and the entry is what makes the void read as a legitimate skip rather than an omission. The counterparty stays live and retries against the next order on the maker's side; it needs no witness entry of its own, because the walk never advances past it and so no worse-priced same-side order can match ahead of it.
+- **Fails IMR** → the order is **auto-canceled** (stamped `canceledBlock`, unlinked, event
+  emitted). A user who drifted insolvent since creation cannot haunt the book.
+- Fresh exposure is margined at the oracle price with a one-sided incipient-loss debit for the
+  fill-vs-oracle gap; closing portions realize PnL and funding up front and reject on bad debt
+  (liquidation is the only path that may realize a loss beyond collateral).
 
-Fills realize proportional PnL and funding on closing portions, classify open/add/close/flip by size, and update both sides' buckets plus open-interest aggregates.
+## Stale oracle
 
-## Observation-block discipline
+Session-bound pairs run on the stale fallback (`lastPairPrice`) outside trading hours. While
+stale:
 
-`observationBlock` must be in the past and at most **12 L2 blocks** (~3 s) old. Orders created after it revert the batch (`OrderCreatedAfterObservation`); orders already filled at it revert (`StaleFilledOrder`); orders canceled, filled, or expired in the race window are skipped without penalty. This pins every batch to a verifiable snapshot of the book — the anchor for censorship proofs.
+- Non-crossing arrivals **insert** normally — overnight gap positioning is the point of the
+  always-on margin model.
+- A crossing fills only against makers priced within ±10% (`MAX_STALE_DEVIATION_BP`) of the last
+  stored price. An arrival that would cross an **out-of-band** maker is canceled outright (the
+  maker stays; the list is price-sorted, so nothing deeper could fill either).
+- Market orders and trigger execution revert — both are priced off the oracle, and a stale
+  reference can neither bound a fill nor arm a stop.
 
-## The batch witness
+The book can therefore never rest crossed, in either regime, and reopen needs no special
+uncrossing step.
 
-`_finalize` assembles a `BatchInfo` struct — total matched notional, oracle price, execution/observation blocks, timestamp, sequencer, stale flag, the **worst fill per side per type** (price + orderId FIFO watermarks), two Pass-C cross-side witnesses used to catch market-order censorship, and `staleSkippedIds[]` — hashes it into `batchHashes[batchId]`, and emits the full preimage in `BatchRecorded`. Anyone can later re-derive the hash and prove misconduct against it: see [Sequencers & Fraud Proofs](sequencers.md).
+## Triggered orders and the vault
 
-Zero-match batches store no hash and are unchallengeable — with no fills there is no matched range to have been censored from.
+Two flows have no arriving order to piggyback on:
 
-## Volume capacity
+- **Stops** — `executeTriggeredOrders` lets anyone fire triggered StopLimit/StopLoss orders
+  against a fresh Pyth price for a flat tip charged to the stop's owner. See
+  [Orders](orders.md).
+- **Liquidation inventory** — `liquidate()` crosses freshly seized inventory into the book
+  inline (bounded), and the permissionless `unloadVault` finishes the job for a reward. Both use
+  the liquidation price band min(`LIQ_MAX_SLIPPAGE_BP` = 5%, current MMR) around oracle. See
+  [Liquidations](liquidations.md).
 
-Before walking, the pair asks the sequencer registry for the caller's remaining capacity (bond × 14 over a rolling 30 minutes) and reverts if none; fills that would cross the boundary partial-fill up to it. Matched volume is recorded back to the registry after the walk.
+## After the walk
+
+A transaction's fills settle their aggregates once: open-interest totals, the fee-ledger debit,
+the mark-price VWAP (funding's anchor), the liquidation-gap EMA (for unload fills), and a vault
+health re-check. Fees are the insurance system's dynamic rates plus optional integrator referral
+fees — see [Fees](fees.md).

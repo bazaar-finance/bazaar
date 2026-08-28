@@ -13,11 +13,9 @@ library BazaarMathLib {
     error BazaarMathLib__OperandTooSmall();
     error BazaarMathLib__ResultOverflow();
 
-    /// @notice Compute the effective price of an order against a batch oracle price.
+    /// @notice Compute the effective price of an order against an oracle price.
     /// @dev Limit / StopLimit / TakeProfit use the configured limitPrice.
     ///      Market / StopLoss derive the bound from oracle ± slippage.
-    ///      Shared between MatchingEngineLib (matching) and BazaarSequencer (omission challenges)
-    ///      so both subsystems use identical math.
     function effectivePrice(
         BazaarTypes.OrderType orderType,
         uint256 limitPrice,
@@ -41,8 +39,8 @@ library BazaarMathLib {
     ///      A StopLoss closing a long is a sell stop (isLong=false) → price must be <= trigger; a
     ///      StopLoss closing a short is a buy stop (isLong=true) → price must be >= trigger.
     ///      The caller is responsible for only applying this to trigger-gated order types.
-    ///      Shared between MatchingEngineLib (matching) and BazaarSequencer (omission challenges)
-    ///      so both subsystems use identical trigger semantics.
+    ///      Shared between arrival-time arming and executeTriggers so both paths use identical
+    ///      trigger semantics.
     function stopTriggerReached(bool isLong, uint256 triggerPrice, uint256 oraclePrice) internal pure returns (bool) {
         return isLong ? oraclePrice >= triggerPrice : oraclePrice <= triggerPrice;
     }

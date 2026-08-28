@@ -3,17 +3,16 @@ pragma solidity 0.8.34;
 
 import {IntegrationBase} from "./IntegrationBase.sol";
 
-/// @notice Exercises BazaarPair's ADL window-deposit tagging (src/BazaarPair.sol:442-449) — a whole
-///         feature branch no test executed. AdlEdgeTest hand-seeds the mappings; here a REAL
-///         depositCollateral during a live ADL window drives the epoch-reset and same-epoch
+/// @notice Exercises BazaarPair.depositCollateral's ADL window-deposit tagging with a REAL
+///         deposit during a live ADL window, driving both the epoch-reset and the same-epoch
 ///         accumulate arms. The tag lets ADL scoring discount a mid-auction top-up so it can't
 ///         re-rank the queue; a bug that mis-tags would let a winner escape deleveraging by depositing.
 contract AdlWindowDepositTest is IntegrationBase {
     // adlDepositEpoch / adlWindowDeposits are internal mappings (no getter); slots from
     // `forge inspect BazaarPair storage-layout`. The guard assertions below fail loudly if the
     // layout ever shifts, so hardcoding the slot can't silently read the wrong word.
-    uint256 constant SLOT_ADL_DEPOSIT_EPOCH = 124;
-    uint256 constant SLOT_ADL_WINDOW_DEPOSITS = 125;
+    uint256 constant SLOT_ADL_DEPOSIT_EPOCH = 122;
+    uint256 constant SLOT_ADL_WINDOW_DEPOSITS = 123;
 
     function _adlDepositEpoch(address u) internal view returns (uint256) {
         return uint256(vm.load(address(pair), keccak256(abi.encode(u, SLOT_ADL_DEPOSIT_EPOCH))));
@@ -23,21 +22,17 @@ contract AdlWindowDepositTest is IntegrationBase {
         return uint256(vm.load(address(pair), keccak256(abi.encode(u, SLOT_ADL_WINDOW_DEPOSITS))));
     }
 
-    /// @dev Drive the pair into a live ADL window via a deep-underwater liquidation the vault inherits.
-    ///      Mirrors AdlIntegrationTest's trigger.
+    /// @dev Drive the pair into a live ADL window via a deep-underwater liquidation the vault
+    ///      inherits: a real matched 5 BTC book, then a phantom estate whose bankruptcy gap
+    ///      overruns 80% of the insurance fund.
     function _triggerAdl() internal {
-        vm.startPrank(seq);
-        usdc.approve(address(sequencer), 20_000 * USDC_SCALE);
-        sequencer.deposit(20_000 * USDC_SCALE);
-        vm.stopPrank();
-
         _deposit(alice, 60_000 * BAZAAR_SCALE);
         _deposit(bob, 60_000 * BAZAAR_SCALE);
         uint256 size = 5 * BAZAAR_SCALE;
-        uint256 aL = _placeLimit(alice, true, size, 51_000 * BAZAAR_SCALE);
-        uint256 bS = _placeLimit(bob, false, size, 49_000 * BAZAAR_SCALE);
+        _placeLimit(alice, true, size, 51_000 * BAZAAR_SCALE);
         _roll(2);
-        assertEq(_match(_lists(_one(aL), _one(bS), _empty(), _empty()), 10), 1, "5 BTC opened");
+        _placeLimit(bob, false, size, 49_000 * BAZAAR_SCALE);
+        assertEq(_posSize(alice), size, "5 BTC opened");
 
         _deposit(dave, 10 * BAZAAR_SCALE);
         _writePosition(dave, true, size, 254_960 * BAZAAR_SCALE); // bankruptcy ~$50,990 → deep underwater

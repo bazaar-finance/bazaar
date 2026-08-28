@@ -8,29 +8,23 @@ import {IntegrationBase} from "./IntegrationBase.sol";
 /// @title AdlIntegrationTest
 /// @notice Full ADL lifecycle on the live pair: a deep-underwater liquidation hands the vault an
 ///         exposure whose expected loss exceeds 80% of the insurance fund → ADL triggers (freezing
-///         trading) → after the 15-minute auction the opposite-side winner is deleveraged at the
-///         vault's bankruptcy price, insurance funds the credit, the vault exposure clears, and the
-///         margin curve is recomputed on completion.
+///         trading) → once the auction's score threshold decays the opposite-side winner is
+///         deleveraged at the vault's bankruptcy price, insurance funds the credit, the vault
+///         exposure clears, and the margin curve is recomputed on completion.
 contract AdlIntegrationTest is IntegrationBase {
     function test_e2e_Adl_TriggersOnDeepLiquidation_AndDeleveragesWinner() public {
-        // Boost the sequencer bond so the 5 BTC open (~$255k notional) fits the volume cap (bond×15).
-        vm.startPrank(seq);
-        usdc.approve(address(sequencer), 20_000 * USDC_SCALE);
-        sequencer.deposit(20_000 * USDC_SCALE);
-        vm.stopPrank();
-
-        // Real matched pair: alice long 5 / bob short 5, filled at alice's older $51k limit.
+        // Real matched pair: alice long 5 / bob short 5, filled at alice's resting $51k limit.
         _deposit(alice, 60_000 * BAZAAR_SCALE);
         _deposit(bob, 60_000 * BAZAAR_SCALE);
         uint256 size = 5 * BAZAAR_SCALE;
-        uint256 aL = _placeLimit(alice, true, size, 51_000 * BAZAAR_SCALE);
-        uint256 bS = _placeLimit(bob, false, size, 49_000 * BAZAAR_SCALE);
+        _placeLimit(alice, true, size, 51_000 * BAZAAR_SCALE);
         _roll(2);
-        assertEq(_match(_lists(_one(aL), _one(bS), _empty(), _empty()), 10), 1, "5 BTC opened at $51k");
+        _placeLimit(bob, false, size, 49_000 * BAZAAR_SCALE);
+        assertEq(_posSize(alice), size, "5 BTC opened at $51k");
         _assertBooksSettled("adl: after open");
 
         // Phantom deep-underwater long for dave: bankruptcy price $50,990/BTC → at the $50k oracle the
-        // vault-inherited loss is (254,950 − 250,000) = $4,950 > 80% of the ~$5k insurance fund.
+        // vault-inherited loss is (254,950 − 250,000) = $4,950 > 80% of the ~$4k insurance fund.
         _deposit(dave, 10 * BAZAAR_SCALE);
         _writePosition(dave, true, size, 254_960 * BAZAAR_SCALE);
         // _writePosition only rewrites size/entryValue (not collateral), so the cash books still balance.
@@ -58,8 +52,9 @@ contract AdlIntegrationTest is IntegrationBase {
         assertEq(evPrice, aux.adlSnapshotPrice, "event snapshot price matches auxState");
         assertEq(evFunding, aux.adlSnapshotFundingIndex, "event frozen funding matches auxState");
 
-        // Wait out the 15-minute auction so the score threshold collapses, then deleverage bob —
-        // the short side (opposite the vault's inherited long), in profit at the snapshot price.
+        // Wait out the 10-minute auction (ADL_AUCTION_DURATION) so the score threshold collapses,
+        // then deleverage bob — the short side (opposite the vault's inherited long), in profit at
+        // the snapshot price.
         vm.warp(vm.getBlockTimestamp() + 15 minutes + 1);
         uint256 insBefore = _insuranceBal();
         uint256 bobCollBefore = _posCollateral(bob);

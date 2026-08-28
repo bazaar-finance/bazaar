@@ -50,9 +50,9 @@ contract ReentrantActor {
     }
 }
 
-/// @notice The suite had zero attacker-contract / reentrancy tests despite seven ETH-refunding
-///         payable entrypoints. These prove the contract-wide ReentrancyGuard actually blocks
-///         reentry through the refund callback.
+/// @notice Every payable BazaarPair entrypoint refunds excess ETH to the caller mid-call. These
+///         prove the contract-wide ReentrancyGuard actually blocks reentry through that refund
+///         callback — both into the same entrypoint and across entrypoints.
 contract ReentrancyAttackTest is IntegrationBase {
     ReentrantActor internal actor;
 

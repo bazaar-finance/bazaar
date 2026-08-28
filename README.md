@@ -2,7 +2,7 @@
 
 **Permissionless perpetual futures on anything with a price feed — no admin keys, no whitelists, no off-switch.**
 
-Bazaar is a USDC-margined perpetual-futures protocol built for Arbitrum. Any asset with a [Pyth](https://pyth.network) price feed — crypto, equities, FX, indices — can be listed permissionlessly through an [UMA Optimistic Oracle](https://uma.xyz) assertion and traded on an on-chain central limit order book. Order matching is performed in batches by **permissionless, bonded sequencers** whose honesty is enforced by on-chain fraud proofs rather than trust.
+Bazaar is a USDC-margined perpetual-futures protocol built for Arbitrum. Any asset with a [Pyth](https://pyth.network) price feed — crypto, equities, FX, indices — can be listed permissionlessly through an [UMA Optimistic Oracle](https://uma.xyz) assertion and traded on an on-chain central limit order book. The book is **fully on-chain and sorted**, and orders match **on arrival**, inside their own creation transaction — price-time priority and fill prices are enforced by the contract itself, with no trusted matcher anywhere in the fill path.
 
 The protocol is immutable: no owner, no pauser, no upgradeable proxies, no governance token. Every privileged action is either fully permissionless, economically bonded, or adjudicated by UMA's optimistic oracle. The single governed parameter — the UMA identifier those assertions are adjudicated under — moves only through a $5,000-bonded assertion, a 2-day public dispute window, and a 14-day activation timelock.
 
@@ -12,7 +12,7 @@ The protocol is immutable: no owner, no pauser, no upgradeable proxies, no gover
 
 **Read the book at [docs.bazaar.finance](https://docs.bazaar.finance/).**
 
-Everything protocol-level — architecture, matching, the risk engine, funding, fees, listing, termination, parameter tables, the contract reference, and role guides for traders, LPs, sequencers, and integrators — lives there, built from [`docs/`](docs) and redeployed on every push that touches it. The book is the single source of truth for how the protocol works; this README covers only the repository itself.
+Everything protocol-level — architecture, matching, the risk engine, funding, fees, listing, termination, parameter tables, the contract reference, and role guides for traders, LPs, keepers, and integrators — lives there, built from [`docs/`](docs) and redeployed on every push that touches it. The book is the single source of truth for how the protocol works; this README covers only the repository itself.
 
 ## Development
 
@@ -25,7 +25,7 @@ forge build
 forge test
 ```
 
-The test suite is 869 tests across 76 suites. CI pins Foundry to v1.4.3 and runs `forge fmt --check`, build, and the full suite on every push; EIP-170 size limits are enforced as a test (`test/unit/ContractSizeTest.t.sol`) over production contracts.
+CI pins Foundry to v1.4.3 and runs `forge fmt --check`, build, and the full test suite on every push; EIP-170 size limits are enforced as a test (`test/unit/ContractSizeTest.t.sol`) over production contracts.
 
 For the full local stack on Anvil — mocked Pyth/UMA/USDC, listing a pair, pushing prices, placing orders — see [Local Development](https://docs.bazaar.finance/guide/quick-start.html) in the book; `make help` lists every target. Deploying the protocol to a real network is covered in [Self-Deployment](https://docs.bazaar.finance/guide/deployment.html).
 
@@ -35,13 +35,12 @@ For the full local stack on Anvil — mocked Pyth/UMA/USDC, listing a pair, push
 src/
 ├── BazaarPair.sol              # Core market: orders, positions, insurance, lifecycle
 ├── BazaarFactory.sol           # UMA-gated listings, EIP-1167 cloning
-├── BazaarSequencer.sol         # Bonds, volume caps, fraud proofs
 ├── BazaarOracle.sol            # Pyth adapter + composite feeds
 ├── BazaarPairTerminator.sol    # Wind-down paths
 ├── BazaarPairLens.sol          # Read-only views
 ├── interfaces/
 └── libraries/                  # ten DELEGATECALL externals, then inlined helpers
-    ├── MatchingEngineLib.sol   # Three-pass batch matching + witnesses
+    ├── MatchingEngineLib.sol   # Arrival matching: the walk, insertion, unload
     ├── OrderManagementLib.sol  # Order creation/cancel/cleanup
     ├── CollateralLib.sol       # Deposits/withdrawals incl. terminal modes
     ├── LiquidationLib.sol      # Bankruptcy pricing, vault aggregation
@@ -51,6 +50,7 @@ src/
     ├── FundingLib.sol          # Mark EMA + funding index
     ├── TerminationLib.sol      # Settlement waterfall
     ├── MetaTxLib.sol           # EIP-712 meta-transactions
+    ├── OrderBookLib.sol        # Sorted doubly-linked book lists (insert/unlink)
     ├── BucketLib.sol           # Position solvency math
     ├── VaultHealthLib.sol      # ADL/termination triggers
     ├── MmrSampleLib.sol        # 24h-lagged MMR ring buffer
@@ -58,8 +58,8 @@ src/
     └── BazaarTypes.sol         # Structs, enums, protocol constants
 script/                         # DeployLibraries + DeployBazaar + network config
 test/
-├── unit/                       # 27 test files: per-library and per-mechanism
-└── integration/                # 34 test files: end-to-end, incl. zero-sum invariant
+├── unit/                       # 24 test files: per-library and per-mechanism
+└── integration/                # 31 test files: end-to-end, incl. zero-sum invariant
 ```
 
 ## Security

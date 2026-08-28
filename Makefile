@@ -64,7 +64,6 @@ deploy-anvil:
 	FACTORY_ADDR=$$(grep "BazaarFactory:" /tmp/bazaar-deploy.log | head -1 | awk '{print $$NF}') && \
 	ORACLE_ADDR=$$(grep "BazaarOracle:" /tmp/bazaar-deploy.log | head -1 | awk '{print $$NF}') && \
 	PAIR_IMPL_ADDR=$$(grep "BazaarPair implementation:" /tmp/bazaar-deploy.log | head -1 | awk '{print $$NF}') && \
-	SEQUENCER_ADDR=$$(grep "BazaarSequencer:" /tmp/bazaar-deploy.log | head -1 | awk '{print $$NF}') && \
 	LENS_ADDR=$$(grep "BazaarPairLens:" /tmp/bazaar-deploy.log | head -1 | awk '{print $$NF}') && \
 	TERMINATOR_ADDR=$$(grep "BazaarTerminatePair:" /tmp/bazaar-deploy.log | head -1 | awk '{print $$NF}') && \
 	USDC_ADDR=$$(grep "USDC:" /tmp/bazaar-deploy.log | head -1 | awk '{print $$NF}') && \
@@ -89,11 +88,10 @@ deploy-anvil:
 	echo "  BazaarFactory:         $$FACTORY_ADDR" && \
 	echo "  BazaarOracle:          $$ORACLE_ADDR" && \
 	echo "  BazaarPair (impl):     $$PAIR_IMPL_ADDR" && \
-	echo "  BazaarSequencer:       $$SEQUENCER_ADDR" && \
 	echo "  BazaarPairLens:        $$LENS_ADDR" && \
 	echo "  BazaarTerminatePair:   $$TERMINATOR_ADDR" && \
-	printf "OOV3=%s\nUSDC=%s\nFACTORY=%s\nORACLE=%s\nPAIR_IMPL=%s\nSEQUENCER=%s\nLENS=%s\nTERMINATOR=%s\n" \
-		$$OOV3_ADDR $$USDC_ADDR $$FACTORY_ADDR $$ORACLE_ADDR $$PAIR_IMPL_ADDR $$SEQUENCER_ADDR $$LENS_ADDR $$TERMINATOR_ADDR \
+	printf "OOV3=%s\nUSDC=%s\nFACTORY=%s\nORACLE=%s\nPAIR_IMPL=%s\nLENS=%s\nTERMINATOR=%s\n" \
+		$$OOV3_ADDR $$USDC_ADDR $$FACTORY_ADDR $$ORACLE_ADDR $$PAIR_IMPL_ADDR $$LENS_ADDR $$TERMINATOR_ADDR \
 		> .anvil-addresses
 
 # ---------- Anvil Utilities ----------
@@ -171,9 +169,9 @@ create-order-anvil:
 	echo "  Limit price: $(LIMIT_PRICE) USD" && \
 	echo "  Long:        $(or $(IS_LONG),true)" && \
 	cast send $(PAIR) \
-		"createOrder(uint8,uint256,uint256,uint256,uint256,bool,bool,uint64,address,bytes[],uint256,uint256,uint256,bytes)" \
-		1 0 $$LIMIT_WEI 0 $$SIZE_WEI $(or $(IS_LONG),true) false 18446744073709551615 \
-		0x0000000000000000000000000000000000000000 \
+		"createOrder((uint8,bool,bool,bool,uint256,uint256,uint256,uint256,uint64,address),(uint64,uint64,uint64,uint64,uint32),bytes[],uint256,uint256,uint256,bytes)" \
+		"(1,$(or $(IS_LONG),true),false,false,$$SIZE_WEI,0,$$LIMIT_WEI,0,18446744073709551615,0x0000000000000000000000000000000000000000)" \
+		"(0,0,0,0,0)" \
 		"[$$BASE_UPDATE,$$USDC_UPDATE]" 0 0 0 0x \
 		--rpc-url $(ANVIL_RPC_URL) \
 		--private-key $(ANVIL_PRIVATE_KEY) \

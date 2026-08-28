@@ -5,6 +5,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {BazaarTypes} from "./BazaarTypes.sol";
 import {BucketLib} from "./BucketLib.sol";
 import {VaultHealthLib} from "./VaultHealthLib.sol";
+import {OrderBookLib} from "./OrderBookLib.sol";
 
 /// @title AdlLib
 /// @notice External library for Auto-Deleveraging (ADL) logic. Runs via DELEGATECALL with BazaarPair storage.
@@ -63,6 +64,7 @@ library AdlLib {
     ///      BazaarPair handles reward transfers and vault health re-evaluation after this returns.
     function executeAdlCore(
         mapping(uint256 => BazaarTypes.Order) storage orders,
+        BazaarTypes.OrderBook storage book,
         mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
         BazaarTypes.Vault storage pairVault,
         address[] calldata winners,
@@ -98,6 +100,7 @@ library AdlLib {
         // total it closed (which equals effectiveSize unless the early-break fired).
         r.totalLiqSize = _closeAdlWinners(
             orders,
+            book,
             positionBuckets,
             pairVault,
             winners,
@@ -227,6 +230,7 @@ library AdlLib {
     /// @notice Pass 2: Close eligible winners at the settlement price
     function _closeAdlWinners(
         mapping(uint256 => BazaarTypes.Order) storage orders,
+        BazaarTypes.OrderBook storage book,
         mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
         BazaarTypes.Vault storage pairVault,
         address[] calldata winners,
@@ -323,7 +327,7 @@ library AdlLib {
                     adlScore,
                     settlementPrice
                 );
-                _resetBucket(orders, user, bucket, params);
+                _resetBucket(orders, book, user, bucket, params);
             } else {
                 // Partial close
                 closedSize = remaining;
@@ -416,43 +420,64 @@ library AdlLib {
         }
     }
 
-    /// @notice Resets a user's position bucket after full ADL close (cancels TP/SL/Market, zeros position fields)
+    /// @notice Resets a user's position bucket after full ADL close (cancels TP/SL, zeros
+    ///         position fields). A resting TakeProfit is unlinked from the book in the same
+    ///         write, so no walk can fill an order whose backing position was just deleveraged.
     function _resetBucket(
         mapping(uint256 => BazaarTypes.Order) storage orders,
+        BazaarTypes.OrderBook storage book,
         address user,
         BazaarTypes.PositionBucket storage bucket,
         BazaarTypes.AdlParams memory params
     ) internal {
-        // Cancel active TP/SL/Market orders
-        if (bucket.takeProfitOrderId != 0) {
-            BazaarTypes.Order storage tpOrder = orders[bucket.takeProfitOrderId];
-            if (tpOrder.canceledBlock == 0 && tpOrder.filledBlock == 0) {
-                tpOrder.canceledBlock = params.currentBlock;
-            }
-        }
-        if (bucket.stopLossOrderId != 0) {
-            BazaarTypes.Order storage slOrder = orders[bucket.stopLossOrderId];
-            if (slOrder.canceledBlock == 0 && slOrder.filledBlock == 0) {
-                slOrder.canceledBlock = params.currentBlock;
-            }
-        }
-        if (bucket.activeMarketOrderId != 0) {
-            BazaarTypes.Order storage mktOrder = orders[bucket.activeMarketOrderId];
-            if (mktOrder.canceledBlock == 0 && mktOrder.filledBlock == 0) {
-                mktOrder.canceledBlock = params.currentBlock;
-            }
-        }
+        _cancelBucketOrder(orders, book, bucket.takeProfitOrderId, params.pairId, params.currentBlock);
+        _cancelBucketOrder(orders, book, bucket.stopLossOrderId, params.pairId, params.currentBlock);
 
         bucket.size = 0;
         bucket.entryValue = 0;
         bucket.entryFundingIndex = 0;
         bucket.takeProfitOrderId = 0;
         bucket.stopLossOrderId = 0;
-        bucket.activeMarketOrderId = 0;
         bucket.entryMmrBp = 0; // keep the "flat => no MMR grandfather" invariant
         bucket.mmrUpdateTs = 0; // and the "0 when flat" grace-clock invariant
         // Note: collateral is NOT reset (already updated by caller with PnL)
 
         BucketLib.emitBucketUpdate(user, bucket, params.currentFundingIndex, params.marginRequirements, params.pairId);
+    }
+
+    /// @dev Cancel one slot-anchored order (0 = none): stamp, unlink, emit. Already-terminal
+    ///      orders are left untouched.
+    function _cancelBucketOrder(
+        mapping(uint256 => BazaarTypes.Order) storage orders,
+        BazaarTypes.OrderBook storage book,
+        uint256 orderId,
+        bytes32 pairId,
+        uint64 currentBlock
+    ) private {
+        if (orderId == 0) return;
+        BazaarTypes.Order storage o = orders[orderId];
+        if (o.canceledBlock != 0 || o.filledBlock != 0) return;
+        o.canceledBlock = currentBlock;
+        OrderBookLib.unlink(orders, book, orderId);
+        emit BazaarTypes.OrderUpdated(
+            pairId,
+            orderId,
+            o.creator,
+            BazaarTypes.OrderUpdatePayload({
+                action: BazaarTypes.OrderAction.Canceled,
+                orderType: o.orderType,
+                isLong: o.isLong,
+                isPostOnly: o.isPostOnly,
+                size: o.size,
+                filledSize: o.filledSize,
+                triggerPrice: o.triggerPrice,
+                limitPrice: o.limitPrice,
+                maxSlippageBp: o.maxSlippageBp,
+                canceledBlock: currentBlock,
+                filledBlock: o.filledBlock,
+                expiryBlock: o.expiryBlock,
+                creationBlock: o.creationBlock
+            })
+        );
     }
 }

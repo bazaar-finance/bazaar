@@ -25,7 +25,6 @@ interface IBazaarPairLens {
             uint256 takeProfitOrderId,
             uint256 stopLossOrderId,
             uint256 entryMmrBp,
-            uint256 activeMarketOrderId,
             uint256 mmrUpdateTs
         );
     function currentFundingIndex() external view returns (int256);
@@ -64,6 +63,30 @@ interface IBazaarPairLens {
     function isPairTerminatedEmergency() external view returns (bool);
     function outstandingOrderExposure(address user) external view returns (uint256 longExposure, uint256 shortExposure);
     function auxState() external view returns (BazaarTypes.AuxState memory);
+    function book() external view returns (uint64 bidHead, uint64 askHead, uint64 bidCount, uint64 askCount);
+    function orders(uint256 orderId)
+        external
+        view
+        returns (
+            address creator,
+            address integrator,
+            uint256 triggerPrice,
+            uint256 limitPrice,
+            uint256 maxSlippageBp,
+            uint256 size,
+            uint256 filledSize,
+            uint8 orderType,
+            bool isLong,
+            bool isPostOnly,
+            bool isIoc,
+            bool inBook,
+            uint64 creationBlock,
+            uint64 expiryBlock,
+            uint64 canceledBlock,
+            uint64 filledBlock,
+            uint64 prevInBook,
+            uint64 nextInBook
+        );
 }
 
 /// @title BazaarPairLens
@@ -87,7 +110,6 @@ contract BazaarPairLens {
             bucket.takeProfitOrderId,
             bucket.stopLossOrderId,
             bucket.entryMmrBp,
-            bucket.activeMarketOrderId,
             bucket.mmrUpdateTs
         ) = IBazaarPairLens(pair).positionBuckets(user);
     }
@@ -108,7 +130,6 @@ contract BazaarPairLens {
             bucket.takeProfitOrderId,
             bucket.stopLossOrderId,
             bucket.entryMmrBp,
-            bucket.activeMarketOrderId,
             bucket.mmrUpdateTs
         ) = IBazaarPairLens(pair).positionBuckets(user);
 
@@ -116,8 +137,8 @@ contract BazaarPairLens {
 
         BazaarTypes.MarginRequirements memory marginReqs;
         (marginReqs.imrBp, marginReqs.mmrBp, marginReqs.lastUpdateTs,) = IBazaarPairLens(pair).marginRequirements();
-        // Use the live 24h-lagged MMR so this view matches what liquidate()/matchBatch() apply
-        // on-chain; without it, an old position would display against entryMmrBp instead.
+        // Use the live 24h-lagged MMR so this view matches what liquidate() and the matching
+        // walk apply on-chain; without it, an old position would display against entryMmrBp.
         marginReqs.laggedMmrBp = IBazaarPairLens(pair).getLaggedMmrBp();
 
         result = BucketLib.calculateState(bucket, currentPrice, fundingIdx, marginReqs);
@@ -175,7 +196,6 @@ contract BazaarPairLens {
             bucket.takeProfitOrderId,
             bucket.stopLossOrderId,
             bucket.entryMmrBp,
-            bucket.activeMarketOrderId,
             bucket.mmrUpdateTs
         ) = IBazaarPairLens(pair).positionBuckets(user);
         if (bucket.size == 0 || bucket.isLong != aux.adlLongs) return (0, false);
@@ -219,7 +239,7 @@ contract BazaarPairLens {
         view
         returns (uint256 collateral, uint256 registeredClaim, uint256 profitRatioBp, uint256 claimPayout)
     {
-        (,,, collateral,,,,,,) = IBazaarPairLens(pair).positionBuckets(user);
+        (,,, collateral,,,,,) = IBazaarPairLens(pair).positionBuckets(user);
         registeredClaim = IBazaarPairLens(pair).terminalProfitClaim(user);
         profitRatioBp = IBazaarPairLens(pair).auxState().normalTerminalWinnersPayoutRatioBp;
         claimPayout = Math.mulDiv(registeredClaim, profitRatioBp, BazaarTypes.BP_SCALE);
@@ -242,7 +262,7 @@ contract BazaarPairLens {
         returns (uint256 bounty, bool settleable)
     {
         if (IBazaarPairLens(pair).settlementPriceFixedTs() == 0) return (0, false);
-        (, uint256 size,,,,,,,,) = IBazaarPairLens(pair).positionBuckets(user);
+        (, uint256 size,,,,,,,) = IBazaarPairLens(pair).positionBuckets(user);
         if (size == 0) return (0, false);
         return (CollateralLib._bountyFor(size, IBazaarPairLens(pair).fixedSettlementPrice()), true);
     }
@@ -288,7 +308,6 @@ contract BazaarPairLens {
             bucket.takeProfitOrderId,
             bucket.stopLossOrderId,
             bucket.entryMmrBp,
-            bucket.activeMarketOrderId,
             bucket.mmrUpdateTs
         ) = IBazaarPairLens(pair).positionBuckets(user);
 
@@ -405,13 +424,9 @@ contract BazaarPairLens {
     function getOrderLifetimeConstants()
         external
         pure
-        returns (uint64 minOrderLifetimeBlocks, uint64 marketOrderLifetimeBlocks, uint64 maxOrderLifetimeBlocks)
+        returns (uint64 minOrderLifetimeBlocks, uint64 maxOrderLifetimeBlocks)
     {
-        return (
-            BazaarTypes.MIN_ORDER_LIFETIME_BLOCKS,
-            BazaarTypes.MARKET_ORDER_LIFETIME_BLOCKS,
-            BazaarTypes.MAX_ORDER_LIFETIME_BLOCKS
-        );
+        return (BazaarTypes.MIN_ORDER_LIFETIME_BLOCKS, BazaarTypes.MAX_ORDER_LIFETIME_BLOCKS);
     }
 
     /// @notice Returns the minimum collateral deposit amount
@@ -461,10 +476,6 @@ contract BazaarPairLens {
         );
     }
 
-    /// @notice Returns the flat sequencer fee per side
-    function getSequencerFlatFeePerSide() external pure returns (uint256) {
-        return BazaarTypes.SEQUENCER_FLAT_FEE_PER_SIDE;
-    }
 
     /// @notice Returns the keeper reward constants shared by live liquidation and terminal
     ///         settlement: reward = max(minReward, notional * feeEbp / ebpScale).
@@ -474,6 +485,75 @@ contract BazaarPairLens {
         returns (uint256 minReward, uint256 feeEbp, uint256 ebpScale)
     {
         return (BazaarTypes.MIN_LIQUIDATOR_REWARD, BazaarTypes.LIQUIDATION_FEE_EBP, BazaarTypes.EBP_SCALE);
+    }
+
+    // ---- Order book views ----
+
+    /// @dev limitPrice + book links of one order, read through the pair's public getter.
+    function _bookNode(address pair, uint64 id) internal view returns (uint256 price, uint64 next) {
+        (,,, uint256 p,,,,,,,,,,,,,, uint64 nxt) = IBazaarPairLens(pair).orders(id);
+        return (p, nxt);
+    }
+
+    /// @notice Head-to-tail page of one book side, for depth displays and hint computation.
+    /// @param startId 0 = start at the side's head; otherwise resume from this order.
+    /// @param maxN Maximum nodes returned.
+    /// @return orderIds The visited orders in book order (array length = nodes actually visited).
+    /// @return prices Their limit prices.
+    /// @return nextId 0 when the side is exhausted; otherwise pass it as the next page's startId.
+    function getBookDepth(address pair, bool isLong, uint64 startId, uint256 maxN)
+        external
+        view
+        returns (uint256[] memory orderIds, uint256[] memory prices, uint64 nextId)
+    {
+        (uint64 bidHead, uint64 askHead,,) = IBazaarPairLens(pair).book();
+        uint64 cur = startId != 0 ? startId : (isLong ? bidHead : askHead);
+        uint256[] memory ids = new uint256[](maxN);
+        uint256[] memory pxs = new uint256[](maxN);
+        uint256 n;
+        while (cur != 0 && n < maxN) {
+            (uint256 p, uint64 nxt) = _bookNode(pair, cur);
+            ids[n] = cur;
+            pxs[n] = p;
+            unchecked {
+                ++n;
+            }
+            cur = nxt;
+        }
+        // Truncate both arrays to the visited count (shrinking a length in place is memory-safe).
+        assembly ("memory-safe") {
+            mstore(ids, n)
+            mstore(pxs, n)
+        }
+        return (ids, pxs, cur);
+    }
+
+    /// @notice Hint helper for MatchHints.pred: the orderId a new (limitPrice, orderId) entry
+    ///         should rest directly behind on its side (0 = it belongs at the head). The new
+    ///         order's id is always larger than every resting id, so equal prices queue it last.
+    /// @param startId 0 = walk from the side's head; otherwise resume from this order.
+    /// @param maxIter Node budget for this call.
+    /// @return pred The predecessor when `found`, else the last node visited (resume point).
+    /// @return found False when the budget ran out before the position was reached — call again
+    ///         with startId = pred.
+    function findPredecessor(address pair, bool isLong, uint256 limitPrice, uint64 startId, uint256 maxIter)
+        external
+        view
+        returns (uint64 pred, bool found)
+    {
+        (uint64 bidHead, uint64 askHead,,) = IBazaarPairLens(pair).book();
+        uint64 cur = startId != 0 ? startId : (isLong ? bidHead : askHead);
+        pred = startId;
+        for (uint256 i; i < maxIter; ++i) {
+            if (cur == 0) return (pred, true); // tail reached: rest behind the last node
+            (uint256 p,) = _bookNode(pair, cur);
+            // Strictly better-priced nodes stay ahead; equal price keeps FIFO (new id is newest).
+            bool nodeFirst = isLong ? p >= limitPrice : p <= limitPrice;
+            if (!nodeFirst) return (pred, true);
+            pred = cur;
+            (, cur) = _bookNode(pair, cur);
+        }
+        return (pred, false);
     }
 
     // ---- Auxiliary BazaarPair state forwarders ----

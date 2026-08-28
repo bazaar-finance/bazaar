@@ -14,7 +14,7 @@ proposePairDeployment(baseFeedId, isContinuouslyTraded, totalAmount, description
         ▼
 assertionResolvedCallback / settleDeploymentProposal
         ├─ truthful → EIP-1167 clone deployed, seeded, registered with
-        │             sequencer + terminator; pairId = baseFeedId
+        │             the terminator; pairId = baseFeedId
         └─ disputed-and-false → bond lost to disputer, seed refunded
 ```
 

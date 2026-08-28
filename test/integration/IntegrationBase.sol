@@ -8,7 +8,6 @@ import {BazaarFactory} from "../../src/BazaarFactory.sol";
 import {BazaarPair} from "../../src/BazaarPair.sol";
 import {BazaarPairLens} from "../../src/BazaarPairLens.sol";
 import {BazaarOracle} from "../../src/BazaarOracle.sol";
-import {BazaarSequencer} from "../../src/BazaarSequencer.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 import {MockUSDC} from "../mocks/MockUSDC.sol";
 import {MockArbSys} from "../mocks/MockArbSys.sol";
@@ -16,12 +15,17 @@ import {MockPyth} from "@pythnetwork/pyth-sdk-solidity/MockPyth.sol";
 
 /// @title IntegrationBase
 /// @notice Shared deployment harness for the Bazaar integration suite. Every integration test
-///         contract inherits this so it gets a full factory/oracle/sequencer/pair deployment plus
-///         the order/deposit/match/price helpers — no duplicated setUp per file.
+///         contract inherits this so it gets a full factory/oracle/pair deployment plus the
+///         order/deposit/price helpers — no duplicated setUp per file.
 ///
-/// @dev    Prank ordering gotcha: any helper that builds a Pyth price update makes an EXTERNAL call
-///         to `mockPyth`, which CONSUMES a pending `vm.prank`. Every helper here builds the price
-///         bytes BEFORE the prank; do the same in tests.
+/// @dev    Matching is arrival-time: createOrder walks the book in the same transaction, so a
+///         crossing placement fills immediately at the resting maker's price and there is no
+///         separate match step. Helpers that place a maker first and a crossing taker second
+///         therefore produce the fill prices their callers assert on.
+///
+///         Prank ordering gotcha: any helper that builds a Pyth price update makes an EXTERNAL
+///         call to `mockPyth`, which CONSUMES a pending `vm.prank`. Every helper here builds the
+///         price bytes BEFORE the prank; do the same in tests.
 abstract contract IntegrationBase is Test {
     using stdStorage for StdStorage;
     StdStorage internal _stdstore;
@@ -37,7 +41,6 @@ abstract contract IntegrationBase is Test {
 
     BazaarFactory public factory;
     BazaarOracle public oracle;
-    BazaarSequencer public sequencer;
     BazaarPair public pair;
     BazaarPair public aaplPair;
     MockUSDC public usdc;
@@ -49,7 +52,7 @@ abstract contract IntegrationBase is Test {
     address public bob;
     address public carol;
     address public dave;
-    address public seq;
+    address public seq; // generic keeper address (trigger execution, unloads, sweeps)
 
     function setUp() public virtual {
         deployer = makeAddr("deployer");
@@ -66,7 +69,6 @@ abstract contract IntegrationBase is Test {
         (, address usdcAddr,,) = helperConfig.activeNetworkConfig();
         usdc = MockUSDC(usdcAddr);
         oracle = factory.oracle();
-        sequencer = factory.sequencer();
         mockPyth = MockPyth(address(oracle.pyth()));
         lens = new BazaarPairLens();
 
@@ -97,12 +99,7 @@ abstract contract IntegrationBase is Test {
         (,,,,,, bytes32 aaplPairId,,,) = factory.deploymentProposals(aaplAssertionId);
         aaplPair = BazaarPair(payable(factory.getPairAddress(aaplPairId)));
 
-        vm.startPrank(seq);
-        usdc.approve(address(sequencer), 5_000 * USDC_SCALE);
-        sequencer.deposit(5_000 * USDC_SCALE);
-        vm.stopPrank();
-
-        vm.roll(block.number + 20); // observationBlock headroom
+        vm.roll(block.number + 20);
     }
 
     // ---------------------------- price helpers ----------------------------
@@ -128,7 +125,7 @@ abstract contract IntegrationBase is Test {
     }
 
     /// @dev BTC update at an arbitrary price, stamped now. Uses the vm.getBlockTimestamp() cheatcode
-    ///      (not the block.timestamp opcode) so a stale cached timestamp can't slip in after a match.
+    ///      (not the block.timestamp opcode) so a stale cached timestamp can't slip in after a fill.
     function _priceAt(uint256 priceUsd) internal returns (bytes[] memory) {
         return _priceUpdate(priceUsd, uint64(vm.getBlockTimestamp()));
     }
@@ -154,75 +151,79 @@ abstract contract IntegrationBase is Test {
     }
 
     // ---------------------------- orders ----------------------------
+
+    /// @dev Zeroed execution aids: head-insert-or-repair positioning, protocol-default walk cap.
+    function _hintsNone() internal pure returns (BazaarTypes.MatchHints memory m) {}
+
+    /// @dev Per-pair probe watermark for _lastCreatedOrderId.
+    mapping(address => uint256) internal _idProbe;
+
+    /// @dev The newest orderId a pair has assigned. Ids are a gapless monotonic counter from 1,
+    ///      so probing forward from a per-pair watermark finds the last created order without
+    ///      reading events — createOrder has no id return, and the order may already be terminal
+    ///      (filled or canceled in its own transaction) so the active-set is no source either.
+    function _lastCreatedOrderId(BazaarPair p) internal returns (uint256) {
+        uint256 w = _idProbe[address(p)];
+        if (w == 0) w = 1;
+        while (true) {
+            (address creator,,,,,,,,,,,,,,,,,) = p.orders(w);
+            if (creator == address(0)) break;
+            ++w;
+        }
+        _idProbe[address(p)] = w;
+        require(w > 1, "no orders created yet");
+        return w - 1;
+    }
+
     function _newestLimitOrderId(address user) internal returns (uint256) {
         (uint256[] memory ids,,,) = pair.getUserActiveLimitOrders(user);
         require(ids.length > 0, "no active limit orders");
         return ids[ids.length - 1];
     }
 
+    function _limitSpec(bool isLong, uint256 size, uint256 limitPrice)
+        internal
+        view
+        returns (BazaarTypes.OrderSpec memory s)
+    {
+        s.orderType = BazaarTypes.OrderType.Limit;
+        s.isLong = isLong;
+        s.size = size;
+        s.limitPrice = limitPrice;
+        s.expirationBlock = uint64(block.number + 500_000);
+    }
+
     function _placeLimit(address user, bool isLong, uint256 size, uint256 limitPrice) internal returns (uint256) {
         bytes[] memory pu = _freshPrice(); // build BEFORE the prank (external mockPyth call would consume it)
         vm.prank(user);
-        pair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            limitPrice,
-            0,
-            size,
-            isLong,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
-            pu,
-            0,
-            0,
-            0,
-            ""
-        );
-        return _newestLimitOrderId(user);
+        pair.createOrder(_limitSpec(isLong, size, limitPrice), _hintsNone(), pu, 0, 0, 0, "");
+        return _lastCreatedOrderId(pair);
     }
 
-    function _lists(uint256[] memory a, uint256[] memory b, uint256[] memory c, uint256[] memory d)
+    /// @dev Place a limit while the oracle prints `oraclePriceUsd` (warps +3s so the update is
+    ///      strictly newer). A crossing placement fills immediately at the maker's price; the
+    ///      oracle price drives the margin checks and the stale band only.
+    function _placeLimitAt(address user, bool isLong, uint256 size, uint256 limitPrice, uint256 oraclePriceUsd)
         internal
-        pure
-        returns (BazaarTypes.OrderLists memory ol)
+        returns (uint256)
     {
-        ol.longLimits = a;
-        ol.shortLimits = b;
-        ol.longMarkets = c;
-        ol.shortMarkets = d;
+        vm.warp(vm.getBlockTimestamp() + 3);
+        bytes[] memory pu = _priceUpdate(oraclePriceUsd, uint64(vm.getBlockTimestamp()));
+        vm.prank(user);
+        pair.createOrder(_limitSpec(isLong, size, limitPrice), _hintsNone(), pu, 0, 0, 0, "");
+        return _lastCreatedOrderId(pair);
     }
 
-    function _empty() internal pure returns (uint256[] memory a) {
-        a = new uint256[](0);
-    }
-
-    function _one(uint256 a) internal pure returns (uint256[] memory out) {
-        out = new uint256[](1);
-        out[0] = a;
-    }
-
-    function _two(uint256 a, uint256 b) internal pure returns (uint256[] memory out) {
-        out = new uint256[](2);
-        out[0] = a;
-        out[1] = b;
-    }
-
-    function _match(BazaarTypes.OrderLists memory lists, uint256 maxMatches) internal returns (uint256 successCount) {
-        bytes[] memory pu = _freshPrice(); // build BEFORE the prank (external mockPyth call would consume it)
-        uint64 obs = uint64(vm.getBlockNumber() - 1);
-        vm.prank(seq);
-        successCount = pair.matchBatch(lists, maxMatches, pu, obs);
-    }
-
-    // ---------------------------- order-type placement ----------------------------
     function _placeMarket(address user, bool isLong, uint256 size, uint256 maxSlippageBp) internal returns (uint256) {
         bytes[] memory pu = _freshPrice();
+        BazaarTypes.OrderSpec memory s;
+        s.orderType = BazaarTypes.OrderType.Market;
+        s.isLong = isLong;
+        s.size = size;
+        s.maxSlippageBp = maxSlippageBp;
         vm.prank(user);
-        pair.createOrder(
-            BazaarTypes.OrderType.Market, 0, 0, maxSlippageBp, size, isLong, false, 0, address(0), pu, 0, 0, 0, ""
-        );
-        return _activeMarketOrderId(user);
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        return _lastCreatedOrderId(pair);
     }
 
     function _placeStopLimit(address user, bool isLong, uint256 size, uint256 triggerPrice, uint256 limitPrice)
@@ -230,24 +231,16 @@ abstract contract IntegrationBase is Test {
         returns (uint256)
     {
         bytes[] memory pu = _freshPrice();
+        BazaarTypes.OrderSpec memory s;
+        s.orderType = BazaarTypes.OrderType.StopLimit;
+        s.isLong = isLong;
+        s.size = size;
+        s.triggerPrice = triggerPrice;
+        s.limitPrice = limitPrice;
+        s.expirationBlock = uint64(block.number + 500_000);
         vm.prank(user);
-        pair.createOrder(
-            BazaarTypes.OrderType.StopLimit,
-            triggerPrice,
-            limitPrice,
-            0,
-            size,
-            isLong,
-            false,
-            uint64(block.number + 500_000),
-            address(0),
-            pu,
-            0,
-            0,
-            0,
-            ""
-        );
-        return _newestLimitOrderId(user);
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        return _lastCreatedOrderId(pair);
     }
 
     function _placeStopLoss(address user, bool isLong, uint256 size, uint256 triggerPrice, uint256 maxSlippageBp)
@@ -255,75 +248,77 @@ abstract contract IntegrationBase is Test {
         returns (uint256)
     {
         bytes[] memory pu = _freshPrice();
+        BazaarTypes.OrderSpec memory s;
+        s.orderType = BazaarTypes.OrderType.StopLoss;
+        s.isLong = isLong;
+        s.size = size;
+        s.triggerPrice = triggerPrice;
+        s.maxSlippageBp = maxSlippageBp;
         vm.prank(user);
-        pair.createOrder(
-            BazaarTypes.OrderType.StopLoss,
-            triggerPrice,
-            0,
-            maxSlippageBp,
-            size,
-            isLong,
-            false,
-            0,
-            address(0),
-            pu,
-            0,
-            0,
-            0,
-            ""
-        );
-        return _stopLossOrderId(user);
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        return _lastCreatedOrderId(pair);
     }
 
     function _placeTakeProfit(address user, bool isLong, uint256 size, uint256 limitPrice) internal returns (uint256) {
         bytes[] memory pu = _freshPrice();
+        BazaarTypes.OrderSpec memory s;
+        s.orderType = BazaarTypes.OrderType.TakeProfit;
+        s.isLong = isLong;
+        s.size = size;
+        s.limitPrice = limitPrice;
         vm.prank(user);
-        pair.createOrder(
-            BazaarTypes.OrderType.TakeProfit, 0, limitPrice, 0, size, isLong, false, 0, address(0), pu, 0, 0, 0, ""
-        );
-        return _takeProfitOrderId(user);
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        return _lastCreatedOrderId(pair);
     }
 
-    /// @dev Open `size` for `user` in direction `isLong` by matching against `counterparty` at $50k.
+    /// @dev Open `size` for `user` in direction `isLong` against `counterparty` at $50k oracle.
+    ///      The user's limit is placed first (older id → resting maker), so the fill executes at
+    ///      the user's limit price when the counterparty's crossing order arrives.
     function _openPosition(address user, address counterparty, bool isLong, uint256 size) internal {
         _deposit(user, 20_000 * BAZAAR_SCALE);
         _deposit(counterparty, 20_000 * BAZAAR_SCALE);
-        uint256 longId;
-        uint256 shortId;
         if (isLong) {
-            longId = _placeLimit(user, true, size, 51_000 * BAZAAR_SCALE);
-            shortId = _placeLimit(counterparty, false, size, 49_000 * BAZAAR_SCALE);
+            _placeLimit(user, true, size, 51_000 * BAZAAR_SCALE);
+            _roll(2);
+            _placeLimit(counterparty, false, size, 49_000 * BAZAAR_SCALE);
         } else {
-            shortId = _placeLimit(user, false, size, 49_000 * BAZAAR_SCALE);
-            longId = _placeLimit(counterparty, true, size, 51_000 * BAZAAR_SCALE);
+            _placeLimit(user, false, size, 49_000 * BAZAAR_SCALE);
+            _roll(2);
+            _placeLimit(counterparty, true, size, 51_000 * BAZAAR_SCALE);
         }
-        _roll(2);
-        _match(_lists(_one(longId), _one(shortId), _empty(), _empty()), 10);
     }
 
-    /// @dev matchBatch at a custom oracle price (whole USD); warps past staleness so the price is consumed.
-    function _matchAtPrice(BazaarTypes.OrderLists memory lists, uint256 maxMatches, uint256 priceUsd)
-        internal
-        returns (uint256 successCount)
-    {
+    // ---------------------------- keeper entry points ----------------------------
+
+    /// @dev Fire one stop through the permissionless trigger executor at $50k.
+    function _executeTrigger(uint256 orderId) internal returns (uint256 executedCount) {
+        return _executeTriggerAt(orderId, 50_000);
+    }
+
+    /// @dev Fire one stop at a custom oracle price (warps +3s so the update is strictly newer).
+    function _executeTriggerAt(uint256 orderId, uint256 priceUsd) internal returns (uint256 executedCount) {
         vm.warp(vm.getBlockTimestamp() + 3);
         bytes[] memory pu = _priceUpdate(priceUsd, uint64(vm.getBlockTimestamp()));
-        uint64 obs = uint64(vm.getBlockNumber() - 1);
+        BazaarTypes.TriggerExec[] memory execs = new BazaarTypes.TriggerExec[](1);
+        execs[0].orderId = uint64(orderId);
         vm.prank(seq);
-        successCount = pair.matchBatch(lists, maxMatches, pu, obs);
+        executedCount = pair.executeTriggeredOrders(execs, pu);
+    }
+
+    /// @dev Unload vault liquidation inventory into the book (protocol-default walk cap) at $50k.
+    function _unloadVault() internal returns (uint256 unloadedSize) {
+        bytes[] memory pu = _freshPrice();
+        vm.prank(seq);
+        unloadedSize = pair.unloadVault(0, pu);
     }
 
     // ---------------------------- order / position / vault readers ----------------------------
-    function _activeMarketOrderId(address user) internal view returns (uint256 id) {
-        (,,,,,,,, id,) = pair.positionBuckets(user);
-    }
-
     function _takeProfitOrderId(address user) internal view returns (uint256 id) {
-        (,,,,, id,,,,) = pair.positionBuckets(user);
+        (,,,,, id,,,) = pair.positionBuckets(user);
     }
 
     function _stopLossOrderId(address user) internal view returns (uint256 id) {
-        (,,,,,, id,,,) = pair.positionBuckets(user);
+        (,,,,,, id,,) = pair.positionBuckets(user);
     }
 
     function _filledSize(uint256 orderId) internal view returns (uint256 s) {
@@ -338,20 +333,40 @@ abstract contract IntegrationBase is Test {
         (,,,,,,,,,,,,,, cb,,,) = pair.orders(orderId);
     }
 
+    function _inBook(uint256 orderId) internal view returns (bool b) {
+        (,,,,,,,,,,, b,,,,,,) = pair.orders(orderId);
+    }
+
     function _position(address user) internal view returns (bool isLong, uint256 size) {
-        (isLong, size,,,,,,,,) = pair.positionBuckets(user);
+        (isLong, size,,,,,,,) = pair.positionBuckets(user);
     }
 
     function _posSize(address user) internal view returns (uint256 size) {
-        (, size,,,,,,,,) = pair.positionBuckets(user);
+        (, size,,,,,,,) = pair.positionBuckets(user);
     }
 
     function _posCollateral(address user) internal view returns (uint256 c) {
-        (,,, c,,,,,,) = pair.positionBuckets(user);
+        (,,, c,,,,,) = pair.positionBuckets(user);
     }
 
     function _insuranceBal() internal view returns (uint256 b) {
         (,,,,, b,,,,,,) = pair.pairVault();
+    }
+
+    // ---------------------------- misc array helpers ----------------------------
+    function _empty() internal pure returns (uint256[] memory a) {
+        a = new uint256[](0);
+    }
+
+    function _one(uint256 a) internal pure returns (uint256[] memory out) {
+        out = new uint256[](1);
+        out[0] = a;
+    }
+
+    function _two(uint256 a, uint256 b) internal pure returns (uint256[] memory out) {
+        out = new uint256[](2);
+        out[0] = a;
+        out[1] = b;
     }
 
     // ---------------------------- solvency books (Check-3) ----------------------------
@@ -401,9 +416,9 @@ abstract contract IntegrationBase is Test {
     }
 
     /// @dev Advance `n` L2 blocks. Uses the vm.getBlockNumber() cheatcode rather than the `block.number`
-    ///      opcode: after an external call like matchBatch the optimizer can re-materialize a stale
+    ///      opcode: after an external call like createOrder the optimizer can re-materialize a stale
     ///      cached `block.number`, turning `vm.roll(block.number + n)` into a no-op. The cheatcode read
-    ///      is immune to that, so sequential-match tests advance reliably.
+    ///      is immune to that, so sequential-fill tests advance reliably.
     function _roll(uint256 n) internal {
         vm.roll(vm.getBlockNumber() + n);
     }

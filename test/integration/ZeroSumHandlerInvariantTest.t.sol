@@ -4,7 +4,6 @@ pragma solidity 0.8.34;
 import {Test} from "forge-std/Test.sol";
 import {IntegrationBase} from "./IntegrationBase.sol";
 import {BazaarPair} from "../../src/BazaarPair.sol";
-import {BazaarSequencer} from "../../src/BazaarSequencer.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 import {MockUSDC} from "../mocks/MockUSDC.sol";
 import {MockPyth} from "@pythnetwork/pyth-sdk-solidity/MockPyth.sol";
@@ -23,28 +22,21 @@ contract ZeroSumHandler is Test {
 
     BazaarPair internal pair;
     MockUSDC internal usdc;
-    BazaarSequencer internal sequencer;
     MockPyth internal mockPyth;
-    address internal seq;
     address[] internal traders;
 
     uint256 public ghostDeposits;
     uint256 public ghostWithdrawals;
+    /// @dev Counts successful order placements. Each placement runs at most one matching walk,
+    ///      so payout-truncation dust is bounded by a small multiple of this count.
     uint256 public ghostTrades;
 
-    constructor(
-        BazaarPair _pair,
-        MockUSDC _usdc,
-        BazaarSequencer _seq,
-        MockPyth _pyth,
-        address _sequencer,
-        address[] memory _traders
-    ) {
+    uint256 internal idProbe;
+
+    constructor(BazaarPair _pair, MockUSDC _usdc, MockPyth _pyth, address[] memory _traders) {
         pair = _pair;
         usdc = _usdc;
-        sequencer = _seq;
         mockPyth = _pyth;
-        seq = _sequencer;
         traders = _traders;
         vm.deal(address(this), 100 ether);
     }
@@ -58,17 +50,8 @@ contract ZeroSumHandler is Test {
         pu[0] = d;
     }
 
-    function _lists(uint256 longId, uint256 shortId) internal pure returns (BazaarTypes.OrderLists memory ol) {
-        ol.longLimits = new uint256[](1);
-        ol.longLimits[0] = longId;
-        ol.shortLimits = new uint256[](1);
-        ol.shortLimits[0] = shortId;
-        ol.longMarkets = new uint256[](0);
-        ol.shortMarkets = new uint256[](0);
-    }
-
     function _ensureCollateral(address u, uint256 target) internal {
-        (,,, uint256 coll,,,,,,) = pair.positionBuckets(u);
+        (,,, uint256 coll,,,,,) = pair.positionBuckets(u);
         if (coll >= target) return;
         uint256 needBaz = target - coll;
         uint256 usdcNeed = needBaz * USDC_SCALE / SCALE;
@@ -98,7 +81,7 @@ contract ZeroSumHandler is Test {
 
     function withdraw(uint256 actorSeed, uint256 amtSeed) public {
         address a = traders[bound(actorSeed, 0, traders.length - 1)];
-        (, uint256 size,, uint256 coll,,,,,,) = pair.positionBuckets(a);
+        (, uint256 size,, uint256 coll,,,,,) = pair.positionBuckets(a);
         if (size != 0 || coll < 1e18) return; // flat users only: empty price update suffices
         uint256 amtBaz = bound(amtSeed, 1e18, coll);
         amtBaz -= amtBaz % 1e12; // round to USDC granularity
@@ -109,6 +92,10 @@ contract ZeroSumHandler is Test {
         } catch {}
     }
 
+    /// @dev Rest a long at $51k, then arrive a crossing short at $49k — the arrival fills at the
+    ///      resting maker's price inside its own createOrder. Leftover resting orders from
+    ///      margin-failed halves simply become makers for later trades, which widens the state
+    ///      space the invariants are checked over.
     function trade(uint256 lSeed, uint256 sSeed, uint256 sizeSeed) public {
         address L = traders[bound(lSeed, 0, traders.length - 1)];
         address S = traders[bound(sSeed, 0, traders.length - 1)];
@@ -118,52 +105,30 @@ contract ZeroSumHandler is Test {
         uint256 size = bound(sizeSeed, 1e16, 2e17); // 0.01 - 0.2 BTC
 
         vm.warp(vm.getBlockTimestamp() + 3);
-        uint256 longId = _place(L, true, size, 51_000 * SCALE);
+        _place(L, true, size, 51_000 * SCALE);
         vm.warp(vm.getBlockTimestamp() + 3);
-        uint256 shortId = _place(S, false, size, 49_000 * SCALE);
-        if (longId == 0 || shortId == 0) return;
-
-        vm.roll(vm.getBlockNumber() + 2);
-        vm.warp(vm.getBlockTimestamp() + 3);
-        bytes[] memory pu = _pu(50_000);
-        uint64 obs = uint64(vm.getBlockNumber() - 1);
-        vm.prank(seq);
-        try pair.matchBatch(_lists(longId, shortId), 10, pu, obs) returns (uint256 n) {
-            if (n > 0) ghostTrades++;
-        } catch {}
+        _place(S, false, size, 49_000 * SCALE);
     }
 
-    function _place(address u, bool isLong, uint256 size, uint256 px) internal returns (uint256 id) {
+    function _place(address u, bool isLong, uint256 size, uint256 px) internal {
         bytes[] memory pu = _pu(50_000);
+        BazaarTypes.OrderSpec memory spec;
+        spec.orderType = BazaarTypes.OrderType.Limit;
+        spec.isLong = isLong;
+        spec.size = size;
+        spec.limitPrice = px;
+        spec.expirationBlock = uint64(vm.getBlockNumber() + 500_000);
+        BazaarTypes.MatchHints memory hints;
         vm.prank(u);
-        try pair.createOrder(
-            BazaarTypes.OrderType.Limit,
-            0,
-            px,
-            0,
-            size,
-            isLong,
-            false,
-            uint64(vm.getBlockNumber() + 500_000),
-            address(0),
-            pu,
-            0,
-            0,
-            0,
-            ""
-        ) {
-            (uint256[] memory ids,,,) = pair.getUserActiveLimitOrders(u);
-            id = ids[ids.length - 1];
-        } catch {
-            id = 0;
-        }
+        try pair.createOrder(spec, hints, pu, 0, 0, 0, "") {
+            ghostTrades++;
+        } catch {}
     }
 }
 
-/// @notice The suite had zero handler-based invariant tests despite the zero-sum property being
-///         formally specified. This drives randomized deposit/trade/withdraw sequences and asserts
-///         the two books invariants after every call — catching D-drift, dropped fees, or PnL
-///         credited without a debit that fixed-checkpoint scenario tests can miss.
+/// @notice Drives randomized deposit/trade/withdraw sequences and asserts the two books
+///         invariants after every call — catching D-drift, dropped fees, or PnL credited without
+///         a debit that fixed-checkpoint scenario tests can miss.
 contract ZeroSumHandlerInvariantTest is IntegrationBase {
     ZeroSumHandler internal handler;
     address[] internal actors;
@@ -175,13 +140,13 @@ contract ZeroSumHandlerInvariantTest is IntegrationBase {
         actors[1] = bob;
         actors[2] = carol;
         actors[3] = dave;
-        handler = new ZeroSumHandler(pair, usdc, sequencer, mockPyth, seq, actors);
+        handler = new ZeroSumHandler(pair, usdc, mockPyth, actors);
         targetContract(address(handler));
     }
 
-    /// @dev Trader equity marked at (price p, funding index f). Copied from ZeroSumInvariantTest.
+    /// @dev Trader equity marked at (price p, funding index f). Mirrors ZeroSumInvariantTest.
     function _equityAt(address u, uint256 p, int256 f) internal view returns (int256 equity) {
-        (bool isLong, uint256 size, uint256 entryValue, uint256 collateral, int256 entryFundingIdx,,,,,) =
+        (bool isLong, uint256 size, uint256 entryValue, uint256 collateral, int256 entryFundingIdx,,,,) =
             pair.positionBuckets(u);
         equity = int256(collateral);
         if (size == 0) return equity;
@@ -192,7 +157,7 @@ contract ZeroSumHandlerInvariantTest is IntegrationBase {
         equity += pricePnl + fundingPnl;
     }
 
-    /// @dev Vault pendingLiq inventory marked at (p, f). Copied from ZeroSumInvariantTest.
+    /// @dev Vault pendingLiq inventory marked at (p, f). Mirrors ZeroSumInvariantTest.
     function _vaultInventoryAt(uint256 p, int256 f) internal view returns (int256 value) {
         (,,,,,, uint256 plSize, uint256 plEntry,, int256 plFundIdx, bool plIsLong,) = pair.pairVault();
         if (plSize == 0) return 0;
@@ -229,12 +194,13 @@ contract ZeroSumHandlerInvariantTest is IntegrationBase {
         //  - VALUE CREATION (claims > cash): the insolvency-risk direction — the books would owe
         //    more than the contract holds. Truncation dust NEVER pushes this way (the contract keeps
         //    the sub-unit remainder), so this bound stays TIGHT and fixed regardless of fill count.
-        //    A per-trade value-minting bug cannot hide behind the activity-scaled band here.
+        //    A per-fill value-minting bug cannot hide behind the activity-scaled band here.
         //
         //  - VALUE DESTRUCTION beyond dust (claims << cash): the benign direction where legitimate
-        //    1e18->1e6 payout truncation accumulates. Bounded by the run's fill count (ghostTrades
-        //    resets to 0 per run via the state snapshot). A real dropped funding/PnL leak would be
-        //    dollars — orders of magnitude above this dust band.
+        //    1e18->1e6 payout truncation accumulates. Each successful placement runs at most one
+        //    walk with at most one truncating payout (the bug-bounty skim), so the band scales
+        //    with ghostTrades (reset to 0 per run via the state snapshot). A real dropped
+        //    funding/PnL leak would be dollars — orders of magnitude above this dust band.
         int256 mintBand = 1e13; // tight: value never minted
         int256 dustBand = int256(1e13 + handler.ghostTrades() * 2e12); // scaled: benign truncation
         assertLe(claims, cash + mintBand, "no value minted (claims <= cash + dust)");

@@ -33,7 +33,7 @@ contract InsuranceMetaTxTest is IntegrationBase {
         uint256 amount = 1_000 * BAZAAR_SCALE;
         uint256 fee = BAZAAR_SCALE / 2; // 50 cents (relayer fee cap is $1)
         uint256 nonce = pair.metaTxNonces(user);
-        uint256 deadline = vm.getBlockTimestamp() + 30;
+        uint256 deadline = vm.getBlockTimestamp() + MetaTxLib.MAX_DEADLINE_WINDOW;
 
         vm.prank(user);
         usdc.approve(address(pair), (amount + fee) * USDC_SCALE / BAZAAR_SCALE);
@@ -60,7 +60,7 @@ contract InsuranceMetaTxTest is IntegrationBase {
         uint256 amount = BAZAAR_SCALE / 2; // 50 cents
         uint256 fee = BAZAAR_SCALE; // $1: at the relayer cap, but >= the amount -> reverts
         uint256 nonce = pair.metaTxNonces(user);
-        uint256 deadline = vm.getBlockTimestamp() + 30;
+        uint256 deadline = vm.getBlockTimestamp() + MetaTxLib.MAX_DEADLINE_WINDOW;
 
         vm.prank(user);
         usdc.approve(address(pair), (amount + fee) * USDC_SCALE / BAZAAR_SCALE);
@@ -84,7 +84,7 @@ contract InsuranceMetaTxTest is IntegrationBase {
 
         uint256 fee = BAZAAR_SCALE / 2;
         uint256 nonce = pair.metaTxNonces(user);
-        uint256 deadline = vm.getBlockTimestamp() + 30;
+        uint256 deadline = vm.getBlockTimestamp() + MetaTxLib.MAX_DEADLINE_WINDOW;
         vm.prank(user);
         usdc.approve(address(pair), fee * USDC_SCALE / BAZAAR_SCALE);
         bytes memory sig =
@@ -113,7 +113,7 @@ contract InsuranceMetaTxTest is IntegrationBase {
 
         uint256 fee = BAZAAR_SCALE / 2; // 50 cents (relayer fee cap is $1)
         uint256 nonce = pair.metaTxNonces(user);
-        uint256 deadline = vm.getBlockTimestamp() + 30;
+        uint256 deadline = vm.getBlockTimestamp() + MetaTxLib.MAX_DEADLINE_WINDOW;
         bytes memory sig =
             _sign(keccak256(abi.encode(MetaTxLib.EXECUTE_INSURANCE_WITHDRAWAL_TYPEHASH, nonce, deadline, fee)));
 

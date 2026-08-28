@@ -96,6 +96,22 @@ library BazaarTypes {
         uint32 maxSteps;
     }
 
+    /// @notice The user-intent half of an order creation — exactly the fields covered by the
+    ///         EIP-712 CreateOrder payload (execution aids like MatchHints and priceUpdate ride
+    ///         outside the signature).
+    struct OrderSpec {
+        OrderType orderType;
+        bool isLong;
+        bool isPostOnly;
+        bool isIoc; // Limit only: fill what crosses on arrival, cancel the remainder
+        uint256 size;
+        uint256 triggerPrice;
+        uint256 limitPrice;
+        uint256 maxSlippageBp;
+        uint64 expirationBlock; // absolute L2 block (not TTL)
+        address integrator;
+    }
+
     struct PositionBucket {
         bool isLong;
         uint256 size;
@@ -105,7 +121,6 @@ library BazaarTypes {
         uint256 takeProfitOrderId;
         uint256 stopLossOrderId;
         uint256 entryMmrBp;
-        uint256 activeMarketOrderId; // 1-active-market cap (0 = none, mirrors TP/SL pattern)
         uint256 mmrUpdateTs; // timestamp entryMmrBp was last set (open/increase/flip); 0 when flat
     }
 
@@ -143,40 +158,6 @@ library BazaarTypes {
         uint256 newEntryValue;
         uint256 newCollateral;
         bool newIsLong;
-    }
-
-    /// @notice Aggregate summary of a matchBatch call — hashed and stored for challenges.
-    ///         Fields are hashed via abi.encode (not stored raw) so widths don't need to pack.
-    /// @dev Per-type same-side aggregates carry the worst-priority order that matched
-    ///      in each (side, type) bucket. For longs we track lowest eff price + highest
-    ///      orderId at that price (FIFO). Symmetric for shorts. Pass-C-only fields are
-    ///      witnesses for market-omission cross-side checks.
-    struct BatchInfo {
-        uint256 totalMatchNotional; // sum of all match notionals (bazaar-scale)
-        uint256 oraclePrice; // oracle price at observationBlock
-        uint64 executionBlock;
-        uint64 observationBlock;
-        uint64 matchTimestamp; // block.timestamp at execution
-        address sequencer;
-        bool isStale; // oracle stale at observationBlock
-
-        // Cross-pass same-side (price, id) FIFO witnesses
-        uint256 lowestLongLimitPrice;
-        uint256 lowestLongLimitId;
-        uint256 highestShortLimitPrice;
-        uint256 highestShortLimitId;
-        uint256 lowestLongMarketPrice;
-        uint256 lowestLongMarketId;
-        uint256 highestShortMarketPrice;
-        uint256 highestShortMarketId;
-
-        // Pass-C-only cross-side witnesses for market omission challenges
-        uint256 lowestShortLimitPriceC;
-        uint256 highestLongLimitPriceC;
-
-        // Order IDs that passed normal IMR but failed stale-IMR (2x) — only populated
-        // during stale batches. Membership rejects challenges in challengeOmission.
-        uint256[] staleSkippedIds;
     }
 
     struct Vault {
@@ -301,11 +282,6 @@ library BazaarTypes {
         address bugBountyAddress;
     }
 
-    /// @notice Groups scalar state variables shared with MatchingEngineLib via DELEGATECALL
-    struct MatchingState {
-        uint256 nextBatchId;
-    }
-
     // -------------------- Constants --------------------
 
     int32 internal constant USDC_EXPONENT = -6;
@@ -327,13 +303,6 @@ library BazaarTypes {
     uint256 internal constant MMR_SAMPLE_COUNT = 25;
     uint256 internal constant MMR_GRACE_PERIOD = 24 hours;
 
-    // Sequencer fees in EBP
-    uint256 internal constant MAKER_SEQUENCER_FEE_EBP = 25;
-    uint256 internal constant TAKER_SEQUENCER_FEE_EBP = 75;
-
-    // Flat sequencer fee per side ($0.03 in BAZAAR_SCALE), added on top of bps fees
-    uint256 internal constant SEQUENCER_FLAT_FEE_PER_SIDE = 3 * BAZAAR_SCALE / 100; // $0.03
-
     // Integrator fees in EBP — charged only on orders that carry an integrator address;
     // direct-to-contract orders (integrator = address(0)) pay no integrator fee.
     uint256 internal constant MAKER_INTEGRATOR_FEE_EBP = 25;
@@ -352,9 +321,6 @@ library BazaarTypes {
     // min(this, current MMR) — tightens with the margin cushion in calm regimes.
     uint256 internal constant LIQ_MAX_SLIPPAGE_BP = 500;
 
-    // Sentinel taker order ID for vault liquidation matches
-    uint256 internal constant LIQ_TAKER_SENTINEL = type(uint256).max;
-
     // Bug bounty tax
     uint256 internal constant BUG_BOUNTY_TAX_BP = 100;
 
@@ -372,7 +338,6 @@ library BazaarTypes {
 
     // Order-lifetime constants, in Arbitrum L2 blocks (~250ms each, 4 blocks/sec).
     uint64 internal constant MIN_ORDER_LIFETIME_BLOCKS = 12; // ~3 s
-    uint64 internal constant MARKET_ORDER_LIFETIME_BLOCKS = 12; // ~3 s
     uint64 internal constant MAX_ORDER_LIFETIME_BLOCKS = 365 * 24 * 60 * 60 * 4; // ~126.1M, ~1 year
 
     // Per-user active-order caps (bounds the exposure-tally iteration in deposit/withdraw margin
@@ -384,12 +349,26 @@ library BazaarTypes {
     // 64 settlements bound the worst-case arrival transaction well inside a block's gas.
     uint256 internal constant MAX_WALK_STEPS = 64;
 
+    // Keeper tip for executing a triggered StopLimit/StopLoss, charged from the stop owner's
+    // bucket collateral at execution time (like a trading fee — no escrow). An owner whose
+    // collateral cannot cover it has the stop auto-canceled instead, mirroring the fee-coverage
+    // rule in the fill margin gate. No tip is charged when a stop arms immediately at creation.
+    uint256 internal constant TRIGGER_TIP = BAZAAR_SCALE / 4; // $0.25
+
+    // unloadVault pays its caller max(MIN_LIQUIDATOR_REWARD, LIQUIDATION_FEE_EBP of unloaded
+    // notional) from insurance, but only when at least this much notional was unloaded —
+    // otherwise dust-sized unload calls could farm the flat floor out of the fund.
+    uint256 internal constant UNLOAD_BOUNTY_MIN_NOTIONAL = 100 * BAZAAR_SCALE;
+
+    // Bounds one executeTriggeredOrders call (each exec can run a full walk).
+    uint256 internal constant MAX_TRIGGER_EXECS_PER_CALL = 20;
+
+    // Node budget for the unload walk run inline at the end of liquidate() — bounds the
+    // liquidator's gas; the permissionless unloadVault handles anything deeper.
+    uint256 internal constant LIQ_INLINE_UNLOAD_STEPS = 16;
+
     // Sentinel: TP/SL orders never expire by block
     uint64 internal constant NEVER_EXPIRE_BLOCK = type(uint64).max;
-
-    // Omission challenge penalty: 7% of min(batchNotional, orderNotional).
-    // Chosen so that max sequencer gain from skipping (5% market-slippage) < penalty.
-    uint256 internal constant OMISSION_PENALTY_BP = 700;
 
     // Liquidation reward floor (shared between BazaarPair and LiquidationLib).
     // Reward = max(this, LIQUIDATION_FEE_EBP of notional); the floor covers gas on small positions.
@@ -409,10 +388,6 @@ library BazaarTypes {
 
     // -------------------- Events --------------------
 
-    /// @notice Emitted once per successful matchBatch call. Contains the full BatchInfo
-    ///         preimage so challengers can reconstruct without extra storage.
-    event BatchRecorded(bytes32 indexed pairId, uint256 indexed batchId, address indexed sequencer, BatchInfo info);
-
     // OrderFilled is the sole per-fill event: it carries fillSize/fillPrice/fees plus the
     // maker/taker label in `isMaker`, so no separate match-level event is emitted. A pair match
     // emits two (one per side); a vault-liquidation close emits one (the user side, always maker).
@@ -427,7 +402,7 @@ library BazaarTypes {
         uint256 executionPrice,
         uint256 fee,
         bool isFullyFilled,
-        bool isMaker // this side rested (rebate-tier sequencer fee); false = taker
+        bool isMaker // this side rested in the book and set the fill price; false = taker
     );
 
     event PositionModified(
@@ -564,79 +539,41 @@ library BazaarTypes {
 
     // -------------------- MatchingEngineLib Structs --------------------
 
-    /// @notice Shared matching context — built once by BazaarPair and passed by reference
-    ///         to the walk library to minimize calldata/memory copies.
-    struct MatchContext {
-        uint256 cachedPrice; // single valuation basis for the whole batch: existing and fresh exposure alike
+    /// @notice Shared context for one arrival-matching transaction — built once by BazaarPair
+    ///         and passed by reference to the walk library. Snapshotting the price, funding
+    ///         index, fee rates, and margin params up front makes every fill in the transaction
+    ///         judge against the same basis.
+    struct ArrivalContext {
+        uint256 cachedPrice; // single valuation basis for the whole tx: existing and fresh exposure alike
         int256 cachedFundingIdx;
         uint256 insuranceFeeEbp;
-        uint256 takerSequencerFeeEbp;
-        uint256 remainingCapacity;
         uint256 closingFeeEbp;
         bool isOracleStale;
         MarginRequirements marginReqs;
         bytes32 pairId;
-        uint64 observationBlock;
         uint64 currentBlock;
         address usdc;
         address bugBountyAddress;
-        address sequencer;
-        uint256 bugBountyTaxBp;
-        uint256 maxMatches; // sequencer-supplied gas-safety circuit breaker
     }
 
-    /// @notice Bundled order-ID lists for matchBatch. Bundling 4 calldata arrays into one
-    ///         struct reduces stack pressure on the matching engine entry point under via_ir.
-    struct OrderLists {
-        uint256[] longLimits;
-        uint256[] shortLimits;
-        uint256[] longMarkets;
-        uint256[] shortMarkets;
-    }
-
-    /// @notice Accumulated results for a full matchBatch call (memory-only, never stored).
-    ///         Per-type aggregates are populated during the walk and copied into BatchInfo at finalize.
-    /// @dev `staleSkippedIds` is preallocated to totalIds capacity at executeBatch entry; only
-    ///      indices [0, staleSkippedCount) are valid. At finalize, the array is truncated via
-    ///      assembly to staleSkippedCount before being copied to BatchInfo. Aggregates (OI deltas,
-    ///      fees) and IntegratorBag are bundled here too, which saves stack pressure in the
-    ///      matching engine by avoiding separate mem-pointer params.
-    struct BatchResult {
-        uint256 successCount;
-        // Σ fillNotional across all passes — serves triple duty: capacity checks + recordVolume,
-        // the VWAP numerator (Σ price×size ≡ Σ notional), and BatchInfo.totalMatchNotional.
+    /// @notice Accumulated results of one walk (memory-only, never stored). Fills add their
+    ///         deltas here; a single finalize step applies everything to storage once per walk.
+    struct ArrivalResult {
+        uint256 fillCount;
+        // Σ fillNotional — the VWAP numerator (Σ price×size ≡ Σ notional) and unloaded notional.
         uint256 totalMatchedVolume;
         uint256 totalFillSize; // VWAP denominator
 
-        // Cross-pass same-side aggregates
-        uint256 lowestLongLimitPrice;
-        uint256 lowestLongLimitId;
-        uint256 highestShortLimitPrice;
-        uint256 highestShortLimitId;
-        uint256 lowestLongMarketPrice;
-        uint256 lowestLongMarketId;
-        uint256 highestShortMarketPrice;
-        uint256 highestShortMarketId;
-
-        // Pass-C-only cross-side witnesses
-        uint256 lowestShortLimitPriceC;
-        uint256 highestLongLimitPriceC;
-
-        // Stale-skip list — preallocated; staleSkippedCount tracks valid prefix length.
-        uint256[] staleSkippedIds;
-        uint256 staleSkippedCount;
-
-        // Liquidation-EMA accumulators (Pass A)
+        // Liquidation-EMA accumulators (unload walks only)
         int256 sumLiqGapTimesSize;
         uint256 totalLiqFillSize;
         uint256 liqCount;
 
-        // Aggregate (OI deltas, fees, vault PnL) — populated during walk, applied in _finalize
+        // OI deltas, fees, vault PnL — populated during the walk, applied in finalize
         int256 deltaLongOI;
         int256 deltaShortOI;
         int256 deltaLongWeightedEntry;
         int256 deltaShortWeightedEntry;
-        uint256 totalUserSeqFees;
         uint256 totalIntegratorFees;
         uint256 totalInsuranceFees;
         int256 totalVaultPnl;
@@ -644,16 +581,35 @@ library BazaarTypes {
         // Deposits-ledger headroom remaining for fee attribution: seeded from
         // totalCollateralDeposited at walk start, drawn down by every charged fill. Fees
         // are collected from book collateral but settled against the deposits ledger in
-        // _finalize, and book collateral can legitimately exceed that ledger (open losers
+        // finalize, and book collateral can legitimately exceed that ledger (open losers
         // back profits that were already withdrawn) — so a fill whose fees exceed the
         // remaining budget has ALL its fees waived (nothing charged, nothing paid out)
         // rather than collecting a fee the ledger cannot fund.
         uint256 feeBudget;
 
-        // Integrator dedup buffer (preallocated to 2x the batch fill bound at executeBatch
-        // entry — each match can append two distinct integrators, one per side)
+        // Integrator dedup buffer (preallocated to 2x the walk's node cap — each fill can
+        // append two distinct integrators, one per side)
         IntegratorAccum[] integratorAccums;
         uint256 integratorCount;
+
+        uint256 nodesVisited; // enforced against the walk's node cap, counting skips too
+    }
+
+    /// @notice Compact per-walk summary returned to BazaarPair for its post-walk hooks
+    ///         (mark-price VWAP, liquidation-gap EMA, vault health, unload bounty).
+    struct WalkSummary {
+        uint256 totalMatchedVolume;
+        uint256 totalFillSize;
+        int256 sumLiqGapTimesSize;
+        uint256 totalLiqFillSize;
+        uint256 liqCount;
+    }
+
+    /// @notice One triggered-stop execution request: the stop's id plus the hints its walk and
+    ///         (for StopLimit) its remainder insertion should use.
+    struct TriggerExec {
+        uint64 orderId;
+        MatchHints hints;
     }
 
     // -------------------- TerminationLib Structs --------------------
@@ -704,15 +660,7 @@ library BazaarTypes {
 
     struct CreateOrderParams {
         bytes32 pairId;
-        bool isLong;
-        uint256 size;
-        uint256 triggerPrice;
-        uint256 limitPrice;
-        uint256 maxSlippageBp;
-        OrderType orderType;
-        uint64 expirationBlock; // absolute block number (not TTL)
-        bool isPostOnly;
-        address integrator;
+        OrderSpec spec; // the signed user intent, nested to keep flattened field count low under via_ir
         uint256 currentPrice; // cached oracle price
         int256 currentFundingIndex;
         MarginRequirements marginReqs;

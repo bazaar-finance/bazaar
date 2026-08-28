@@ -10,6 +10,7 @@ import {LiquidationLib} from "../../src/libraries/LiquidationLib.sol";
 ///      OI floors) can be asserted directly instead of only seeded.
 contract BookkeepingHarness {
     mapping(uint256 => BazaarTypes.Order) public orders;
+    BazaarTypes.OrderBook internal book;
     mapping(address => BazaarTypes.PositionBucket) public positionBuckets;
     BazaarTypes.Vault public vault;
 
@@ -65,6 +66,7 @@ contract BookkeepingHarness {
         return LiquidationLib.processLiquidations(
             users,
             orders,
+            book,
             positionBuckets,
             vault,
             BazaarTypes.LiquidateParams({

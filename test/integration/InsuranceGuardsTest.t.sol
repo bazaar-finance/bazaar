@@ -17,18 +17,18 @@ contract InsuranceGuardsTest is IntegrationBase {
 
     // Slots from `forge inspect BazaarPair storage-layout`; re-derive them there if a state
     // variable declared earlier in BazaarPair is added or resized.
-    uint256 constant SLOT_TERMINATION_FLAGS = 29;
-    uint256 constant SLOT_NORMAL_TERMINATION_PRICE = 65;
-    uint256 constant SLOT_NORMAL_COLLATERAL_RATIO = 67;
+    uint256 constant SLOT_TERMINATION_FLAGS = 28;
+    uint256 constant SLOT_NORMAL_TERMINATION_PRICE = 63;
+    uint256 constant SLOT_NORMAL_COLLATERAL_RATIO = 65;
 
     /// @dev Open a 1v1 BTC position (alice long / bob short at $50k) so the pair has live OI.
     function _openOI() internal {
         _deposit(alice, 20_000 * BAZAAR_SCALE);
         _deposit(bob, 20_000 * BAZAAR_SCALE);
-        uint256 aL = _placeLimit(alice, true, 1 * BAZAAR_SCALE, 50_000 * BAZAAR_SCALE);
-        uint256 bS = _placeLimit(bob, false, 1 * BAZAAR_SCALE, 49_000 * BAZAAR_SCALE);
+        _placeLimit(alice, true, 1 * BAZAAR_SCALE, 50_000 * BAZAAR_SCALE);
         _roll(2);
-        assertEq(_match(_lists(_one(aL), _one(bS), _empty(), _empty()), 10), 1, "OI opened");
+        _placeLimit(bob, false, 1 * BAZAAR_SCALE, 49_000 * BAZAAR_SCALE);
+        assertEq(_posSize(alice), 1 * BAZAAR_SCALE, "OI opened");
     }
 
     function _requestAll(address user) internal returns (uint256 shares) {
@@ -112,10 +112,10 @@ contract InsuranceGuardsTest is IntegrationBase {
         // Tiny OI: 0.001 BTC each side @ ~$50k -> OI notional ~$100.
         _deposit(alice, 100 * BAZAAR_SCALE);
         _deposit(bob, 100 * BAZAAR_SCALE);
-        uint256 aL = _placeLimit(alice, true, BAZAAR_SCALE / 1000, 50_000 * BAZAAR_SCALE);
-        uint256 bS = _placeLimit(bob, false, BAZAAR_SCALE / 1000, 49_000 * BAZAAR_SCALE);
+        _placeLimit(alice, true, BAZAAR_SCALE / 1000, 50_000 * BAZAAR_SCALE);
         _roll(2);
-        assertEq(_match(_lists(_one(aL), _one(bS), _empty(), _empty()), 10), 1, "tiny OI opened");
+        _placeLimit(bob, false, BAZAAR_SCALE / 1000, 49_000 * BAZAAR_SCALE);
+        assertEq(_posSize(alice), BAZAAR_SCALE / 1000, "tiny OI opened");
 
         _depositInsurance(carol, 1_000 * BAZAAR_SCALE); // fund >> OI -> far above target
 

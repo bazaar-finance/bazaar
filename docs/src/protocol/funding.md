@@ -4,10 +4,10 @@ Funding tethers the perp's traded price to its index. Bazaar's implementation ha
 
 ## Mark price
 
-The mark is an EMA of batch execution VWAPs:
+The mark is an EMA of execution VWAPs — one update per matching transaction, fed the volume-weighted average price of that transaction's fills:
 
-- Each batch's weight scales with its share of rolling volume (which itself decays linearly to zero over 60 minutes), capped at **10%** per batch. There is no floor — a dust fill against deep volume gets ~0 weight, so a tiny wash trade can't nudge the mark. The 10% cap is the manipulation bound — no single batch, however large, can move the mark more than 10% of the way to its print.
-- Before entering the EMA, the batch print itself is clamped to **±5% of the index** — an implausible fill price can't be injected into the mark, and the steady-state mark stays within that band of index.
+- Each update's weight scales with its share of rolling volume (which itself decays linearly to zero over 60 minutes), capped at **10%** per update. There is no floor — a dust fill against deep volume gets ~0 weight, so a tiny wash trade can't nudge the mark. The 10% cap is the manipulation bound — no single matching transaction, however large, can move the mark more than 10% of the way to its print.
+- Before entering the EMA, the print itself is clamped to **±5% of the index** — an implausible fill price can't be injected into the mark, and the steady-state mark stays within that band of index.
 - With no trades, the mark **decays linearly back to the index over 1 hour** — a stale mark cannot pin funding away from index indefinitely.
 
 ## Funding rate
