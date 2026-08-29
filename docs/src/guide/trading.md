@@ -12,7 +12,7 @@ A practical guide to trading on Bazaar. Plain language first; every section link
 
 | You want to… | Use | Behavior |
 |---|---|---|
-| Fill now at market | `Market` | fills immediately against resting limits at up to your slippage cap (max 5%); never rests — whatever can't fill in your own transaction is canceled |
+| Fill now at market | `Market` | fills immediately against resting limits at up to your slippage cap (max 10%); never rests — whatever can't fill in your own transaction is canceled |
 | Rest at your price | `Limit` | sits on the book until filled, canceled, or expired (up to ~1 year); `postOnly` guarantees you're the maker |
 | Enter on a breakout | `StopLimit` | arms when price crosses your trigger, then acts as a limit |
 | Lock in profit | `TakeProfit` | reduce-only limit against your position; one per position |

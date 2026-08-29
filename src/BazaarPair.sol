@@ -1092,7 +1092,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
 
     // -------------------- Constants --------------------
     uint256 internal constant MIN_ORDER_AMOUNT = BazaarTypes.MIN_ORDER_AMOUNT; // min order size (5 USDC)
-    uint256 internal constant MAX_SLIPPAGE_BP = BazaarTypes.MAX_SLIPPAGE_BP; // 5% max slippage for market-type orders
+    uint256 internal constant MAX_SLIPPAGE_BP = BazaarTypes.MAX_SLIPPAGE_BP; // 10% max slippage for market-type orders
     uint256 internal constant MAX_CANCELS_PER_CALL = 200;
 
     // -------------------- Functions --------------------

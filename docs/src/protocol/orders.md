@@ -8,7 +8,7 @@ market** (a *position bucket*); orders modify it.
 
 | Type | Priced by | Trigger | Notes |
 |---|---|---|---|
-| `Market` | book prices, bounded by oracle ± `maxSlippageBp` | — | slippage cap 5%; fills immediately, remainder cancels — never rests; rejected while the oracle is stale |
+| `Market` | book prices, bounded by oracle ± `maxSlippageBp` | — | slippage cap 10%; fills immediately, remainder cancels — never rests; rejected while the oracle is stale |
 | `Limit` | `limitPrice` | — | GTC by default; the only type that takes `isPostOnly` or `isIoc` |
 | `StopLimit` | `limitPrice` | arms at `triggerPrice` | limit must be on the fillable side of the trigger (buy: limit ≥ trigger) |
 | `TakeProfit` | `limitPrice` | — | position-reducing only: opposite direction, `size ≤ position`, **1 per position**, never expires; **rests in the book from creation** |

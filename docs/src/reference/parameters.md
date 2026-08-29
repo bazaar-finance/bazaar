@@ -7,7 +7,7 @@ All constants live in `src/libraries/BazaarTypes.sol`, `src/libraries/RiskParams
 | Parameter | Value |
 |---|---|
 | `MIN_ORDER_AMOUNT` | $5 notional (full closes exempt) |
-| `MAX_SLIPPAGE_BP` | 500 (5%) — market/stop-loss slippage cap |
+| `MAX_SLIPPAGE_BP` | 1000 (10%) — market/stop-loss slippage cap |
 | `MIN_ORDER_LIFETIME_BLOCKS` / max | 12 blocks (~3 s) / ~1 year |
 | `MAX_ACTIVE_LIMIT_ORDERS_PER_USER` | 100 (Limit + StopLimit) |
 | TP/SL per position | 1 each |

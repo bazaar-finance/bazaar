@@ -334,7 +334,7 @@ library BazaarTypes {
 
     // Order constants (shared between BazaarPair and OrderManagementLib)
     uint256 internal constant MIN_ORDER_AMOUNT = 5 * BAZAAR_SCALE;
-    uint256 internal constant MAX_SLIPPAGE_BP = 500; // 5% max slippage for market-type orders
+    uint256 internal constant MAX_SLIPPAGE_BP = 1000; // 10% max slippage for market-type orders
 
     // Order-lifetime constants, in Arbitrum L2 blocks (~250ms each, 4 blocks/sec).
     uint64 internal constant MIN_ORDER_LIFETIME_BLOCKS = 12; // ~3 s

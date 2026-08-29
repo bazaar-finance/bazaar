@@ -1913,7 +1913,7 @@ contract BazaarPairTest is Test {
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
 
         vm.prank(user1);
-        vm.expectRevert(abi.encodeWithSelector(OrderManagementLib.OrderManagementLib__InvalidSlippage.selector, 501));
+        vm.expectRevert(abi.encodeWithSelector(OrderManagementLib.OrderManagementLib__InvalidSlippage.selector, 1001));
         btcPair.createOrder(
             BazaarTypes.OrderSpec({
                 orderType: BazaarTypes.OrderType.Market,
@@ -1923,7 +1923,7 @@ contract BazaarPairTest is Test {
                 size: POSITION_SIZE,
                 triggerPrice: 0,
                 limitPrice: 0,
-                maxSlippageBp: 501, // exceeds MAX_SLIPPAGE_BP (500)
+                maxSlippageBp: 1001, // exceeds MAX_SLIPPAGE_BP (1000)
                 expirationBlock: 0,
                 integrator: address(0)
             }),
@@ -2821,7 +2821,7 @@ contract BazaarPairTest is Test {
 
         // Excessive slippage (> 500 bp)
         vm.prank(user1);
-        vm.expectRevert(abi.encodeWithSelector(OrderManagementLib.OrderManagementLib__InvalidSlippage.selector, 501));
+        vm.expectRevert(abi.encodeWithSelector(OrderManagementLib.OrderManagementLib__InvalidSlippage.selector, 1001));
         btcPair.createOrder(
             BazaarTypes.OrderSpec({
                 orderType: BazaarTypes.OrderType.StopLoss,
@@ -2831,7 +2831,7 @@ contract BazaarPairTest is Test {
                 size: POSITION_SIZE,
                 triggerPrice: 45_000 * BAZAAR_SCALE,
                 limitPrice: 0,
-                maxSlippageBp: 501, // exceeds MAX_SLIPPAGE_BP
+                maxSlippageBp: 1001, // exceeds MAX_SLIPPAGE_BP
                 expirationBlock: 0,
                 integrator: address(0)
             }),
