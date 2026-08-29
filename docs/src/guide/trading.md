@@ -15,7 +15,7 @@ A practical guide to trading on Bazaar. Plain language first; every section link
 | Fill now at market | `Market` | fills immediately against resting limits at up to your slippage cap (max 10%); never rests — whatever can't fill in your own transaction is canceled |
 | Rest at your price | `Limit` | sits on the book until filled, canceled, or expired (up to ~1 year); `postOnly` guarantees you're the maker |
 | Enter on a breakout | `StopLimit` | arms when price crosses your trigger, then acts as a limit |
-| Lock in profit | `TakeProfit` | reduce-only limit against your position; one per position |
+| Lock in profit | `TakeProfit` | reduce-only; fires at market once the price reaches your target, one per position |
 | Cap your loss | `StopLoss` | reduce-only market-style close when price crosses your trigger; one per position |
 
 Minimum order: **$5** notional (closing your whole position is always allowed). Stops are fired by permissionless keepers, but only against a *proven, fresh oracle* price — a keeper cannot choose the price that triggers you, only prove the one Pyth published. The keeper who fires your stop earns a flat **$0.25** tip from your collateral, like a trading fee.

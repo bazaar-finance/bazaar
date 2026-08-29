@@ -295,17 +295,18 @@ contract ArrivalMatchTest is IntegrationBase {
     // TP/SL fence mid-fill: canceled resting orders can never fill
     // ============================================================
 
-    function test_fence_cancelsRestingTakeProfitMidFill_neverFillsIt() public {
-        // Bob holds a long with a resting TakeProfit ask high above the market, plus a plain
-        // closing ask near the market. A buyer consumes the near ask, shrinking bob's position
-        // to zero — the fence cancels AND unlinks the now-oversized TP in the same fill. A
-        // later buyer at the TP's price must not fill it; their order rests instead.
+    function test_fence_cancelsTakeProfitMidFill_soItCanNeverFire() public {
+        // Bob holds a long with a TakeProfit covering all of it, plus a plain closing ask near
+        // the market. A buyer consumes the near ask, taking bob flat — the fence must cancel the
+        // now-oversized TP in that same fill, so a keeper cannot later fire a close-only order
+        // against a position that no longer exists.
         _openPosition(bob, carol, true, BTC / 10); // bob long 0.1 at 51k entry
         _fund(alice);
         _fund(dave);
 
-        uint256 tp = _placeTakeProfit(bob, false, BTC / 10, 52_000 * BAZAAR_SCALE);
-        assertTrue(_inBook(tp), "TakeProfit rests in the book at creation");
+        uint256 tp = _placeTakeProfit(bob, false, BTC / 10, 52_000 * BAZAAR_SCALE, 500);
+        assertFalse(_inBook(tp), "TakeProfit waits outside the book");
+        assertEq(_takeProfitOrderId(bob), tp, "TP slot anchored");
 
         uint256 closeAsk = _placeLimit(bob, false, BTC / 10, 50_100 * BAZAAR_SCALE);
 
@@ -314,14 +315,13 @@ contract ArrivalMatchTest is IntegrationBase {
         assertEq(_filledSize(closeAsk), BTC / 10, "near ask filled");
         assertEq(_posSize(bob), 0, "bob flat");
         assertGt(_canceledBlock(tp), 0, "fence canceled the oversized TP");
-        assertFalse(_inBook(tp), "fence unlinked the TP from the book");
         assertEq(_takeProfitOrderId(bob), 0, "TP slot cleared");
 
-        // A buyer at the TP's price finds no ask: their bid rests, and the canceled TP stays
-        // at zero fills.
-        uint256 lateBid = _placeLimit(dave, true, BTC / 10, 52_000 * BAZAAR_SCALE);
+        // Liquidity exists at the target, and the price reaches it — the canceled TP still must
+        // not fire.
+        _placeLimitAt(dave, true, BTC / 10, 52_000 * BAZAAR_SCALE, 52_000);
+        assertEq(_executeTriggerAt(tp, 52_000), 0, "canceled TP is skipped by the keeper");
         assertEq(_filledSize(tp), 0, "canceled TP can never fill");
-        assertTrue(_inBook(lateBid), "late bid rests against an empty ask side");
         _assertBooks("after fence scenario");
     }
 

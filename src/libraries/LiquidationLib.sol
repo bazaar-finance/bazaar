@@ -335,9 +335,10 @@ library LiquidationLib {
     }
 
     /// @notice Resets a user's position bucket to zero state
-    /// @dev Cancels any active TP/SL orders — unlinking a resting TakeProfit from the book, so
-    ///      no walk can fill an order whose backing position was just seized — and resets all
-    ///      position fields to zero.
+    /// @dev Cancels any active TP/SL orders and resets all position fields to zero. The
+    ///      cancellation is load-bearing: TP/SL wait outside the book for a keeper to fire them,
+    ///      so an order left live after the position is seized would execute market-style and
+    ///      re-open exposure for a user who was just liquidated.
     function _resetBucket(
         address user,
         BazaarTypes.PositionBucket storage bucket,

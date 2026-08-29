@@ -11,21 +11,37 @@ market** (a *position bucket*); orders modify it.
 | `Market` | book prices, bounded by oracle ± `maxSlippageBp` | — | slippage cap 10%; fills immediately, remainder cancels — never rests; rejected while the oracle is stale |
 | `Limit` | `limitPrice` | — | GTC by default; the only type that takes `isPostOnly` or `isIoc` |
 | `StopLimit` | `limitPrice` | arms at `triggerPrice` | limit must be on the fillable side of the trigger (buy: limit ≥ trigger) |
-| `TakeProfit` | `limitPrice` | — | position-reducing only: opposite direction, `size ≤ position`, **1 per position**, never expires; **rests in the book from creation** |
-| `StopLoss` | book prices, bounded by oracle ± `maxSlippageBp` | arms at `triggerPrice` | same restrictions as TakeProfit |
+| `TakeProfit` | book prices, bounded by oracle ± `maxSlippageBp` | fires at `triggerPrice` **in your favour** | position-reducing only: opposite direction, `size ≤ position`, **1 per position**, never expires |
+| `StopLoss` | book prices, bounded by oracle ± `maxSlippageBp` | fires at `triggerPrice` **against you** | same restrictions as TakeProfit |
 
 **Time-in-force.** A Limit order with `isIoc` fills whatever crosses on arrival and cancels the
 remainder instead of resting. `isPostOnly` is the opposite commitment — crossing anything cancels
 the order before any fill. The two are mutually exclusive.
 
-**Stops.** An untriggered StopLimit/StopLoss rests *outside* the book. If a fresh oracle price
-already meets the trigger at creation (buy fires at price ≥ trigger, sell at ≤, inclusive), the
-stop arms immediately in the same transaction. Otherwise anyone may fire it later through
-`executeTriggeredOrders` with a fresh Pyth price: the executor earns a flat `TRIGGER_TIP` ($0.25)
-charged to the stop's owner like a trading fee — no escrow. An owner whose collateral cannot cover
-the tip has the stop auto-canceled instead, mirroring the fee-coverage rule every fill applies.
-Triggers are evaluated against the oracle price the executor proves, never a price the executor
-chooses.
+**Trigger orders.** StopLimit, StopLoss and TakeProfit all wait *outside* the book until an oracle
+price reaches their trigger. If a fresh price already satisfies the trigger at creation, the order
+arms immediately in the same transaction; otherwise anyone may fire it later through
+`executeTriggeredOrders` with a fresh Pyth price. The executor earns a flat `TRIGGER_TIP` ($0.25)
+charged to the owner like a trading fee — no escrow. An owner whose collateral cannot cover the tip
+has the order auto-canceled instead, mirroring the fee-coverage rule every fill applies. Triggers
+are evaluated against the oracle price the executor proves, never a price the executor chooses.
+
+Stops and take-profits fire on **opposite** sides of the market, because a stop exists to cap a
+loss and a take-profit to realize a gain:
+
+| Position | Order side | Stop fires when | Take-profit fires when |
+|---|---|---|---|
+| Long | sell (`isLong = false`) | price ≤ trigger | price ≥ trigger |
+| Short | buy (`isLong = true`) | price ≥ trigger | price ≤ trigger |
+
+Both comparisons are inclusive at the trigger. On firing, a StopLoss or TakeProfit executes
+**market-style** — it takes whatever the book offers within oracle ± `maxSlippageBp` and cancels any
+unfilled remainder, so it never lingers as resting liquidity. A StopLimit instead *becomes* a limit
+order: it matches what crosses and rests the remainder in the book at its limit price.
+
+A profit target that must fill at an exact price is a plain `Limit` order — that is the
+limit-priced counterpart to `TakeProfit`, and unlike a TakeProfit it provides depth to the book
+while it waits.
 
 ## Creation rules
 
@@ -54,7 +70,7 @@ chooses.
 - The matching engine **auto-cancels** orders in these situations: a fill that would fail the
   owner's margin check, a self-match (the incoming order cancels), a post-only order that would
   take instead of make, an IOC/Market/step-capped/dust remainder, a stop whose owner cannot cover
-  the trigger tip, and a resting TP/SL left oversized after a fill shrinks or flips the position.
+  the trigger tip, and a TP/SL left oversized after a fill shrinks or flips the position.
   Every auto-cancel unlinks in the same transaction.
 
 ## Order lifecycle

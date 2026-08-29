@@ -427,8 +427,9 @@ library AdlLib {
     }
 
     /// @notice Resets a user's position bucket after full ADL close (cancels TP/SL, zeros
-    ///         position fields). A resting TakeProfit is unlinked from the book in the same
-    ///         write, so no walk can fill an order whose backing position was just deleveraged.
+    ///         position fields). Cancelling is required, not hygiene: TP/SL wait outside the book
+    ///         for a keeper to fire them, so a live order left behind would execute market-style
+    ///         against a position that no longer exists and open a fresh one in its place.
     function _resetBucket(
         mapping(uint256 => BazaarTypes.Order) storage orders,
         BazaarTypes.OrderBook storage book,

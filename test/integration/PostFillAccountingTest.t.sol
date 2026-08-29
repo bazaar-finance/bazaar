@@ -115,10 +115,11 @@ contract PostFillAccountingTest is IntegrationBase {
     /// @notice A TakeProfit larger than the shrunken position is auto-canceled by the fence.
     function test_fence_oversizedTakeProfitCanceledOnPartialClose() public {
         _openAt50k(2 * BAZAAR_SCALE / 10);
-        uint256 tpId = _placeTakeProfit(alice, false, 2 * BAZAAR_SCALE / 10, 55_000 * BAZAAR_SCALE);
+        uint256 tpId = _placeTakeProfit(alice, false, 2 * BAZAAR_SCALE / 10, 55_000 * BAZAAR_SCALE, 500);
         assertEq(_takeProfitOrderId(alice), tpId, "TP attached");
 
-        // Partial close 0.1: carol's buy takes alice's $49k ask (the TP rests deeper at $55k).
+        // Partial close 0.1: carol's buy takes alice's $49k ask. The TP waits outside the book
+        // for a $55k print, so it takes no part in this fill.
         _deposit(carol, 20_000 * BAZAAR_SCALE);
         _placeLimit(alice, false, BAZAAR_SCALE / 10, 49_000 * BAZAAR_SCALE);
         _roll(2);
@@ -375,12 +376,12 @@ contract PostFillAccountingTest is IntegrationBase {
     /// @notice A fully-filled TakeProfit clears its bucket slot so a fresh TP can be attached.
     function test_persistFill_takeProfitSlotClearedOnFullFill() public {
         _openAt50k(BAZAAR_SCALE / 10);
-        uint256 tpId = _placeTakeProfit(alice, false, BAZAAR_SCALE / 10, 50_500 * BAZAAR_SCALE);
+        uint256 tpId = _placeTakeProfit(alice, false, BAZAAR_SCALE / 10, 50_500 * BAZAAR_SCALE, 500);
 
-        // The TP rests in the book; carol's crossing buy fills it at its $50.5k limit.
+        // Liquidity for the fired TP to sell into, then a keeper fires it at the $50.5k target.
         _deposit(carol, 20_000 * BAZAAR_SCALE);
-        _roll(2);
-        _placeLimit(carol, true, BAZAAR_SCALE / 10, 51_000 * BAZAAR_SCALE);
+        _placeLimitAt(carol, true, BAZAAR_SCALE / 10, 50_400 * BAZAAR_SCALE, 50_500);
+        assertEq(_executeTriggerAt(tpId, 50_500), 1, "TP fired at its target");
 
         assertEq(_filledSize(tpId), BAZAAR_SCALE / 10, "TP fully filled");
         assertEq(_takeProfitOrderId(alice), 0, "TP slot cleared");

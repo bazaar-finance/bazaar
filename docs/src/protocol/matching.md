@@ -15,10 +15,11 @@ no third party in the fill path — the taker pays for the liquidity it consumes
 
 For each node, in order:
 
-1. **Re-read the head from storage.** A fill can cancel resting TP/SL orders anywhere in the book
-   (the oversize fence), so no pointer survives a settlement in memory.
+1. **Re-read the head from storage.** A settlement unlinks the maker it just consumed, and can
+   cancel the *taker itself* — a close-only order that just closed its position hits the oversize
+   fence mid-walk — so no pointer or liveness flag survives a settlement in memory.
 2. **Stop if the best price no longer crosses** the taker's bound (its limit price, or
-   oracle ± `maxSlippageBp` for Market/StopLoss).
+   oracle ± `maxSlippageBp` for Market, StopLoss and TakeProfit).
 3. **Count the node** against the walk's step budget (`MatchHints.maxSteps`, clamped to
    `MAX_WALK_STEPS` = 32; 0 selects the default). The budget counts *nodes visited*, skips
    included, so expired dust cannot push a taker past their gas budget.
@@ -32,8 +33,8 @@ For each node, in order:
 
 | Case | Outcome |
 |---|---|
-| GTC limit / TakeProfit, no longer crossing | rests in the book (positioned by insertion hints) |
-| Market, StopLoss execution, or IOC | canceled |
+| GTC limit / armed StopLimit, no longer crossing | rests in the book (positioned by insertion hints) |
+| Market, StopLoss/TakeProfit execution, or IOC | canceled |
 | post-only that crossed a live maker | canceled before any fill |
 | self-match (maker is the taker's own order) | incoming remainder canceled; the resting order stays |
 | step budget hit while still crossing | canceled — the book must never rest crossed |

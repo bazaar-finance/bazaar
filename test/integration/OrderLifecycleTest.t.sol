@@ -185,7 +185,8 @@ contract OrderLifecycleTest is IntegrationBase {
         s.orderType = BazaarTypes.OrderType.TakeProfit;
         s.isLong = false;
         s.size = BTC / 10;
-        s.limitPrice = 55_000 * BAZAAR_SCALE;
+        s.triggerPrice = 55_000 * BAZAAR_SCALE;
+        s.maxSlippageBp = 500;
         s.isIoc = true;
         _expectTifRevert(s);
     }

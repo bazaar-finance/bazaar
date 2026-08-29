@@ -70,8 +70,8 @@ library BazaarTypes {
     /// @dev One slot. bidHead is the best bid (highest limitPrice, oldest orderId at ties);
     ///      askHead is the best ask (lowest limitPrice, oldest at ties); 0 = empty side. The
     ///      counts track live nodes per side for lens pagination and traversal invariants.
-    ///      Ordering keys off limitPrice alone — every restable type (Limit, TakeProfit, armed
-    ///      StopLimit) is limit-priced, so list order is oracle-independent and never decays.
+    ///      Ordering keys off limitPrice alone — every restable type (Limit and armed StopLimit)
+    ///      is limit-priced, so list order is oracle-independent and never decays.
     struct OrderBook {
         uint64 bidHead;
         uint64 askHead;

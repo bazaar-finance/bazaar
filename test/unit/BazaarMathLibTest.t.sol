@@ -19,6 +19,10 @@ contract MathHarness {
         return BazaarMathLib.stopTriggerReached(isLong, trig, oracle);
     }
 
+    function takeProfitTriggerReached(bool isLong, uint256 trig, uint256 oracle) external pure returns (bool) {
+        return BazaarMathLib.takeProfitTriggerReached(isLong, trig, oracle);
+    }
+
     function signedMulDiv(int256 x, int256 y, int256 d) external pure returns (int256) {
         return BazaarMathLib.signedMulDiv(x, y, d);
     }
@@ -140,12 +144,13 @@ contract BazaarMathLibTest is Test {
     // effectivePrice
     // ---------------------------------------------------------------
 
-    function test_effectivePrice_nonMarketTypesReturnLimit() public view {
+    /// @dev Only the two limit-priced types read `limitPrice`; a wildly out-of-band value is used
+    ///      so an accidental oracle derivation could not coincide with the expected result.
+    function test_effectivePrice_limitTypesReturnLimit() public view {
         uint256 lp = 999 * SCALE;
         uint256 oracle = 100 * SCALE;
         assertEq(h.effectivePrice(BazaarTypes.OrderType.Limit, lp, true, 500, oracle), lp);
         assertEq(h.effectivePrice(BazaarTypes.OrderType.StopLimit, lp, true, 500, oracle), lp);
-        assertEq(h.effectivePrice(BazaarTypes.OrderType.TakeProfit, lp, false, 500, oracle), lp);
     }
 
     function test_effectivePrice_marketAppliesSlippage() public view {
@@ -159,6 +164,15 @@ contract BazaarMathLibTest is Test {
         uint256 oracle = 100 * SCALE;
         assertEq(h.effectivePrice(BazaarTypes.OrderType.StopLoss, 0, true, 500, oracle), 105 * SCALE);
         assertEq(h.effectivePrice(BazaarTypes.OrderType.StopLoss, 0, false, 500, oracle), 95 * SCALE);
+    }
+
+    /// @dev TakeProfit executes market-style, so it derives its bound from the oracle and ignores
+    ///      `limitPrice` entirely — passing a non-zero one here proves it is not consulted.
+    function test_effectivePrice_takeProfitAppliesSlippage() public view {
+        uint256 oracle = 100 * SCALE;
+        uint256 ignoredLimit = 999 * SCALE;
+        assertEq(h.effectivePrice(BazaarTypes.OrderType.TakeProfit, ignoredLimit, true, 500, oracle), 105 * SCALE);
+        assertEq(h.effectivePrice(BazaarTypes.OrderType.TakeProfit, ignoredLimit, false, 500, oracle), 95 * SCALE);
     }
 
     function test_effectivePrice_zeroSlippageIsOracle() public view {
@@ -181,5 +195,36 @@ contract BazaarMathLibTest is Test {
         assertTrue(h.stopTriggerReached(false, 100, 100)); // inclusive
         assertTrue(h.stopTriggerReached(false, 100, 99));
         assertFalse(h.stopTriggerReached(false, 100, 101));
+    }
+
+    // ---------------------------------------------------------------
+    // takeProfitTriggerReached
+    // ---------------------------------------------------------------
+
+    function test_takeProfitTrigger_buySide_firesAtOrBelow() public view {
+        assertTrue(h.takeProfitTriggerReached(true, 100, 100)); // inclusive
+        assertTrue(h.takeProfitTriggerReached(true, 100, 99));
+        assertFalse(h.takeProfitTriggerReached(true, 100, 101));
+    }
+
+    function test_takeProfitTrigger_sellSide_firesAtOrAbove() public view {
+        assertTrue(h.takeProfitTriggerReached(false, 100, 100)); // inclusive
+        assertTrue(h.takeProfitTriggerReached(false, 100, 101));
+        assertFalse(h.takeProfitTriggerReached(false, 100, 99));
+    }
+
+    /// @dev The two triggers are exact mirrors away from the trigger price, and BOTH fire at it.
+    ///      That overlap is deliberate: implementing take-profit as `!stopTriggerReached(...)`
+    ///      would negate an inclusive test into a strict one, making the trigger price the single
+    ///      price at which a take-profit does not fire.
+    function test_triggers_areMirrored_andBothInclusiveAtTrigger() public view {
+        for (uint256 i = 0; i < 2; i++) {
+            bool isLong = i == 0;
+            assertTrue(h.stopTriggerReached(isLong, 100, 100));
+            assertTrue(h.takeProfitTriggerReached(isLong, 100, 100));
+            // Away from the trigger, exactly one of the two fires.
+            assertTrue(h.stopTriggerReached(isLong, 100, 101) != h.takeProfitTriggerReached(isLong, 100, 101));
+            assertTrue(h.stopTriggerReached(isLong, 100, 99) != h.takeProfitTriggerReached(isLong, 100, 99));
+        }
     }
 }

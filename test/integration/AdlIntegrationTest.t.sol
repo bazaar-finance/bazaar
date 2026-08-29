@@ -108,10 +108,10 @@ contract AdlIntegrationTest is IntegrationBase {
         _placeLimit(bob, false, 3 * BAZAAR_SCALE, 49_000 * BAZAAR_SCALE);
         assertEq(_posSize(bob), 8 * BAZAAR_SCALE, "bob short 8 at a $51k basis");
 
-        // Bob protects the whole short with a take-profit buy. It rests in the book as a bid far
-        // below the market, outside the liquidation band so no unload can consume it.
-        uint256 tp = _placeTakeProfit(bob, true, 8 * BAZAAR_SCALE, 45_000 * BAZAAR_SCALE);
-        assertTrue(_inBook(tp), "TakeProfit rests in the book");
+        // Bob covers the whole short with a take-profit buy targeting $45k. It waits outside the
+        // book until the oracle falls that far, so nothing in this scenario can fill it.
+        uint256 tp = _placeTakeProfit(bob, true, 8 * BAZAAR_SCALE, 45_000 * BAZAAR_SCALE, 500);
+        assertFalse(_inBook(tp), "TakeProfit waits outside the book");
         assertEq(_takeProfitOrderId(bob), tp, "TP slot anchored");
 
         // Deep-underwater long of 5: bankruptcy ≈ $50,990/BTC, so the vault's expected loss
@@ -126,7 +126,7 @@ contract AdlIntegrationTest is IntegrationBase {
             (,,,,,, uint256 pend,,,,,) = pair.pairVault();
             assertEq(pend, 5 * BAZAAR_SCALE, "vault inherited exactly 5 BTC");
         }
-        assertTrue(_inBook(tp), "TP untouched by the liquidation (out of the unload band)");
+        assertEq(_canceledBlock(tp), 0, "TP untouched by the liquidation");
 
         vm.warp(vm.getBlockTimestamp() + 15 minutes + 1);
         bytes[] memory pu = _freshPrice();
@@ -136,7 +136,6 @@ contract AdlIntegrationTest is IntegrationBase {
         assertFalse(pair.isPairTerminatedEmergency(), "pair survives the deleverage");
         assertEq(_posSize(bob), 3 * BAZAAR_SCALE, "bob partially deleveraged: 8 - 5");
         assertGt(_canceledBlock(tp), 0, "oversized TakeProfit canceled by the fence");
-        assertFalse(_inBook(tp), "and unlinked, so no arrival can reach it");
         assertEq(_takeProfitOrderId(bob), 0, "TP slot cleared");
         _assertBooks("adl: after partial deleverage");
     }

@@ -259,13 +259,19 @@ abstract contract IntegrationBase is Test {
         return _lastCreatedOrderId(pair);
     }
 
-    function _placeTakeProfit(address user, bool isLong, uint256 size, uint256 limitPrice) internal returns (uint256) {
+    /// @dev TakeProfit is a trigger order: it waits outside the book until the oracle reaches
+    ///      `triggerPrice`, then executes market-style bounded by oracle ± `maxSlippageBp`.
+    function _placeTakeProfit(address user, bool isLong, uint256 size, uint256 triggerPrice, uint256 maxSlippageBp)
+        internal
+        returns (uint256)
+    {
         bytes[] memory pu = _freshPrice();
         BazaarTypes.OrderSpec memory s;
         s.orderType = BazaarTypes.OrderType.TakeProfit;
         s.isLong = isLong;
         s.size = size;
-        s.limitPrice = limitPrice;
+        s.triggerPrice = triggerPrice;
+        s.maxSlippageBp = maxSlippageBp;
         vm.prank(user);
         pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
         return _lastCreatedOrderId(pair);

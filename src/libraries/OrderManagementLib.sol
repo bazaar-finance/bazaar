@@ -118,10 +118,15 @@ library OrderManagementLib {
             }
             orderMaxSlippageBp = 0;
         } else if (ot == BazaarTypes.OrderType.TakeProfit) {
+            // Mirror of StopLoss: a profit target is a trigger order that executes at market once
+            // the oracle reaches it, so it carries a trigger and a slippage bound and no limit
+            // price. A profit target that must fill at an exact price is a plain Limit order.
             if (spec.isPostOnly) revert OrderManagementLib__PostOnlyNotAllowed();
-            if (spec.limitPrice == 0) revert OrderManagementLib__ZeroLimitPrice();
-            orderMaxSlippageBp = 0;
-            orderTriggerPrice = 0;
+            if (spec.triggerPrice == 0) revert OrderManagementLib__ZeroTriggerPrice();
+            if (spec.maxSlippageBp == 0 || spec.maxSlippageBp > MAX_SLIPPAGE_BP) {
+                revert OrderManagementLib__InvalidSlippage(spec.maxSlippageBp);
+            }
+            orderLimitPrice = 0;
         } else if (ot == BazaarTypes.OrderType.StopLoss) {
             if (spec.isPostOnly) revert OrderManagementLib__PostOnlyNotAllowed();
             if (spec.triggerPrice == 0) revert OrderManagementLib__ZeroTriggerPrice();

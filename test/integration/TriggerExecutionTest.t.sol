@@ -225,4 +225,80 @@ contract TriggerExecutionTest is IntegrationBase {
         assertEq(_filledSize(sl), BTC / 2, "stop filled in full despite maxSteps = 1");
         assertEq(_posSize(bob), 0, "position fully protected");
     }
+
+    // ============================================================
+    // TakeProfit: the mirrored trigger
+    // ============================================================
+
+    /// @notice A take-profit fires when the market moves IN FAVOUR of the position, the mirror of
+    ///         a stop. For a long that means a sell target ABOVE the market: unreached below it,
+    ///         live at or above it.
+    function test_takeProfit_long_firesOnlyWhenPriceRisesToTarget() public {
+        _openPosition(bob, carol, true, BTC / 10); // bob long 0.1 @ 51k
+        uint256 tp = _placeTakeProfit(bob, false, BTC / 10, 52_000 * BAZAAR_SCALE, 500);
+        assertFalse(_inBook(tp), "waits outside the book");
+
+        // Below the target: not reached. A stop with these same arguments WOULD fire here, which
+        // is exactly the direction this test pins.
+        assertEq(_executeTriggerAt(tp, 51_000), 0, "not fired below the target");
+        assertEq(_canceledBlock(tp), 0, "still live");
+
+        // At the target: fires (inclusive), and takes market-style against resting liquidity.
+        _deposit(dave, 60_000 * BAZAAR_SCALE);
+        _placeLimitAt(dave, true, BTC / 10, 51_900 * BAZAAR_SCALE, 52_000);
+        assertEq(_executeTriggerAt(tp, 52_000), 1, "fires at exactly the target");
+        assertEq(_filledSize(tp), BTC / 10, "closed against the resting bid");
+        assertEq(_posSize(bob), 0, "position closed");
+        assertEq(_takeProfitOrderId(bob), 0, "TP slot cleared");
+    }
+
+    /// @notice The short mirror: a take-profit buy targets a price BELOW the market.
+    function test_takeProfit_short_firesOnlyWhenPriceFallsToTarget() public {
+        _openPosition(bob, carol, false, BTC / 10); // bob short 0.1
+        uint256 tp = _placeTakeProfit(bob, true, BTC / 10, 48_000 * BAZAAR_SCALE, 500);
+
+        assertEq(_executeTriggerAt(tp, 49_000), 0, "not fired above the target");
+        assertEq(_canceledBlock(tp), 0, "still live");
+
+        _deposit(dave, 60_000 * BAZAAR_SCALE);
+        _placeLimitAt(dave, false, BTC / 10, 48_100 * BAZAAR_SCALE, 48_000);
+        assertEq(_executeTriggerAt(tp, 48_000), 1, "fires at exactly the target");
+        assertEq(_filledSize(tp), BTC / 10, "closed against the resting ask");
+        assertEq(_posSize(bob), 0, "position closed");
+    }
+
+    /// @notice A take-profit whose target the current price already satisfies arms in its own
+    ///         creation transaction, with no keeper and no tip — same as a stop.
+    function test_takeProfit_targetAlreadyReached_executesAtCreation() public {
+        _openPosition(bob, carol, true, BTC / 10);
+        _deposit(dave, 60_000 * BAZAAR_SCALE);
+        _placeLimit(dave, true, BTC / 10, 49_900 * BAZAAR_SCALE); // liquidity at the market
+
+        uint256 collBefore = _posCollateral(bob);
+        uint256 keeperBefore = usdc.balanceOf(seq);
+        // Target $49k, market $50k: already satisfied for a long's sell target.
+        uint256 tp = _placeTakeProfit(bob, false, BTC / 10, 49_000 * BAZAAR_SCALE, 500);
+
+        assertEq(_filledSize(tp), BTC / 10, "executed in the creation transaction");
+        assertEq(_posSize(bob), 0, "position closed");
+        assertEq(usdc.balanceOf(seq), keeperBefore, "no keeper involved");
+        assertGt(collBefore, 0);
+    }
+
+    /// @notice Market-style execution: an unfilled remainder cancels rather than resting, so a
+    ///         fired take-profit never becomes book liquidity.
+    function test_takeProfit_remainderCancels_neverRests() public {
+        _openPosition(bob, carol, true, BTC / 10);
+        _deposit(dave, 60_000 * BAZAAR_SCALE);
+        uint256 tp = _placeTakeProfit(bob, false, BTC / 10, 52_000 * BAZAAR_SCALE, 500);
+
+        // Only a fraction of the size is available at the target.
+        _placeLimitAt(dave, true, BTC / 100, 51_900 * BAZAAR_SCALE, 52_000);
+        assertEq(_executeTriggerAt(tp, 52_000), 1, "fired");
+
+        assertEq(_filledSize(tp), BTC / 100, "filled only what the book offered");
+        assertGt(_canceledBlock(tp), 0, "remainder canceled");
+        assertFalse(_inBook(tp), "never rests");
+        assertEq(_posSize(bob), BTC / 10 - BTC / 100, "the rest of the position survives");
+    }
 }

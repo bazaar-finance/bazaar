@@ -25,8 +25,9 @@ import {OrderBookLib} from "./OrderBookLib.sol";
 ///  • The book never rests crossed: every disposition that could leave a still-crossing
 ///    remainder (step-cap, stale band, self-match, margin failure) cancels the incoming order.
 ///  • The walk re-reads its side's head from storage every iteration and never carries a next
-///    pointer across a settlement: a fill can cancel-and-unlink resting TP/SL orders anywhere
-///    in the book through the oversize fence, so any cached pointer would go stale mid-walk.
+///    pointer across a settlement: a settlement unlinks the maker it just consumed or
+///    auto-cancels one that fails its margin gate, and can terminate the TAKER's own order
+///    through the oversize fence, so any cached pointer or cached liveness would go stale.
 ///  • Margin checks always use normal IMR against the tx's cached price. Failure → auto-cancel.
 ///    During the stale fallback, a maker priced outside MAX_STALE_DEVIATION_BP of the cached
 ///    price cancels the INCOMING order's remainder; the resting maker stays.
@@ -116,11 +117,8 @@ library MatchingEngineLib {
             if (ot == BazaarTypes.OrderType.Market && ctx.isOracleStale) {
                 revert MatchingEngineLib__BlockedOracleStale();
             }
-            if (ot == BazaarTypes.OrderType.StopLimit || ot == BazaarTypes.OrderType.StopLoss) {
-                if (
-                    ctx.isOracleStale
-                        || !BazaarMathLib.stopTriggerReached(t.isLong, t.triggerPrice, ctx.cachedPrice)
-                ) {
+            if (_isTriggerGated(ot)) {
+                if (ctx.isOracleStale || !_triggerReached(ot, t.isLong, t.triggerPrice, ctx.cachedPrice)) {
                     return sum;
                 }
             }
@@ -162,10 +160,10 @@ library MatchingEngineLib {
             uint256 orderId = execs[i].orderId;
             BazaarTypes.Order storage o = orders[orderId];
             BazaarTypes.OrderType ot = o.orderType;
-            if (ot != BazaarTypes.OrderType.StopLimit && ot != BazaarTypes.OrderType.StopLoss) continue;
+            if (!_isTriggerGated(ot)) continue;
             if (o.creator == address(0) || o.canceledBlock != 0 || o.filledBlock != 0 || o.inBook) continue;
             if (o.expiryBlock < ctx.currentBlock) continue;
-            if (!BazaarMathLib.stopTriggerReached(o.isLong, o.triggerPrice, ctx.cachedPrice)) continue;
+            if (!_triggerReached(ot, o.isLong, o.triggerPrice, ctx.cachedPrice)) continue;
 
             {
                 BazaarTypes.PositionBucket storage bucket = positionBuckets[o.creator];
@@ -1327,9 +1325,10 @@ library MatchingEngineLib {
     }
 
     /// @dev Cancel any TP/SL whose remaining size exceeds the position left after a fill that
-    ///      shrank or flipped it. Unlinking here is load-bearing for the walk's head-re-read
-    ///      discipline: a resting TakeProfit canceled by this fence leaves the book in the same
-    ///      transaction, so no later iteration (or any other walk) can fill it.
+    ///      shrank or flipped it — a close-only order may never exceed the position it closes.
+    ///      Both types wait outside the book, so the unlink is a no-op here; it is kept because
+    ///      this fence is the shared exit for every shrink path and must stay correct if a
+    ///      close-only type ever rests again.
     function _cancelOversizedTpSl(
         address user,
         BazaarTypes.PositionBucket storage bucket,
@@ -1506,7 +1505,28 @@ library MatchingEngineLib {
     // ================================================================
 
     function _isOracleDerivedPrice(BazaarTypes.OrderType ot) internal pure returns (bool) {
-        return ot == BazaarTypes.OrderType.Market || ot == BazaarTypes.OrderType.StopLoss;
+        return ot == BazaarTypes.OrderType.Market || ot == BazaarTypes.OrderType.StopLoss
+            || ot == BazaarTypes.OrderType.TakeProfit;
+    }
+
+    /// @dev True for the types that wait outside the book for an oracle price to reach them.
+    function _isTriggerGated(BazaarTypes.OrderType ot) internal pure returns (bool) {
+        return ot == BazaarTypes.OrderType.StopLimit || ot == BazaarTypes.OrderType.StopLoss
+            || ot == BazaarTypes.OrderType.TakeProfit;
+    }
+
+    /// @dev Has this trigger-gated order's condition been met at `oraclePrice`? Stops fire when
+    ///      the market moves against the position, take-profits when it moves in favour, so the
+    ///      two use mirrored comparisons. Shared by arrival-time arming and executeTriggers so
+    ///      both paths agree on when an order is live.
+    function _triggerReached(BazaarTypes.OrderType ot, bool isLong, uint256 triggerPrice, uint256 oraclePrice)
+        internal
+        pure
+        returns (bool)
+    {
+        return ot == BazaarTypes.OrderType.TakeProfit
+            ? BazaarMathLib.takeProfitTriggerReached(isLong, triggerPrice, oraclePrice)
+            : BazaarMathLib.stopTriggerReached(isLong, triggerPrice, oraclePrice);
     }
 
     // ================================================================

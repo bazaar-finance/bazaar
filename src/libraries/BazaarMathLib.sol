@@ -14,8 +14,8 @@ library BazaarMathLib {
     error BazaarMathLib__ResultOverflow();
 
     /// @notice Compute the effective price of an order against an oracle price.
-    /// @dev Limit / StopLimit / TakeProfit use the configured limitPrice.
-    ///      Market / StopLoss derive the bound from oracle ± slippage.
+    /// @dev Limit / StopLimit use the configured limitPrice.
+    ///      Market / StopLoss / TakeProfit derive the bound from oracle ± slippage.
     function effectivePrice(
         BazaarTypes.OrderType orderType,
         uint256 limitPrice,
@@ -23,7 +23,7 @@ library BazaarMathLib {
         uint256 maxSlippageBp,
         uint256 oraclePrice
     ) internal pure returns (uint256) {
-        if (orderType != BazaarTypes.OrderType.Market && orderType != BazaarTypes.OrderType.StopLoss) {
+        if (orderType == BazaarTypes.OrderType.Limit || orderType == BazaarTypes.OrderType.StopLimit) {
             return limitPrice;
         }
         unchecked {
@@ -43,6 +43,24 @@ library BazaarMathLib {
     ///      trigger semantics.
     function stopTriggerReached(bool isLong, uint256 triggerPrice, uint256 oraclePrice) internal pure returns (bool) {
         return isLong ? oraclePrice >= triggerPrice : oraclePrice <= triggerPrice;
+    }
+
+    /// @notice Whether a take-profit order's trigger has been reached by the given oracle price.
+    /// @dev The mirror of `stopTriggerReached`: a stop fires when the market moves AGAINST the
+    ///      position, a take-profit when it moves IN FAVOUR. Closing a long is a sell
+    ///      (isLong=false) whose target sits above the market → fires at price >= trigger;
+    ///      closing a short is a buy (isLong=true) whose target sits below → fires at price <=
+    ///      trigger. Inclusive at the trigger, matching the stop predicate.
+    ///
+    ///      Written as its own comparison rather than `!stopTriggerReached(...)`: the negation of
+    ///      an inclusive test is a strict one, which would make a take-profit resting exactly at
+    ///      its target the one price at which it does not fire.
+    function takeProfitTriggerReached(bool isLong, uint256 triggerPrice, uint256 oraclePrice)
+        internal
+        pure
+        returns (bool)
+    {
+        return isLong ? oraclePrice <= triggerPrice : oraclePrice >= triggerPrice;
     }
 
     /// @notice Safe signed multiply-divide: (x * y) / denominator supporting negative operands.

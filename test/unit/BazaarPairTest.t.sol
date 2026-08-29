@@ -2563,7 +2563,10 @@ contract BazaarPairTest is Test {
         _depositCollateral(btcPair, user1, 15_000 * BAZAAR_SCALE);
         _simulateOpenPosition(user1); // 1 BTC long at $50,000
 
-        uint256 tpPrice = 55_000 * BAZAAR_SCALE; // sell high
+        // Sell take-profit $5k above spot: untriggered at creation (a sell TP fires at
+        // price >= trigger), so it waits outside the book for a qualifying price.
+        uint256 tpTrigger = 55_000 * BAZAAR_SCALE; // sell high
+        uint256 tpSlippage = 500; // 5% max slippage from oracle at execution
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
 
         vm.prank(user1);
@@ -2574,9 +2577,9 @@ contract BazaarPairTest is Test {
                 isPostOnly: false,
                 isIoc: false,
                 size: POSITION_SIZE,
-                triggerPrice: 0,
-                limitPrice: tpPrice,
-                maxSlippageBp: 0,
+                triggerPrice: tpTrigger,
+                limitPrice: 0,
+                maxSlippageBp: tpSlippage,
                 expirationBlock: 0,
                 integrator: address(0)
             }),
@@ -2588,11 +2591,11 @@ contract BazaarPairTest is Test {
             ""
         );
 
-        // TP order stored; it rests in the book at its limit price from creation onward
-        (,, uint256 tp, uint256 lp,,,, BazaarTypes.OrderType ot,,,,,,,,,,) = btcPair.orders(1);
+        (,, uint256 tp, uint256 lp, uint256 msBp,,, BazaarTypes.OrderType ot,,,,,,,,,,) = btcPair.orders(1);
         assertTrue(ot == BazaarTypes.OrderType.TakeProfit);
-        assertEq(tp, 0); // no triggerPrice for TP
-        assertEq(lp, tpPrice);
+        assertEq(tp, tpTrigger);
+        assertEq(lp, 0); // no limit price for TP
+        assertEq(msBp, tpSlippage);
 
         // Bucket links to TP order
         (,,,,, uint256 tpOrderId,,,) = btcPair.positionBuckets(user1);
@@ -2612,9 +2615,9 @@ contract BazaarPairTest is Test {
                 isPostOnly: false,
                 isIoc: false,
                 size: POSITION_SIZE,
-                triggerPrice: 0,
-                limitPrice: 55_000 * BAZAAR_SCALE,
-                maxSlippageBp: 0,
+                triggerPrice: 55_000 * BAZAAR_SCALE,
+                limitPrice: 0,
+                maxSlippageBp: 500,
                 expirationBlock: 0,
                 integrator: address(0)
             }),
@@ -2642,9 +2645,9 @@ contract BazaarPairTest is Test {
                 isPostOnly: false,
                 isIoc: false,
                 size: POSITION_SIZE,
-                triggerPrice: 0,
-                limitPrice: 55_000 * BAZAAR_SCALE,
-                maxSlippageBp: 0,
+                triggerPrice: 55_000 * BAZAAR_SCALE,
+                limitPrice: 0,
+                maxSlippageBp: 500,
                 expirationBlock: 0,
                 integrator: address(0)
             }),
@@ -2678,9 +2681,9 @@ contract BazaarPairTest is Test {
                 isPostOnly: false,
                 isIoc: false,
                 size: 2 * POSITION_SIZE, // 2 BTC > 1 BTC position
-                triggerPrice: 0,
-                limitPrice: 55_000 * BAZAAR_SCALE,
-                maxSlippageBp: 0,
+                triggerPrice: 55_000 * BAZAAR_SCALE,
+                limitPrice: 0,
+                maxSlippageBp: 500,
                 expirationBlock: 0,
                 integrator: address(0)
             }),
@@ -2708,9 +2711,9 @@ contract BazaarPairTest is Test {
                 isPostOnly: false,
                 isIoc: false,
                 size: POSITION_SIZE / 2,
-                triggerPrice: 0,
-                limitPrice: 55_000 * BAZAAR_SCALE,
-                maxSlippageBp: 0,
+                triggerPrice: 55_000 * BAZAAR_SCALE,
+                limitPrice: 0,
+                maxSlippageBp: 500,
                 expirationBlock: 0,
                 integrator: address(0)
             }),
@@ -2732,9 +2735,9 @@ contract BazaarPairTest is Test {
                 isPostOnly: false,
                 isIoc: false,
                 size: POSITION_SIZE / 2,
-                triggerPrice: 0,
-                limitPrice: 56_000 * BAZAAR_SCALE,
-                maxSlippageBp: 0,
+                triggerPrice: 56_000 * BAZAAR_SCALE,
+                limitPrice: 0,
+                maxSlippageBp: 500,
                 expirationBlock: 0,
                 integrator: address(0)
             }),
@@ -2819,7 +2822,7 @@ contract BazaarPairTest is Test {
             ""
         );
 
-        // Excessive slippage (> 500 bp)
+        // Excessive slippage (> MAX_SLIPPAGE_BP = 1000)
         vm.prank(user1);
         vm.expectRevert(abi.encodeWithSelector(OrderManagementLib.OrderManagementLib__InvalidSlippage.selector, 1001));
         btcPair.createOrder(
@@ -2900,13 +2903,13 @@ contract BazaarPairTest is Test {
 
     // ==================== createOrder: TP/SL + Zero Trigger Tests ====================
 
-    function testCreateOrder_TakeProfit_RevertsZeroLimitPrice() public {
+    function testCreateOrder_TakeProfit_RevertsZeroTriggerPrice() public {
         _depositCollateral(btcPair, user1, 15_000 * BAZAAR_SCALE);
         _simulateOpenPosition(user1);
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
 
         vm.prank(user1);
-        vm.expectRevert(OrderManagementLib.OrderManagementLib__ZeroLimitPrice.selector);
+        vm.expectRevert(OrderManagementLib.OrderManagementLib__ZeroTriggerPrice.selector);
         btcPair.createOrder(
             BazaarTypes.OrderSpec({
                 orderType: BazaarTypes.OrderType.TakeProfit,
@@ -2916,7 +2919,83 @@ contract BazaarPairTest is Test {
                 size: POSITION_SIZE,
                 triggerPrice: 0,
                 limitPrice: 0,
-                maxSlippageBp: 0,
+                maxSlippageBp: 500,
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
+            priceUpdate,
+            0, 0, 0, ""
+        );
+    }
+
+    function testCreateOrder_TakeProfit_RevertsInvalidSlippage() public {
+        _depositCollateral(btcPair, user1, 15_000 * BAZAAR_SCALE);
+        _simulateOpenPosition(user1);
+        bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
+
+        // Zero slippage: a market-style close with a zero bound could never fill.
+        vm.prank(user1);
+        vm.expectRevert(abi.encodeWithSelector(OrderManagementLib.OrderManagementLib__InvalidSlippage.selector, 0));
+        btcPair.createOrder(
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.TakeProfit,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 55_000 * BAZAAR_SCALE,
+                limitPrice: 0,
+                maxSlippageBp: 0, // rejected
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
+            priceUpdate,
+            0, 0, 0, ""
+        );
+
+        // Excessive slippage (> MAX_SLIPPAGE_BP = 1000)
+        vm.prank(user1);
+        vm.expectRevert(abi.encodeWithSelector(OrderManagementLib.OrderManagementLib__InvalidSlippage.selector, 1001));
+        btcPair.createOrder(
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.TakeProfit,
+                isLong: false,
+                isPostOnly: false,
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 55_000 * BAZAAR_SCALE,
+                limitPrice: 0,
+                maxSlippageBp: 1001, // rejected
+                expirationBlock: 0,
+                integrator: address(0)
+            }),
+            BazaarTypes.MatchHints(0, 0, 0, 0, 0),
+            priceUpdate,
+            0, 0, 0, ""
+        );
+    }
+
+    /// @dev A take-profit is a trigger order, so `isPostOnly` is meaningless on it: there is no
+    ///      resting remainder to protect maker status for.
+    function testCreateOrder_TakeProfit_RevertsPostOnly() public {
+        _depositCollateral(btcPair, user1, 15_000 * BAZAAR_SCALE);
+        _simulateOpenPosition(user1);
+        bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
+
+        vm.prank(user1);
+        vm.expectRevert(OrderManagementLib.OrderManagementLib__PostOnlyNotAllowed.selector);
+        btcPair.createOrder(
+            BazaarTypes.OrderSpec({
+                orderType: BazaarTypes.OrderType.TakeProfit,
+                isLong: false,
+                isPostOnly: true, // rejected
+                isIoc: false,
+                size: POSITION_SIZE,
+                triggerPrice: 55_000 * BAZAAR_SCALE,
+                limitPrice: 0,
+                maxSlippageBp: 500,
                 expirationBlock: 0,
                 integrator: address(0)
             }),
@@ -3492,9 +3571,9 @@ contract BazaarPairTest is Test {
                 isPostOnly: false,
                 isIoc: false,
                 size: POSITION_SIZE,
-                triggerPrice: 0,
-                limitPrice: BTC_SPOT_PRICE + 5_000 * BAZAAR_SCALE,
-                maxSlippageBp: 0,
+                triggerPrice: BTC_SPOT_PRICE + 5_000 * BAZAAR_SCALE,
+                limitPrice: 0,
+                maxSlippageBp: 500,
                 expirationBlock: 0,
                 integrator: address(0)
             }),
@@ -3949,7 +4028,8 @@ contract BazaarPairTest is Test {
         _simulateOpenPosition(user1);
 
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
-        uint256 limit = BTC_SPOT_PRICE * 110 / 100; // close above entry for long-side TP
+        uint256 trigger = BTC_SPOT_PRICE * 110 / 100; // profit target 10% above spot, not yet reached
+        uint256 slippage = 500;
         uint256 size = POSITION_SIZE;
 
         vm.expectEmit(true, true, true, true, address(btcPair));
@@ -3964,9 +4044,9 @@ contract BazaarPairTest is Test {
                 isPostOnly: false,
                 size: size,
                 filledSize: 0,
-                triggerPrice: 0,
-                limitPrice: limit,
-                maxSlippageBp: 0,
+                triggerPrice: trigger,
+                limitPrice: 0,
+                maxSlippageBp: slippage,
                 canceledBlock: 0,
                 filledBlock: 0,
                 expiryBlock: type(uint64).max, // NEVER_EXPIRE_BLOCK
@@ -3982,9 +4062,9 @@ contract BazaarPairTest is Test {
                 isPostOnly: false,
                 isIoc: false,
                 size: size,
-                triggerPrice: 0,
-                limitPrice: limit,
-                maxSlippageBp: 0,
+                triggerPrice: trigger,
+                limitPrice: 0,
+                maxSlippageBp: slippage,
                 expirationBlock: 0,
                 integrator: address(0)
             }),
@@ -3999,7 +4079,8 @@ contract BazaarPairTest is Test {
         _simulateOpenPosition(user1);
 
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
-        uint256 limit = BTC_SPOT_PRICE * 110 / 100;
+        uint256 trigger = BTC_SPOT_PRICE * 110 / 100;
+        uint256 slippage = 500;
         uint256 size = POSITION_SIZE;
 
         vm.prank(user1);
@@ -4010,9 +4091,9 @@ contract BazaarPairTest is Test {
                 isPostOnly: false,
                 isIoc: false,
                 size: size,
-                triggerPrice: 0,
-                limitPrice: limit,
-                maxSlippageBp: 0,
+                triggerPrice: trigger,
+                limitPrice: 0,
+                maxSlippageBp: slippage,
                 expirationBlock: 0,
                 integrator: address(0)
             }),
@@ -4040,9 +4121,9 @@ contract BazaarPairTest is Test {
                 isPostOnly: false,
                 size: size,
                 filledSize: 0,
-                triggerPrice: 0,
-                limitPrice: limit,
-                maxSlippageBp: 0,
+                triggerPrice: trigger,
+                limitPrice: 0,
+                maxSlippageBp: slippage,
                 canceledBlock: uint64(block.number),
                 filledBlock: 0,
                 expiryBlock: type(uint64).max,
