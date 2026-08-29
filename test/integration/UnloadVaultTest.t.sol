@@ -229,4 +229,67 @@ contract UnloadVaultTest is IntegrationBase {
         assertEq(pair.liquidate(_arr1(alice), _freshPrice()), 1, "alice liquidated");
         assertEq(_pendingLiqSize(), BTC / 10, "no liquidity: inventory awaits unloadVault");
     }
+
+    // ============================================================
+    // Seizure vs unload: the user's orders die with the position
+    // ============================================================
+
+    /// @notice Liquidation seizes the WHOLE position in one write and the vault inherits it, so
+    ///         a partial unload leaves inventory on the *vault*, not a remainder of the user's
+    ///         position. The liquidatee's TP and SL are therefore both canceled outright —
+    ///         there is no surviving position for a close-only order to reduce, and a live one
+    ///         would re-open exposure for someone who was just liquidated.
+    function test_liquidation_cancelsBothTpAndSl_evenWhenUnloadOnlyPartlyFills() public {
+        _setupInsolventAlice(); // alice: long 0.1 BTC, insolvent at $50k
+
+        uint256 tp = _placeTakeProfit(alice, false, BTC / 10, 55_000 * BAZAAR_SCALE, 500);
+        uint256 sl = _placeStopLoss(alice, false, BTC / 10, 45_000 * BAZAAR_SCALE, 500);
+        assertEq(_takeProfitOrderId(alice), tp, "TP slot armed");
+        assertEq(_stopLossOrderId(alice), sl, "SL slot armed");
+
+        // Only 0.02 BTC of in-band bid depth: the inline unload cannot absorb the full 0.1.
+        _deposit(carol, 20_000 * BAZAAR_SCALE);
+        _placeLimit(carol, true, BTC / 50, 47_600 * BAZAAR_SCALE);
+
+        vm.prank(bob);
+        assertEq(pair.liquidate(_arr1(alice), _freshPrice()), 1, "alice liquidated");
+
+        // The premise: the unload really was partial.
+        assertGt(_pendingLiqSize(), 0, "vault still holds unsold inventory");
+        assertEq(_posSize(carol), BTC / 50, "the in-band maker absorbed its slice");
+
+        // The user's side is fully gone regardless.
+        assertEq(_posSize(alice), 0, "position seized in full, not partially");
+        assertEq(_takeProfitOrderId(alice), 0, "TP slot cleared");
+        assertEq(_stopLossOrderId(alice), 0, "SL slot cleared");
+        assertGt(_canceledBlock(tp), 0, "TP canceled");
+        assertGt(_canceledBlock(sl), 0, "SL canceled");
+
+        // And neither can be revived by a keeper at a price that would have triggered it.
+        assertEq(_executeTriggerAt(tp, 55_000), 0, "canceled TP cannot fire");
+        assertEq(_executeTriggerAt(sl, 45_000), 0, "canceled SL cannot fire");
+        assertEq(_posSize(alice), 0, "alice stays flat");
+    }
+
+    /// @notice The vault's inherited inventory carries no TP/SL of its own: finishing the unload
+    ///         later moves size to fresh counterparties without reviving anything.
+    function test_laterUnload_ofSeizedInventory_revivesNothing() public {
+        _setupInsolventAlice();
+        uint256 tp = _placeTakeProfit(alice, false, BTC / 10, 55_000 * BAZAAR_SCALE, 500);
+
+        vm.prank(bob);
+        pair.liquidate(_arr1(alice), _freshPrice());
+        uint256 leftover = _pendingLiqSize();
+        assertGt(leftover, 0, "nothing absorbed with an empty book");
+
+        // Now supply depth and finish the unload permissionlessly.
+        _deposit(dave, 40_000 * BAZAAR_SCALE);
+        _placeLimit(dave, true, leftover, 47_600 * BAZAAR_SCALE);
+        assertEq(_unloadVault(), leftover, "remaining inventory cleared");
+
+        assertEq(_posSize(dave), leftover, "inventory moved to the new counterparty");
+        assertEq(_posSize(alice), 0, "liquidatee unaffected by the later unload");
+        assertGt(_canceledBlock(tp), 0, "TP still canceled");
+        assertEq(_takeProfitOrderId(dave), 0, "no TP follows the inventory");
+    }
 }
