@@ -53,7 +53,7 @@ All constants live in `src/libraries/BazaarTypes.sol`, `src/libraries/RiskParams
 | Parameter | Value |
 |---|---|
 | Liquidation keeper reward | max($0.10, 2 bp of notional) |
-| Vault-unload keeper reward | max($0.25 `UNLOAD_BOUNTY_MIN`, 2 bp of unloaded notional), paid from insurance when ≥ $1,250 notional unloads (`UNLOAD_BOUNTY_MIN_NOTIONAL`, the point where 2 bp overtakes the floor) or the unload clears the inventory; all-or-nothing on insurance coverage |
+| Vault-unload keeper reward | 2 bp of unloaded notional on any amount, plus a $0.25 floor (`UNLOAD_BOUNTY_MIN`) when the call unloads ≥ $1,250 (`UNLOAD_BOUNTY_MIN_NOTIONAL`, where 2 bp overtakes the floor) or clears the inventory — so a thin-book keeper is never unpaid, and slicing one unload into many earns no premium. Paid from insurance, all-or-nothing on coverage |
 | ADL trigger / cancel | expected loss > 80% / < 60% of fund |
 | ADL auction | 25× score → ~0, quadratic, 10 min; ≤ 25 winners per call |
 | ADL timeout | 24 h → settlement window opens at the live price |

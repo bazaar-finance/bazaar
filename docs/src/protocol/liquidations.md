@@ -28,7 +28,7 @@ A liquidation on the *opposite* side nets against the aggregate immediately: the
 The vault is not a market maker — it exits as fast as the book allows:
 
 - **Inline, inside `liquidate()` itself**: freshly seized inventory is crossed into the resting book before the transaction re-evaluates vault health, within a fixed node budget (`LIQ_INLINE_UNLOAD_STEPS` = 16) that keeps the liquidator's gas predictable.
-- **Permissionless `unloadVault(maxSteps, priceUpdate)`**: any keeper finishes deeper inventory for a reward of `max($0.25, 2 bp of unloaded notional)` from the insurance fund — paid when at least **$1,250** of notional unloads — the point where the bps term overtakes the floor, so splitting a large unload into small calls earns no more — or when the call clears the inventory outright, and all-or-nothing on insurance coverage.
+- **Permissionless `unloadVault(maxSteps, priceUpdate)`**: any keeper finishes deeper inventory for a reward of `max($0.25, 2 bp of unloaded notional)` from the insurance fund — the 2 bp rate is paid on any amount unloaded, so a keeper that drains a thin book is never left with nothing; the **$0.25** floor is added only when at least **$1,250** unloads (where the rate overtakes it) or the call clears the inventory, which is what stops a keeper earning a premium by slicing one unload into many. All-or-nothing on insurance coverage.
 - **Opposite-side netting** (above).
 - **[Auto-deleveraging](adl.md)** when the book can't absorb it and the fund is threatened.
 

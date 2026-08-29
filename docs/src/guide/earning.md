@@ -30,7 +30,7 @@ The honest framing: you get paid *because* your capital is locked in exactly the
 |---|---|---|---|
 | Liquidations | `liquidate(users[], priceUpdate)` | max($0.10, 2 bp of notional) per position | position health vs. lagged MMR (`checkBucketSolvency` on the lens) |
 | Trigger execution | `executeTriggeredOrders(execs[], priceUpdate)` | $0.25 per fired stop (`TRIGGER_TIP`), charged to the stop's owner; ≤ 20 per call | untriggered stops' trigger prices vs. the live Pyth price |
-| Vault unloading | `unloadVault(maxSteps, priceUpdate)` | max($0.25, 2 bp of unloaded notional), paid when ≥ $1,250 notional unloads or the call clears the inventory | `getPendingLiquidationExposure` on the lens after liquidations |
+| Vault unloading | `unloadVault(maxSteps, priceUpdate)` | 2 bp of unloaded notional always; floor of $0.25 when ≥ $1,250 unloads or the call clears the inventory | `getPendingLiquidationExposure` on the lens after liquidations |
 | Price refresh | `refreshPrice(priceUpdate)` | $0.25 when the stored price is > 10 min old, on pairs holding > $10k insurance and > $10k OI | quiet pairs' last stored-price timestamps |
 | ADL execution | `executeAdl(winners[], priceUpdate)` | 0.1% of averted bad debt | `isAdlPending`; rank winners by `getAdlScore` on the lens, descending — it reproduces the on-chain ranking exactly, and a mis-sorted submission reverts |
 | Dead-market cleanup | `terminateStalePair`, `terminateScheduledPair`, UMA settlement pokes | 0.1% (10 bp) of the fund, capped $100 (proposals) | oracle silence > 21 days; passed cessation timestamps |

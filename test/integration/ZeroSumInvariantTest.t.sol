@@ -274,7 +274,7 @@ contract ZeroSumInvariantTest is Test {
     }
 
     /// @dev Unload vault liquidation inventory into the resting book at the given oracle price.
-    ///      The caller (seq) earns the insurance-funded unload reward when >= $100 unloads —
+    ///      The caller (seq) earns the insurance-funded unload reward on whatever unloads —
     ///      cash and the insurance claim fall together, so the zero-sum identity is unmoved.
     function _unloadAt(uint256 priceUsd) internal returns (uint256 unloadedSize) {
         _advance(3);

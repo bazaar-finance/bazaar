@@ -130,20 +130,62 @@ contract UnloadVaultTest is IntegrationBase {
         assertEq(usdc.balanceOf(seq) - keeperBefore, 0.25e6, "$0.25 floor pays the clearing call");
     }
 
-    /// @notice A partial unload below the notional gate that leaves inventory behind earns
-    ///         nothing — this is what stops a keeper from slicing one large unload into many
-    ///         minimum-sized calls and collecting the flat floor on each.
-    function test_unload_reward_withheldBelowGate_whenInventoryRemains() public {
+    /// @notice Below the notional gate, with inventory left over, the caller still earns the plain
+    ///         bps rate — it just does not get the flat floor. A keeper that drains every in-band
+    ///         maker on a thin book has done all the work available, and must not come away with
+    ///         nothing merely because the inventory is larger than the book.
+    function test_unload_reward_bpsPaidBelowGate_withoutFloor() public {
         _deposit(carol, 20_000 * BAZAAR_SCALE);
-        // The book can only absorb ~$499 of a 1 BTC inventory: under the $1,250 gate AND the
-        // inventory survives, so no reward.
+        // The book can only absorb ~$499 of a 1 BTC inventory: under the $1,250 gate, and the
+        // inventory survives, so the bps term pays on its own.
         _placeLimit(carol, true, BTC / 100, 49_900 * BAZAAR_SCALE);
         _setVaultPendingLiq(BTC, 49_900, 48_000, true);
 
         uint256 keeperBefore = usdc.balanceOf(seq);
         assertEq(_unloadVault(), BTC / 100, "partial unload still executes");
         assertGt(_pendingLiqSize(), 0, "inventory remains");
-        assertEq(usdc.balanceOf(seq), keeperBefore, "no reward below the gate while inventory remains");
+
+        uint256 expected = (BTC / 100) * 49_900 * BazaarTypes.LIQUIDATION_FEE_EBP / BazaarTypes.EBP_SCALE / 1e12;
+        uint256 paid = usdc.balanceOf(seq) - keeperBefore;
+        assertEq(paid, expected, "2bp of the unloaded notional paid below the gate");
+        assertLt(paid, 0.25e6, "and the flat floor was NOT applied");
+    }
+
+    /// @notice The property that makes paying below the gate safe: slicing an unload into
+    ///         sub-gate calls earns no premium. Each call is paid the plain rate on what it
+    ///         moved, so the total is the same however the work is divided — only a call that
+    ///         clears the inventory or crosses the gate may add the flat floor, and that can
+    ///         happen at most once per inventory.
+    function test_unload_reward_slicingEarnsNoPremium() public {
+        _deposit(carol, 20_000 * BAZAAR_SCALE);
+        _deposit(dave, 20_000 * BAZAAR_SCALE);
+        _placeLimit(carol, true, BTC / 100, 49_900 * BAZAAR_SCALE);
+        _placeLimit(dave, true, BTC / 100, 49_800 * BAZAAR_SCALE);
+        _setVaultPendingLiq(BTC, 49_900, 48_000, true); // far larger than the book: never cleared
+
+        uint256 firstBefore = usdc.balanceOf(seq);
+        bytes[] memory pu1 = _freshPrice();
+        vm.prank(seq);
+        pair.unloadVault(1, pu1); // one node
+        uint256 firstPaid = usdc.balanceOf(seq) - firstBefore;
+
+        uint256 secondBefore = usdc.balanceOf(seq);
+        bytes[] memory pu2 = _freshPrice();
+        vm.prank(seq);
+        pair.unloadVault(1, pu2); // the next node
+        uint256 secondPaid = usdc.balanceOf(seq) - secondBefore;
+
+        uint256 firstExpected =
+            (BTC / 100) * 49_900 * BazaarTypes.LIQUIDATION_FEE_EBP / BazaarTypes.EBP_SCALE / 1e12;
+        uint256 secondExpected =
+            (BTC / 100) * 49_800 * BazaarTypes.LIQUIDATION_FEE_EBP / BazaarTypes.EBP_SCALE / 1e12;
+        assertEq(firstPaid, firstExpected, "first slice paid its own bps");
+        assertEq(secondPaid, secondExpected, "second slice paid its own bps");
+
+        // Two slices == one call over the same notional: no flat floor was collected on either.
+        uint256 combined = ((BTC / 100) * 49_900 + (BTC / 100) * 49_800) * BazaarTypes.LIQUIDATION_FEE_EBP
+            / BazaarTypes.EBP_SCALE / 1e12;
+        assertEq(firstPaid + secondPaid, combined, "slicing earns exactly the single-call total");
     }
 
     /// @notice Above the notional gate the bps term stands on its own, so a large single unload

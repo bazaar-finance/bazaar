@@ -260,22 +260,27 @@ library MatchingEngineLib {
 
         _finalizeTx(pairVault, ctx, res);
 
-        // Reward gate: either the call moved enough notional that the bps term stands on its own,
-        // or it cleared the inventory outright. Without the first condition a keeper could split
-        // one large unload into many minimum-sized calls and collect the flat floor on each,
-        // paying itself far above the intended rate out of insurance; without the second, the
-        // last sliver of an inventory would never be worth clearing.
-        if (
-            payReward
-                && (
-                    res.totalMatchedVolume >= BazaarTypes.UNLOAD_BOUNTY_MIN_NOTIONAL
-                        || pairVault.pendingLiqSize == 0
-                )
-        ) {
+        // The caller is paid the bps rate on whatever it actually unloaded. The flat floor is
+        // reserved for a call that did a whole unit of work — one that moved at least
+        // UNLOAD_BOUNTY_MIN_NOTIONAL, or finished the inventory. Granting the floor to every call
+        // would let a keeper slice one large unload into minimum-sized pieces and collect it on
+        // each, paying itself many times the intended rate out of insurance. Below that bar the
+        // rate still pays, because a keeper that drains every in-band maker on a thin book has
+        // done all the work available and must not come away with nothing. Slicing gains nothing
+        // under this rule: the bps total is identical however the unload is divided, and the
+        // floor can be earned at most once per inventory.
+        if (payReward) {
             uint256 reward =
                 Math.mulDiv(res.totalMatchedVolume, BazaarTypes.LIQUIDATION_FEE_EBP, BazaarTypes.EBP_SCALE);
-            if (reward < BazaarTypes.UNLOAD_BOUNTY_MIN) reward = BazaarTypes.UNLOAD_BOUNTY_MIN;
-            if (pairVault.insuranceFundBalance >= reward) {
+            if (
+                res.totalMatchedVolume >= BazaarTypes.UNLOAD_BOUNTY_MIN_NOTIONAL
+                    || pairVault.pendingLiqSize == 0
+            ) {
+                if (reward < BazaarTypes.UNLOAD_BOUNTY_MIN) reward = BazaarTypes.UNLOAD_BOUNTY_MIN;
+            }
+            // A walk that filled nothing earns nothing: no fills means totalMatchedVolume is 0,
+            // and the floor is unreachable because pendingLiqSize can only reach 0 through a fill.
+            if (reward > 0 && pairVault.insuranceFundBalance >= reward) {
                 pairVault.insuranceFundBalance -= reward;
                 if (!_sendUsdcFromContract(ctx.usdc, msg.sender, reward)) {
                     pairVault.insuranceFundBalance += reward;
