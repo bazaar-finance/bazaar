@@ -301,4 +301,36 @@ contract TriggerExecutionTest is IntegrationBase {
         assertFalse(_inBook(tp), "never rests");
         assertEq(_posSize(bob), BTC / 10 - BTC / 100, "the rest of the position survives");
     }
+
+    /// @notice A thin book leaves the position PARTIALLY closed and the take-profit dead: the
+    ///         remainder cancels like any market execution, so the surviving position carries no
+    ///         profit target. The bucket slot is freed in the same write, so the owner can arm a
+    ///         replacement sized to what is left — but nothing re-arms it for them.
+    function test_takeProfit_partialFill_leavesRemainderUnprotected_butSlotReusable() public {
+        _openPosition(bob, carol, true, BTC / 10);
+        _deposit(dave, 60_000 * BAZAAR_SCALE);
+        uint256 tp = _placeTakeProfit(bob, false, BTC / 10, 52_000 * BAZAAR_SCALE, 500);
+        assertEq(_takeProfitOrderId(bob), tp, "slot armed");
+
+        // Only a tenth of the size is bid at the target.
+        _placeLimitAt(dave, true, BTC / 100, 51_900 * BAZAAR_SCALE, 52_000);
+        assertEq(_executeTriggerAt(tp, 52_000), 1, "fired");
+
+        uint256 remainder = BTC / 10 - BTC / 100;
+        assertEq(_posSize(bob), remainder, "position only partially closed");
+        assertGt(_canceledBlock(tp), 0, "take-profit is dead, not resting for the remainder");
+        assertEq(_takeProfitOrderId(bob), 0, "slot freed");
+
+        // Re-firing the dead order is a no-op even back at the target price.
+        assertEq(_executeTriggerAt(tp, 52_000), 0, "canceled order cannot fire again");
+        assertEq(_posSize(bob), remainder, "remainder untouched");
+
+        // The freed slot accepts a replacement sized to the surviving position. It has to target a
+        // price the market has not reached yet: the oracle is still sitting at the old target, so
+        // a replacement armed there would fire in its own creation transaction and — with the book
+        // now empty — cancel straight back out.
+        uint256 tp2 = _placeTakeProfit(bob, false, remainder, 53_000 * BAZAAR_SCALE, 500);
+        assertEq(_takeProfitOrderId(bob), tp2, "replacement armed");
+        assertEq(_canceledBlock(tp2), 0, "replacement is live");
+    }
 }

@@ -383,9 +383,10 @@ library MatchingEngineLib {
         }
         if (t.remaining == 0) return; // fully filled; _persistFill stamped it terminal
 
-        // Remainder disposition. Market/StopLoss executions and IOC limits never rest. A
-        // sub-minimum remainder rests only under the live full-close exemption (mirroring
-        // creation), so partial fills cannot mint resting dust.
+        // Remainder disposition. Market, StopLoss/TakeProfit executions, and IOC limits never
+        // rest — a thin book therefore leaves a fired TP/SL dead rather than resting for the part
+        // it could not close. A sub-minimum remainder rests only under the live full-close
+        // exemption (mirroring creation), so partial fills cannot mint resting dust.
         if (_isOracleDerivedPrice(t.order.orderType) || t.order.isIoc) {
             _autoCancelOrder(orders, positionBuckets, userActiveLimitOrders, book, t, ctx);
             return;
