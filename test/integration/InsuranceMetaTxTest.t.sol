@@ -42,17 +42,17 @@ contract InsuranceMetaTxTest is IntegrationBase {
 
         uint256 userUsdcBefore = usdc.balanceOf(user);
         vm.prank(relayer);
-        pair.depositToInsurance(amount, nonce, deadline, fee, sig, "");
+        pair.depositToInsurance(amount, new bytes[](0), nonce, deadline, fee, sig, "");
 
         assertEq(pair.insuranceShares(user), amount, "shares minted to the signer, not the relayer");
         assertEq(pair.insuranceShares(relayer), 0, "relayer holds nothing");
-        assertEq(usdc.balanceOf(relayer), fee / 1e12, "relayer paid the fee");
+        assertEq(_escrowOwed(relayer), fee, "fee accrued to the relayer");
         assertEq(userUsdcBefore - usdc.balanceOf(user), (amount + fee) / 1e12, "user funded amount + fee");
 
         // Same signature again: the nonce is consumed.
         vm.prank(relayer);
         vm.expectRevert();
-        pair.depositToInsurance(amount, nonce, deadline, fee, sig, "");
+        pair.depositToInsurance(amount, new bytes[](0), nonce, deadline, fee, sig, "");
     }
 
     /// @notice A relayer fee >= the deposit amount is rejected outright.
@@ -69,7 +69,7 @@ contract InsuranceMetaTxTest is IntegrationBase {
 
         vm.prank(relayer);
         vm.expectRevert(BazaarPair.BazaarPair__RelayerFeeExceedsDeposit.selector);
-        pair.depositToInsurance(amount, nonce, deadline, fee, sig, "");
+        pair.depositToInsurance(amount, new bytes[](0), nonce, deadline, fee, sig, "");
     }
 
     /// @notice requestInsuranceWithdrawal via relayer: the fee is pulled from the signer's WALLET
@@ -78,7 +78,7 @@ contract InsuranceMetaTxTest is IntegrationBase {
         // The user deposits directly first.
         vm.startPrank(user);
         usdc.approve(address(pair), 1_000 * USDC_SCALE);
-        pair.depositToInsurance(1_000 * BAZAAR_SCALE, 0, 0, 0, "", "");
+        pair.depositToInsurance(1_000 * BAZAAR_SCALE, new bytes[](0), 0, 0, 0, "", "");
         vm.stopPrank();
         uint256 shares = pair.insuranceShares(user);
 
@@ -96,7 +96,7 @@ contract InsuranceMetaTxTest is IntegrationBase {
 
         assertEq(pair.insuranceWithdrawalRequestTs(user), vm.getBlockTimestamp(), "request recorded for the signer");
         assertEq(pair.insuranceWithdrawalRequestShareAmount(user), shares, "full share amount requested");
-        assertEq(usdc.balanceOf(relayer), fee / 1e12, "relayer paid from the wallet");
+        assertEq(_escrowOwed(relayer), fee, "fee accrued to the relayer from the wallet pull");
         assertEq(userUsdcBefore - usdc.balanceOf(user), fee / 1e12, "only the fee left the wallet");
     }
 
@@ -105,7 +105,7 @@ contract InsuranceMetaTxTest is IntegrationBase {
     function test_metaTx_executeInsuranceWithdrawal_viaRelayer() public {
         vm.startPrank(user);
         usdc.approve(address(pair), 1_000 * USDC_SCALE);
-        pair.depositToInsurance(1_000 * BAZAAR_SCALE, 0, 0, 0, "", "");
+        pair.depositToInsurance(1_000 * BAZAAR_SCALE, new bytes[](0), 0, 0, 0, "", "");
         pair.requestInsuranceWithdrawal(1_000 * BAZAAR_SCALE, 0, 0, 0, "", "");
         vm.stopPrank();
 
@@ -124,7 +124,8 @@ contract InsuranceMetaTxTest is IntegrationBase {
 
         // Share price stayed 1:1 (no trading in between): payout 1,000, 50-cent fee to the relayer.
         assertEq(pair.insuranceShares(user), 0, "shares burned");
-        assertEq(usdc.balanceOf(relayer), fee / 1e12, "relayer fee from the payout");
+        assertEq(_escrowOwed(relayer), fee, "relayer fee withheld from the payout and accrued");
         assertEq(usdc.balanceOf(user) - userUsdcBefore, 1_000 * USDC_SCALE - fee / 1e12, "signer got payout minus fee");
+        assertEq(_claimFees(relayer), fee / 1e12, "relayer claims the withheld fee");
     }
 }

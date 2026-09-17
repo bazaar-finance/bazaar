@@ -3,17 +3,18 @@ pragma solidity 0.8.34;
 
 import {IntegrationBase} from "./IntegrationBase.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
-import {BazaarPair} from "../../src/BazaarPair.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 import {MetaTxLib} from "../../src/libraries/MetaTxLib.sol";
 
 /// @title RelayerFeeSolvencyTest
-/// @notice Regression tests for the meta-tx relayer fee in createOrder / cancelOrders. The solvency
-///         invariant (isVaultHealthy Check-3) is that insuranceFundBalance (I) + totalCollateralDeposited
-///         (D), in USDC, tracks the contract's real USDC balance. The relayer fee sends real USDC out
-///         of the contract, so it must decrement D as well as the bucket — otherwise I + D drifts above
-///         the actual balance on every relayed order/cancel, which can force a spurious reason-3
-///         emergency termination and charge a phantom shortfall at settlement.
+/// @notice The solvency invariant (isVaultHealthy Check-3) is that insuranceFundBalance (I) +
+///         totalCollateralDeposited (D) + the fee escrow, in USDC, tracks the contract's real
+///         USDC balance. The createOrder / cancelOrders relayer fee is pulled from the signer's
+///         wallet into the contract and accrued to the relayer's claimable balance, so it enters
+///         the contract only as an escrow liability: D never moves, and it must not touch the
+///         signer's bucket either, since a bucket debit with no D decrement would hold the ledger
+///         above the USDC actually on hand. Both cases pin the ledger identity through the accrual
+///         and the relayer's later claim.
 contract RelayerFeeSolvencyTest is IntegrationBase {
     address internal relayer = makeAddr("relayer");
 
@@ -29,15 +30,24 @@ contract RelayerFeeSolvencyTest is IntegrationBase {
         return usdc.balanceOf(address(pair));
     }
 
-    /// @notice A relayed createOrder must debit the fee from BOTH the bucket and D, keeping I + D
-    ///         equal to the contract's real USDC balance.
+    /// @dev The fee is pulled from the signer's wallet; _deposit approves exactly the deposit, so
+    ///      the fee needs its own allowance.
+    function _allowFees(address user) internal {
+        vm.prank(user);
+        usdc.approve(address(pair), type(uint256).max);
+    }
+
+    /// @notice A relayed createOrder pulls the fee wallet -> escrow: bucket and D stay exactly
+    ///         where they were, and the contract's USDC grows by precisely the new escrow
+    ///         liability.
     function test_relayedCreateOrder_preservesSolvencyLedger() public {
         (address u, uint256 pk) = makeAddrAndKey("relayerFeeUserCreate");
         usdc.mint(u, 100_000 * USDC_SCALE);
         _deposit(u, 1_000 * BAZAAR_SCALE);
+        _allowFees(u);
 
         // Invariant holds before the relayed order.
-        assertEq(_ledgerBaz() / 1e12, _pairUsdc(), "baseline: I + D == contract USDC");
+        assertEq(_ledgerBaz() / 1e12, _pairUsdc(), "baseline: I + D + escrow == contract USDC");
 
         uint256 fee = BAZAAR_SCALE / 2; // $0.50, under the $1 relayer-fee cap
         BazaarTypes.OrderSpec memory spec;
@@ -60,7 +70,7 @@ contract RelayerFeeSolvencyTest is IntegrationBase {
                 spec.size,
                 spec.isLong,
                 spec.isPostOnly,
-                spec.isIoc,
+                spec.tif,
                 spec.expirationBlock,
                 spec.integrator,
                 nonce,
@@ -71,36 +81,38 @@ contract RelayerFeeSolvencyTest is IntegrationBase {
         bytes memory sig = _sign(pk, structHash);
 
         uint256 dBefore = _totalDeposited();
-        uint256 ledgerBefore = _ledgerBaz();
         uint256 usdcBefore = _pairUsdc();
+        uint256 userBefore = usdc.balanceOf(u);
 
-        // The book is empty, so this limit rests without filling; the fee debit is the only
-        // vault movement the call makes.
+        // The book is empty, so this limit rests without filling; the fee is the only USDC the
+        // call moves.
         bytes[] memory pu = _freshPrice(); // build BEFORE the prank (mockPyth call would consume it)
         vm.prank(relayer);
-        pair.createOrder(spec, _hintsNone(), pu, nonce, deadline, fee, sig);
+        pair.createOrder(spec, _hintsNone(), pu, nonce, deadline, fee, sig, "");
 
-        // The fee left the contract as real USDC.
-        assertEq(usdcBefore - _pairUsdc(), fee / 1e12, "fee left the contract as USDC");
-        assertEq(usdc.balanceOf(relayer), fee / 1e12, "relayer received the fee");
-        // D dropped by exactly the fee: leaving D unchanged would hold the ledger above the USDC
-        // actually left in the contract.
-        assertEq(dBefore - _totalDeposited(), fee, "D decremented by the fee");
-        // The ledger delta matches the USDC delta, so the invariant is preserved.
-        assertEq((ledgerBefore - _ledgerBaz()) / 1e12, usdcBefore - _pairUsdc(), "ledger delta == USDC delta");
-        assertEq(_ledgerBaz() / 1e12, _pairUsdc(), "after: I + D == contract USDC");
+        assertEq(_escrowOwed(relayer), fee, "fee accrued to the relayer");
+        assertEq(userBefore - usdc.balanceOf(u), fee / 1e12, "fee came from the signer's wallet");
+        assertEq(_pairUsdc() - usdcBefore, fee / 1e12, "contract USDC grew by the escrowed fee");
+        assertEq(_totalDeposited(), dBefore, "D untouched");
+        assertEq(_posCollateral(u), 1_000 * BAZAAR_SCALE, "bucket untouched");
+        assertEq(_ledgerBaz() / 1e12, _pairUsdc(), "after: I + D + escrow == contract USDC");
+
+        assertEq(_claimFees(relayer), fee / 1e12, "relayer claims the fee");
+        assertEq(_pairUsdc(), usdcBefore, "claim returns the contract to its pre-fee balance");
+        assertEq(_ledgerBaz() / 1e12, _pairUsdc(), "after claim: I + D + escrow == contract USDC");
     }
 
-    /// @notice A relayed cancelOrders must debit the fee from BOTH the bucket and D.
+    /// @notice A relayed cancelOrders accrues the fee the same way, with the same stills.
     function test_relayedCancelOrders_preservesSolvencyLedger() public {
         (address u, uint256 pk) = makeAddrAndKey("relayerFeeUserCancel");
         usdc.mint(u, 100_000 * USDC_SCALE);
         _deposit(u, 1_000 * BAZAAR_SCALE);
+        _allowFees(u);
 
         // A resting order to cancel (placed directly by the user — no relayer fee on placement).
         uint256 orderId = _placeLimit(u, true, BAZAAR_SCALE / 100, 49_000 * BAZAAR_SCALE);
 
-        assertEq(_ledgerBaz() / 1e12, _pairUsdc(), "baseline: I + D == contract USDC");
+        assertEq(_ledgerBaz() / 1e12, _pairUsdc(), "baseline: I + D + escrow == contract USDC");
 
         uint256[] memory ids = _one(orderId);
         uint256 fee = BAZAAR_SCALE / 2;
@@ -113,16 +125,21 @@ contract RelayerFeeSolvencyTest is IntegrationBase {
         bytes memory sig = _sign(pk, structHash);
 
         uint256 dBefore = _totalDeposited();
-        uint256 ledgerBefore = _ledgerBaz();
         uint256 usdcBefore = _pairUsdc();
+        uint256 userBefore = usdc.balanceOf(u);
 
         vm.prank(relayer);
-        pair.cancelOrders(ids, nonce, deadline, fee, sig);
+        pair.cancelOrders(ids, nonce, deadline, fee, sig, "");
 
-        assertEq(usdcBefore - _pairUsdc(), fee / 1e12, "fee left the contract as USDC");
-        assertEq(usdc.balanceOf(relayer), fee / 1e12, "relayer received the fee");
-        assertEq(dBefore - _totalDeposited(), fee, "D decremented by the fee");
-        assertEq((ledgerBefore - _ledgerBaz()) / 1e12, usdcBefore - _pairUsdc(), "ledger delta == USDC delta");
-        assertEq(_ledgerBaz() / 1e12, _pairUsdc(), "after: I + D == contract USDC");
+        assertGt(_canceledBlock(orderId), 0, "order canceled");
+        assertEq(_escrowOwed(relayer), fee, "fee accrued to the relayer");
+        assertEq(userBefore - usdc.balanceOf(u), fee / 1e12, "fee came from the signer's wallet");
+        assertEq(_pairUsdc() - usdcBefore, fee / 1e12, "contract USDC grew by the escrowed fee");
+        assertEq(_totalDeposited(), dBefore, "D untouched");
+        assertEq(_posCollateral(u), 1_000 * BAZAAR_SCALE, "bucket untouched");
+        assertEq(_ledgerBaz() / 1e12, _pairUsdc(), "after: I + D + escrow == contract USDC");
+
+        assertEq(_claimFees(relayer), fee / 1e12, "relayer claims the fee");
+        assertEq(_ledgerBaz() / 1e12, _pairUsdc(), "after claim: I + D + escrow == contract USDC");
     }
 }

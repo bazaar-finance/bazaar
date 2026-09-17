@@ -2,8 +2,10 @@
 pragma solidity 0.8.34;
 
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {BazaarTypes} from "./BazaarTypes.sol";
 import {BucketLib} from "./BucketLib.sol";
+import {FeeEscrowLib} from "./FeeEscrowLib.sol";
 
 /// @title CollateralLib
 /// @notice External library for deposit and withdrawal collateral logic.
@@ -15,13 +17,19 @@ library CollateralLib {
     ///         speak the same "$5 minimum" rule.
     uint256 internal constant MIN_COLLATERAL_AMOUNT = 5 * BazaarTypes.BAZAAR_SCALE;
 
+    /// @notice Tip credited to a caller who settles someone else's position at the fixed terminal
+    ///         price; _paySettlementTip describes who funds it.
+    uint256 internal constant TERMINAL_SETTLEMENT_TIP = BazaarTypes.TERMINAL_SETTLEMENT_TIP;
+
     // -------------------- Errors --------------------
 
-    error CollateralLib__DepositsAreBlocked(bool isPairTerminatedEmergency, bool isPairTerminatedNormal);
+    error CollateralLib__DepositsAreBlocked();
     error CollateralLib__PairScheduledForTermination();
     error CollateralLib__InvalidDepositAmount(uint256 amount, uint256 minAmount);
     error CollateralLib__ZeroWithdrawalAmount();
-    error CollateralLib__WithdrawalBlockedDueToEmergencyTermination();
+    error CollateralLib__NothingToClaim();
+    error CollateralLib__ClaimTransferFailed();
+    error CollateralLib__WithdrawalBlockedVaultUnhealthy();
     error CollateralLib__WithdrawalsFrozenAdlPending();
     error CollateralLib__InsolventPositionBucket(uint256 availableEquity, uint256 minRequiredCollateral);
     error CollateralLib__InsufficientCollateral(uint256 amount, uint256 available);
@@ -29,6 +37,7 @@ library CollateralLib {
     error CollateralLib__NoPriceUpdateDataProvided();
     error CollateralLib__MustRetainMinimumCollateral(uint256 remaining, uint256 minimum);
     error CollateralLib__WithdrawalRequiresFreshPrice();
+    error CollateralLib__LedgerShortfall(uint256 amount, uint256 available);
 
     // ================================================================
     //                         Deposit Logic
@@ -44,9 +53,7 @@ library CollateralLib {
         address caller
     ) external {
         // Block deposits if pair is terminated
-        if (params.isPairTerminatedEmergency || params.isPairTerminatedNormal) {
-            revert CollateralLib__DepositsAreBlocked(params.isPairTerminatedEmergency, params.isPairTerminatedNormal);
-        }
+        if (params.isPairTerminated) revert CollateralLib__DepositsAreBlocked();
 
         // Block deposits if pair is at or past scheduled termination
         if (params.scheduledTerminationTs != 0 && block.timestamp >= params.scheduledTerminationTs) {
@@ -60,85 +67,138 @@ library CollateralLib {
 
         BazaarTypes.PositionBucket storage positionBucket = positionBuckets[caller];
 
-        positionBucket.collateral += params.amount;
+        positionBucket.collateral = SafeCast.toUint128(uint256(positionBucket.collateral) + params.amount);
 
         BucketLib.emitBucketUpdate(caller, positionBucket, params.currentFundingIndex, params.marginReqs, params.pairId);
 
         emit BazaarTypes.CollateralDeposited(params.pairId, caller, params.amount);
     }
 
+    /// @notice Vault-health Check 2: does the contract still hold the USDC its books promise?
+    /// @dev Expected balance is every claim on the contract's cash — the deposits ledger (D),
+    ///      the insurance fund (I), and fees earned but not yet claimed. Lives here rather than
+    ///      in BazaarPair so the pair's EIP-170 budget stays free of it, and here rather than in
+    ///      VaultHealthLib because that library is internal (inlined into its callers), so a
+    ///      function placed there would land back in the pair's bytecode.
+    /// @param usdc The pair's USDC token.
+    /// @param pairVault The pair's vault aggregates.
+    /// @param claimableFeesTotal Unclaimed fee-escrow liability, in BAZAAR precision.
+    /// @param toleranceBp Shortfall tolerated before the pair is judged short — absorbs the
+    ///        1e18 -> 1e6 truncation dust that accrues in the contract's favour on payouts.
+    /// @return short True when the books promise materially more than the contract holds.
+    function isBalanceShort(
+        address usdc,
+        BazaarTypes.Vault storage pairVault,
+        uint256 claimableFeesTotal,
+        uint256 toleranceBp
+    ) external view returns (bool short) {
+        // Division floors, understating the expected balance by sub-cent dust — the same
+        // direction the tolerance errs in, i.e. toward NOT flagging a shortfall.
+        uint256 expected =
+            (pairVault.insuranceFundBalance + pairVault.totalCollateralDeposited + claimableFeesTotal) / 1e12;
+        (bool ok, bytes memory data) = usdc.staticcall(abi.encodeWithSelector(0x70a08231, address(this)));
+        if (!ok || data.length < 32) return false; // an unreadable balance is not evidence of a shortfall
+        return expected > abi.decode(data, (uint256)) + (expected * toleranceBp / BazaarTypes.BP_SCALE);
+    }
+
+    /// @notice Pay out the caller's escrowed balance — every third-party payout the pair accrues
+    ///         through FeeEscrowLib.credit (fee shares, keeper rewards, relayer fees).
+    /// @dev Lives here rather than in BazaarPair so the pair's EIP-170 budget stays free of the
+    ///      transfer and precision-conversion code. Reverts on a failed transfer rather than
+    ///      soft-failing: the cash is already the claimant's own, so there is no fallback
+    ///      recipient to credit, and leaving the balance intact lets them simply try again.
+    /// @return amount The amount paid, in BAZAAR precision.
+    function claimFees(BazaarTypes.FeeEscrow storage feeEscrow, address usdc, bytes32 pairId)
+        external
+        returns (uint256 amount)
+    {
+        amount = feeEscrow.claimable[msg.sender];
+        if (amount == 0) revert CollateralLib__NothingToClaim();
+        feeEscrow.claimable[msg.sender] = 0;
+        unchecked {
+            // total is the sum of all claimable balances.
+            feeEscrow.total -= amount;
+        }
+        if (!_trySendUsdc(usdc, msg.sender, amount)) revert CollateralLib__ClaimTransferFailed();
+        emit BazaarTypes.FeesClaimed(pairId, msg.sender, amount);
+    }
+
     // ================================================================
     //                 Terminal Settlement (two-stage termination)
     // ================================================================
 
-    /// @notice Settle positions at the fixed terminal price. Permissionless and harmless to the
-    ///         settled user: entitlements are identical before and after (pure accounting at a
-    ///         frozen price). During the 48h window (postFinalize=false) winner PnL registers
-    ///         into ts.totalProfitClaims and uncovered losses into ts.terminalBadDebt; after
-    ///         finalize (postFinalize=true) late winners get an immediate clipped credit from
-    ///         the unreserved surplus and late bad debt charges whatever insurance remains.
-    ///         Loser losses always release from the principal ledger (D) into the surplus.
-    ///         A max(MIN_LIQUIDATOR_REWARD, LIQUIDATION_FEE_EBP of notional) bounty pays the caller,
-    ///         charged to the settled position itself: cash from its collateral first, then — for a
-    ///         window-settled winner — a transfer out of its registered profit claim, collected
-    ///         pro-rata after finalize; only positions with neither left fall back to the
-    ///         insurance fund.
+    /// @notice Settle positions at the fixed terminal price. Permissionless: marking a position
+    ///         to a price that will never change cannot alter what its owner is owed, so no
+    ///         solvency threshold, price update or ETH is needed. Before finalize a loser's loss
+    ///         leaves its collateral (the remainder is tallied as bad debt) and a winner's profit
+    ///         is registered as a claim; after finalize a position realizes against the frozen
+    ///         ledgers. Accounts holding no position are skipped. Each position settled for
+    ///         someone else credits the caller's escrow with TERMINAL_SETTLEMENT_TIP, funded as
+    ///         _paySettlementTip describes; settling one's own position pays nothing.
+    /// @param positionBuckets Storage mapping of position buckets
+    /// @param pairVault The vault storage reference
+    /// @param terminalProfitClaim Storage mapping of registered profit claims
+    /// @param ts Terminal-settlement state (tallies before finalize, frozen ratios after)
+    /// @param feeEscrow Fee escrow the settler's tip accrues to
+    /// @param settlementPrice The fixed terminal price
+    /// @param currentFundingIndex The pair's current funding index
+    /// @param postFinalize Whether finalize has already run
+    /// @param pairId The pair identifier for events
+    /// @param users Accounts to settle
+    /// @return settledCount Number of positions settled
     function settleTerminalPositions(
         mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
         BazaarTypes.Vault storage pairVault,
         mapping(address => uint256) storage terminalProfitClaim,
         BazaarTypes.TerminalSettlement storage ts,
+        BazaarTypes.FeeEscrow storage feeEscrow,
         uint256 settlementPrice,
         int256 currentFundingIndex,
         bool postFinalize,
         bytes32 pairId,
-        address usdc,
         address[] calldata users
     ) external returns (uint256 settledCount) {
         BazaarTypes.TerminalSettleParams memory p = BazaarTypes.TerminalSettleParams({
             settlementPrice: settlementPrice,
             currentFundingIndex: currentFundingIndex,
             postFinalize: postFinalize,
-            payBounty: true,
-            pairId: pairId,
-            usdc: usdc
+            pairId: pairId
         });
-        uint256 directBounty = 0; // charged to the settled positions' own collateral
-        uint256 insuranceBounty = 0; // only positions with nothing of their own left
         for (uint256 i = 0; i < users.length; i++) {
-            (bool settled, uint256 direct, uint256 fromInsurance) =
-                _settleOne(positionBuckets, pairVault, terminalProfitClaim, ts, p, users[i]);
-            if (settled) {
-                unchecked {
-                    ++settledCount;
-                }
-                directBounty += direct;
-                insuranceBounty += fromInsurance;
+            address user = users[i];
+            (bool settled, bool bankrupt) = _settleOne(positionBuckets, pairVault, terminalProfitClaim, ts, p, user);
+            if (!settled) continue;
+            unchecked {
+                ++settledCount;
             }
-        }
-        // Direct bounties were debited from each settled position's own collateral AND from the
-        // principal ledger in the same step, so this cash is backed by that D decrement — paying
-        // it can never reach another user's reserved principal. Unconditional (a soft-fail just
-        // strands it as surplus). The insurance portion is debit-if-covered with a soft-restore.
-        if (directBounty > 0) {
-            _trySendUsdc(p.usdc, msg.sender, directBounty);
-        }
-        if (insuranceBounty > 0 && pairVault.insuranceFundBalance >= insuranceBounty) {
-            pairVault.insuranceFundBalance -= insuranceBounty;
-            if (!_trySendUsdc(p.usdc, msg.sender, insuranceBounty)) {
-                pairVault.insuranceFundBalance += insuranceBounty;
-            }
+            if (user != msg.sender) _paySettlementTip(positionBuckets, pairVault, feeEscrow, p, user, bankrupt);
         }
     }
 
-    /// @dev Settle a single position at the terminal price. Returns (settled, directBounty,
-    ///      insuranceBounty). Losers: loss (price + funding) reduces bucket AND the principal
-    ///      ledger D — the release that feeds the profit surplus; uncovered loss registers as
-    ///      bad debt. Winners: PnL becomes a profit claim (registered during the window; clipped
-    ///      junior credit after finalize). The settlement bounty is charged to the settled
-    ///      position: cash from its remaining collateral first, then any remainder transfers from
-    ///      its registered profit claim to the settler (claim units, not cash); only positions
-    ///      with neither left charge insurance. Vault OI aggregates are updated here directly.
+    /// @dev Settle a single position at the terminal price; false when `user` holds none.
+    ///
+    ///      Before finalize nothing here touches the deposits ledger: finalize derives the total
+    ///      owed to traders from the ledger identity (see TerminationLib), which holds only while
+    ///      settlement leaves the ledger alone. A loss comes out of the bucket up to its
+    ///      collateral and the rest is tallied as bad debt; a profit becomes a registered claim,
+    ///      paid at the frozen profit ratio.
+    ///
+    ///      After finalize the position is one finalize did not wait for (escape hatch). Its
+    ///      equity was already inside the total owed at collateral + PnL, so a solvent position
+    ///      realizes to exactly that figure with no ledger change — profit included, since
+    ///      finalize reserved it inside principal. A bankrupt one was counted below zero: the
+    ///      insurers' residual, junior to every trader entitlement, funds its shortfall as far as
+    ///      it goes, and that funded amount moves into the principal ledger so the remaining
+    ///      withdrawals stay covered. Whatever the residual cannot fund stays out of the ledger
+    ///      and leaves the last withdrawals short by that amount — the case the completeness
+    ///      gate on finalize exists to prevent.
+    ///
+    ///      Never reverts for a position that exists: settlement must be able to clear every
+    ///      position, or one of them could hold finalize hostage.
+    /// @return settled False when `user` holds no position
+    /// @return bankrupt True when the position could not cover its own loss — before finalize a
+    ///         loss beyond its collateral, after finalize negative equity. Decides who funds the
+    ///         settler's tip.
     function _settleOne(
         mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
         BazaarTypes.Vault storage pairVault,
@@ -146,16 +206,17 @@ library CollateralLib {
         BazaarTypes.TerminalSettlement storage ts,
         BazaarTypes.TerminalSettleParams memory p,
         address user
-    ) internal returns (bool settled, uint256 directBounty, uint256 insuranceBounty) {
+    ) internal returns (bool settled, bool bankrupt) {
         BazaarTypes.PositionBucket storage bucket = positionBuckets[user];
         uint256 size = bucket.size;
-        if (size == 0) return (false, 0, 0);
+        if (size == 0) return (false, false);
 
         BazaarTypes.MarginRequirements memory zeroReqs; // settlement ignores margins
         BazaarTypes.BucketState memory state =
             BucketLib.calculateState(bucket, p.settlementPrice, p.currentFundingIndex, zeroReqs);
 
-        // Remove from OI aggregates (floored, mirroring LiquidationLib).
+        // Remove from the OI aggregates (floored, mirroring LiquidationLib). Both reaching zero
+        // is what tells finalize the sweep is complete.
         if (bucket.isLong) {
             pairVault.totalLongOI = pairVault.totalLongOI > size ? pairVault.totalLongOI - size : 0;
             pairVault.longWeightedEntrySum = pairVault.longWeightedEntrySum > bucket.entryValue
@@ -169,97 +230,37 @@ library CollateralLib {
         }
 
         int256 pnl = state.totalPnl;
-        if (pnl < 0) {
-            uint256 loss = uint256(-pnl);
-            uint256 covered = loss < bucket.collateral ? loss : bucket.collateral;
-            bucket.collateral -= covered;
-            // Release the realized loss from the principal ledger — this is what frees the
-            // surplus that backs winner profits. Floored defensively.
-            pairVault.totalCollateralDeposited =
-                pairVault.totalCollateralDeposited > covered ? pairVault.totalCollateralDeposited - covered : 0;
-            uint256 uncovered = loss - covered;
-            if (uncovered > 0) {
-                if (!p.postFinalize) {
-                    ts.terminalBadDebt += uncovered;
-                } else {
-                    // Late-discovered bad debt: charge whatever insurance remains.
-                    uint256 take =
-                        uncovered < pairVault.insuranceFundBalance ? uncovered : pairVault.insuranceFundBalance;
-                    pairVault.insuranceFundBalance -= take;
+        uint256 collateral = bucket.collateral;
+        if (!p.postFinalize) {
+            if (pnl < 0) {
+                uint256 loss = uint256(-pnl);
+                uint256 covered = loss < collateral ? loss : collateral;
+                // covered <= collateral by construction.
+                bucket.collateral = uint128(collateral - covered);
+                if (loss > covered) {
+                    ts.terminalBadDebt += loss - covered;
+                    bankrupt = true;
                 }
+            } else if (pnl > 0) {
+                terminalProfitClaim[user] += uint256(pnl);
+                ts.totalProfitClaims += uint256(pnl);
             }
-        } else if (pnl > 0) {
-            uint256 claimable = uint256(pnl);
-            if (claimable > 0) {
-                if (!p.postFinalize) {
-                    terminalProfitClaim[user] += claimable;
-                    ts.totalProfitClaims += claimable;
-                } else {
-                    // Junior path: immediate credit clipped to the unreserved surplus; the credit
-                    // moves into the principal ledger so it becomes reserved (and withdrawable).
-                    uint256 avail = _unreservedSurplus(pairVault, ts, p.usdc);
-                    uint256 pay = claimable < avail ? claimable : avail;
-                    if (pay > 0) {
-                        bucket.collateral += pay;
-                        pairVault.totalCollateralDeposited += pay;
-                    }
-                }
-            }
-        }
-
-        // Settlement bounty — charged to the settled position itself, from whatever collateral it
-        // has left AFTER its own PnL is booked. Winners and losers are treated identically, and
-        // this is the same idiom every other fee in the protocol uses (cf. _chargeRelayerFee):
-        // debit the bucket AND the principal ledger together, so the D decrement exactly backs the
-        // USDC that leaves. That makes it impossible for a bounty to dip into another user's
-        // reserved principal or the insurers' remainder — no surplus check required. Only a
-        // position with nothing left (a loser wiped out by its own loss) falls back to insurance,
-        // so wiped positions still have someone paid to settle them.
-        if (p.payBounty) {
-            uint256 want = _bountyFor(size, p.settlementPrice);
-
-            // 1) Collateral first — debiting the bucket AND the principal ledger together means
-            //    the D decrement backs the USDC leaving, so this can never reach another user's
-            //    reserved principal.
-            uint256 fromCollateral = want < bucket.collateral ? want : bucket.collateral;
-            if (fromCollateral > 0) {
-                bucket.collateral -= fromCollateral;
-                pairVault.totalCollateralDeposited = pairVault.totalCollateralDeposited > fromCollateral
-                    ? pairVault.totalCollateralDeposited - fromCollateral
-                    : 0;
-                directBounty = fromCollateral;
-            }
-            uint256 rest = want - fromCollateral;
-
-            // 2) A winner whose collateral doesn't cover the bounty pays the remainder out of the
-            //    profit claim registered above — transferred to the settler as claim units, never
-            //    cash. The retained-collateral floor is enforced only at withdrawal time, so a
-            //    position can still arrive here nearly bare: relayer fees are charged straight
-            //    from collateral with no floor check, and the bounty scales with settlement-time
-            //    notional while the floor was sized at the last withdrawal. Paying this leg in
-            //    cash would spend a full unit of surplus to retire a claim unit worth less than
-            //    that whenever the book is underwater, diluting every other winner's frozen
-            //    ratio. A claim transfer moves no cash and leaves ts.totalProfitClaims unchanged,
-            //    so the ratio is untouched: the settler simply joins the winners at the same
-            //    pro-rata terms, collected via withdrawal after finalize. No budget or cap is
-            //    needed — nothing leaves the pot here. A self-settling winner transfers to
-            //    themselves, a harmless no-op.
-            if (rest > 0) {
-                uint256 claim = terminalProfitClaim[user];
-                uint256 fromClaim = rest < claim ? rest : claim;
-                if (fromClaim > 0) {
-                    terminalProfitClaim[user] = claim - fromClaim;
-                    terminalProfitClaim[msg.sender] += fromClaim;
-                    rest -= fromClaim;
-                }
-            }
-
-            // 3) Neither collateral nor claim left — a loser wiped out by its own loss, or a
-            //    solvent position whose entire equity was smaller than the bounty and consumed by
-            //    leg 1. Insurance covers the remainder so these positions still have someone paid
-            //    to settle them.
-            if (rest > 0 && bucket.collateral == 0 && terminalProfitClaim[user] == 0) {
-                insuranceBounty = rest;
+        } else {
+            int256 equity = int256(collateral) + pnl;
+            if (equity >= 0) {
+                bucket.collateral = _toCollateral(uint256(equity));
+            } else {
+                uint256 shortfall = uint256(-equity);
+                bucket.collateral = 0;
+                ts.terminalBadDebt += shortfall;
+                bankrupt = true;
+                // Insurance funds the shortfall as far as it goes, and only that much moves into
+                // the principal ledger — the same rule the live protocol applies to a vault loss
+                // insurance cannot cover. An unfunded remainder is recorded in the tally, never
+                // credited to the ledger: the books must not claim cash the pot does not hold.
+                uint256 take = shortfall < pairVault.insuranceFundBalance ? shortfall : pairVault.insuranceFundBalance;
+                pairVault.insuranceFundBalance -= take;
+                pairVault.totalCollateralDeposited += take;
             }
         }
 
@@ -270,7 +271,67 @@ library CollateralLib {
         bucket.entryMmrBp = 0;
         bucket.mmrUpdateTs = 0;
         BucketLib.emitBucketUpdate(user, bucket, p.currentFundingIndex, zeroReqs, p.pairId);
-        return (true, directBounty, insuranceBounty);
+        settled = true;
+    }
+
+    /// @dev Credit the settler's escrow with TERMINAL_SETTLEMENT_TIP, or as much of it as its
+    ///      sources can fund. Settlement must never revert, so every leg is capped at its source.
+    ///
+    ///      Before finalize the settled position pays first, from whatever collateral its own
+    ///      settlement left it, charged like a trading fee: the bucket and the deposits ledger
+    ///      drop together, so the total finalize derives from the ledger falls by exactly what
+    ///      left the pot and the insurers' residual is untouched. Insurance covers the rest,
+    ///      all-or-nothing on coverage like every other insurance-funded reward. Its balance at
+    ///      this point is the nominal one that finalize rewrites from the pot, so it is the
+    ///      escrow credit, shrinking the pot, that actually charges the residual — the right
+    ///      payer for a cost no trader can be charged, since it is junior to every trader. This
+    ///      split is what keeps the tip unfarmable: a position with collateral pays its own tip,
+    ///      and driving one to bankruptcy costs more than the tip pays.
+    ///
+    ///      After finalize a solvent straggler harms nobody (finalize reserved its equity in
+    ///      full), so only a bankrupt one pays, from whatever residual the funding of its own
+    ///      shortfall left: that settlement is the one the insurers' sweep gate waits for and the
+    ///      one nobody is otherwise motivated to run.
+    function _paySettlementTip(
+        mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
+        BazaarTypes.Vault storage pairVault,
+        BazaarTypes.FeeEscrow storage feeEscrow,
+        BazaarTypes.TerminalSettleParams memory p,
+        address user,
+        bool bankrupt
+    ) internal {
+        uint256 tip;
+        if (!p.postFinalize) {
+            BazaarTypes.PositionBucket storage bucket = positionBuckets[user];
+            uint256 fromCollateral = bucket.collateral;
+            if (fromCollateral > TERMINAL_SETTLEMENT_TIP) fromCollateral = TERMINAL_SETTLEMENT_TIP;
+            if (fromCollateral > pairVault.totalCollateralDeposited) {
+                fromCollateral = pairVault.totalCollateralDeposited;
+            }
+            if (fromCollateral > 0) {
+                // fromCollateral <= bucket.collateral, so the narrowing cast is exact.
+                bucket.collateral -= uint128(fromCollateral);
+                pairVault.totalCollateralDeposited -= fromCollateral;
+                BazaarTypes.MarginRequirements memory zeroReqs;
+                BucketLib.emitBucketUpdate(user, bucket, p.currentFundingIndex, zeroReqs, p.pairId);
+                tip = fromCollateral;
+            }
+        } else if (!bankrupt) {
+            return;
+        }
+        uint256 remainder = TERMINAL_SETTLEMENT_TIP - tip;
+        if (remainder <= pairVault.insuranceFundBalance) {
+            pairVault.insuranceFundBalance -= remainder;
+            tip += remainder;
+        }
+        if (tip > 0) FeeEscrowLib.credit(feeEscrow, p.pairId, msg.sender, tip);
+    }
+
+    /// @dev Clamp into the bucket's collateral width rather than revert: settlement must never
+    ///      fail for a position that exists. Unreachable in practice (it takes equity above
+    ///      3.4e20 USD), but a revert here would let one position hold finalize hostage.
+    function _toCollateral(uint256 amount) internal pure returns (uint128) {
+        return amount > type(uint128).max ? type(uint128).max : uint128(amount);
     }
 
     /// @notice Worst-case directional notional for IMR purposes: the position plus same-direction
@@ -290,28 +351,7 @@ library CollateralLib {
         return worstSameDir > worstFlip ? worstSameDir : worstFlip;
     }
 
-    /// @dev Surplus not reserved for principal (D), insurers (I), or registered claims.
-    function _unreservedSurplus(
-        BazaarTypes.Vault storage pairVault,
-        BazaarTypes.TerminalSettlement storage ts,
-        address usdc
-    ) internal view returns (uint256) {
-        (bool ok, bytes memory data) = usdc.staticcall(abi.encodeWithSelector(0x70a08231, address(this)));
-        if (!ok || data.length < 32) return 0;
-        uint256 cashBazaar = abi.decode(data, (uint256)) * 1e12; // USDC 6dp -> BAZAAR 18dp
-        uint256 reserved = pairVault.totalCollateralDeposited + pairVault.insuranceFundBalance + ts.profitReserve;
-        return cashBazaar > reserved ? cashBazaar - reserved : 0;
-    }
-
-    /// @dev Settlement bounty per position: max(MIN_LIQUIDATOR_REWARD, LIQUIDATION_FEE_EBP of
-    ///      notional) — the same reward formula as live liquidation in LiquidationLib.
-    function _bountyFor(uint256 size, uint256 price) internal pure returns (uint256) {
-        uint256 notional = Math.mulDiv(size, price, BazaarTypes.BAZAAR_SCALE);
-        uint256 bps = Math.mulDiv(notional, BazaarTypes.LIQUIDATION_FEE_EBP, BazaarTypes.EBP_SCALE);
-        return bps > BazaarTypes.MIN_LIQUIDATOR_REWARD ? bps : BazaarTypes.MIN_LIQUIDATOR_REWARD;
-    }
-
-    /// @dev Soft-fail USDC transfer (BAZAAR precision in, 6dp out). Mirrors LiquidationLib.
+    /// @dev Soft-fail USDC transfer (BAZAAR precision in, 6dp out).
     function _trySendUsdc(address usdc, address to, uint256 amountBazaar) internal returns (bool) {
         if (usdc == address(0) || to == address(0)) return false;
         uint256 usdcAmount = amountBazaar / 1e12;
@@ -326,17 +366,19 @@ library CollateralLib {
     //                        Withdraw Logic
     // ================================================================
 
-    /// @notice Processes withdraw collateral logic: validates, handles all termination states, updates bucket.
-    /// @dev Called via DELEGATECALL from BazaarPair. Does NOT handle USDC transfer or ETH refund.
+    /// @notice Processes a collateral withdrawal: validates, handles the terminal branch, updates the bucket.
+    /// @dev Called via DELEGATECALL from BazaarPair. Does NOT handle the USDC transfer or ETH refund.
+    /// @return withdrawAmount The cash to send, in BAZAAR precision. Equals `params.amount` on a
+    ///         live pair; on a terminated pair it is the amount scaled by the frozen principal
+    ///         ratio, which is below 100% only when cash could not cover principal.
     function withdrawCollateral(
         mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
-        mapping(address => bool) storage terminalHaircutApplied,
         BazaarTypes.Vault storage pairVault,
         mapping(address => uint256) storage terminalProfitClaim,
         BazaarTypes.TerminalSettlement storage ts,
         BazaarTypes.CollateralWithdrawParams memory params,
         address caller
-    ) external returns (BazaarTypes.CollateralWithdrawResult memory result) {
+    ) external returns (uint256 withdrawAmount) {
         if (params.amount == 0) revert CollateralLib__ZeroWithdrawalAmount();
 
         if (params.pendingTermination) {
@@ -344,51 +386,12 @@ library CollateralLib {
         }
 
         // ------------------------------------------------------------------
-        // Emergency Termination: users withdraw original collateral (no PnL)
+        // Terminated: pay principal and the registered claim at the frozen ratios
         // ------------------------------------------------------------------
-        if (params.isPairTerminatedEmergency) {
-            BazaarTypes.PositionBucket storage suspendedBucket = positionBuckets[caller];
-
-            // Apply haircut once per user if ratio < 100%
-            if (
-                params.emergencyHaircutBp < BazaarTypes.BP_SCALE && !terminalHaircutApplied[caller]
-                    && suspendedBucket.collateral > 0
-            ) {
-                terminalHaircutApplied[caller] = true;
-                uint256 adjustedCollateral =
-                    Math.mulDiv(suspendedBucket.collateral, params.emergencyHaircutBp, BazaarTypes.BP_SCALE);
-                pairVault.totalCollateralDeposited -= (suspendedBucket.collateral - adjustedCollateral);
-                suspendedBucket.collateral = adjustedCollateral;
-            }
-
-            if (params.amount > suspendedBucket.collateral) {
-                revert CollateralLib__InsufficientCollateral(params.amount, suspendedBucket.collateral);
-            }
-
-            suspendedBucket.collateral -= params.amount;
-            BucketLib.emitBucketUpdate(
-                caller, suspendedBucket, params.currentFundingIndex, params.marginReqs, params.pairId
-            );
-
-            pairVault.totalCollateralDeposited -= params.amount;
-
-            result.withdrawAmount = params.amount;
-            result.totalCollateralDecrease = params.amount;
-            emit BazaarTypes.CollateralWithdrawn(params.pairId, caller, result.withdrawAmount, result.positionClosed);
-            return result;
-        }
-
-        // ------------------------------------------------------------------
-        // Normal Termination: settle position at terminal price, then withdraw
-        // ------------------------------------------------------------------
-        if (params.isPairTerminatedNormal && params.normalTerminationPrice > 0) {
+        if (params.isPairTerminated) {
             BazaarTypes.PositionBucket storage termBucket = positionBuckets[caller];
 
-            // Still-open position: settle it inline via the shared terminal-settlement path
-            // (post-finalize semantics: loss releases from D / late bad debt charges insurance /
-            // late winner PnL becomes a clipped junior credit). No bounty for self-settlement.
-            // Vault OI aggregates are updated inside _settleOne, so positionClosed stays false
-            // (the pair-side writeback must not double-decrement them).
+            // A position finalize did not wait for settles here, against the frozen ledgers.
             if (termBucket.size > 0) {
                 _settleOne(
                     positionBuckets,
@@ -396,68 +399,44 @@ library CollateralLib {
                     terminalProfitClaim,
                     ts,
                     BazaarTypes.TerminalSettleParams({
-                        settlementPrice: params.normalTerminationPrice,
+                        settlementPrice: params.settlementPrice,
                         currentFundingIndex: params.currentFundingIndex,
                         postFinalize: true,
-                        payBounty: false,
-                        pairId: params.pairId,
-                        usdc: params.usdcToken
+                        pairId: params.pairId
                     }),
                     caller
                 );
             }
 
-            // Registered profit claim (settled during the window): credit claim x frozen ratio
-            // into the bucket once. The credit moves into the principal ledger so it is reserved
-            // and withdrawable like principal from here on.
+            // Registered claim: credited once, at the frozen profit ratio, into the bucket and
+            // the principal ledger — finalize kept that cash out of the insurers' residual.
             uint256 claim = terminalProfitClaim[caller];
             if (claim > 0) {
                 terminalProfitClaim[caller] = 0;
                 uint256 pay = Math.mulDiv(claim, ts.profitRatioBp, BazaarTypes.BP_SCALE);
                 if (pay > 0) {
-                    termBucket.collateral += pay;
+                    termBucket.collateral = SafeCast.toUint128(uint256(termBucket.collateral) + pay);
                     pairVault.totalCollateralDeposited += pay;
-                    ts.profitReserve = ts.profitReserve > pay ? ts.profitReserve - pay : 0;
                 }
-            }
-
-            // Rung-4 principal haircut: in deep insolvency the winning side's PnL was fully wiped
-            // and a shortfall still remained, so TerminationLib set a sub-100% collateral ratio.
-            // Apply it once per user (flat users included) so cumulative principal payouts cannot
-            // exceed the USDC on hand. The once-flag (terminalHaircutApplied) is shared with the
-            // emergency haircut; a pair is only ever emergency XOR normal terminated, so no collision.
-            // NOTE: the guard is `< BP_SCALE`, NOT `> 0 && < BP_SCALE`. Every normal termination
-            // sets this ratio (BP_SCALE = no haircut, anything below = a real haircut), so a value
-            // of exactly 0 is a *legitimately computed* near-total-wipeout (pot < 0.01% of the book),
-            // NOT the unset default. Treating 0 as "skip" would re-open the first-come-first-served
-            // drain this haircut exists to prevent. A 0 ratio correctly zeroes every payout (the
-            // sub-bp dust stays stranded in the contract rather than draining to early withdrawers).
-            if (
-                params.normalTerminalCollateralRatioBp < BazaarTypes.BP_SCALE && !terminalHaircutApplied[caller]
-                    && termBucket.collateral > 0
-            ) {
-                terminalHaircutApplied[caller] = true;
-                uint256 adjustedCollateral =
-                    Math.mulDiv(termBucket.collateral, params.normalTerminalCollateralRatioBp, BazaarTypes.BP_SCALE);
-                pairVault.totalCollateralDeposited -= (termBucket.collateral - adjustedCollateral);
-                termBucket.collateral = adjustedCollateral;
             }
 
             if (params.amount > termBucket.collateral) {
                 revert CollateralLib__InsufficientCollateral(params.amount, termBucket.collateral);
             }
-
-            termBucket.collateral -= params.amount;
+            termBucket.collateral -= uint128(params.amount);
             BucketLib.emitBucketUpdate(caller, termBucket, params.currentFundingIndex, params.marginReqs, params.pairId);
 
-            pairVault.totalCollateralDeposited -= params.amount;
+            // Floored: the ledger is the total finalize derived, which can sit below the sum of
+            // buckets by rounding dust and, after an escape-hatch finalize, by the part of a
+            // bankrupt position's shortfall that insurance could not fund.
+            pairVault.totalCollateralDeposited = pairVault.totalCollateralDeposited > params.amount
+                ? pairVault.totalCollateralDeposited - params.amount
+                : 0;
 
-            result.withdrawAmount = params.amount;
-            result.totalCollateralDecrease = params.amount;
-            emit BazaarTypes.CollateralWithdrawn(params.pairId, caller, result.withdrawAmount, result.positionClosed);
-            return result;
+            withdrawAmount = Math.mulDiv(params.amount, ts.principalRatioBp, BazaarTypes.BP_SCALE);
+            emit BazaarTypes.CollateralWithdrawn(params.pairId, caller, withdrawAmount);
+            return withdrawAmount;
         }
-
         // ------------------------------------------------------------------
         // Normal Operation: position-aware withdrawal with margin checks
         // ------------------------------------------------------------------
@@ -486,13 +465,12 @@ library CollateralLib {
                 revert CollateralLib__WithdrawalRequiresFreshPrice();
             }
 
-            // Defensive backstop: if isVaultHealthy reported an unhealthy result this tx, block a
-            // normal-operation withdrawal from slipping through. Reason 2 (ADL timeout)
-            // normal-terminates and reason 3 (USDC shortfall) emergency-terminates — both set a
-            // termination flag that routes withdrawals to the terminal branches above, so reaching
-            // here with reason 2/3 should not happen; this guard ensures it can't.
-            if (!params.isVaultHealthy && (params.vaultHealthReason == 2 || params.vaultHealthReason == 3)) {
-                revert CollateralLib__WithdrawalBlockedDueToEmergencyTermination();
+            // Defensive backstop: an unhealthy verdict other than the ADL latch (reasons 2, 3
+            // and 4) opens the settlement window in this same transaction, and the window check
+            // above reverts on the very next call. Reaching here should therefore be impossible;
+            // the guard keeps a future health path from letting a withdrawal through anyway.
+            if (!params.isVaultHealthy && params.vaultHealthReason != 1) {
+                revert CollateralLib__WithdrawalBlockedVaultUnhealthy();
             }
 
             // Reason 1 = liquidation exposure exceeds insurance. The ADL window is then either
@@ -527,12 +505,12 @@ library CollateralLib {
             // equity. The margin check below is EQUITY-based (collateral + unrealized PnL), so
             // without a cash floor a profitable position could withdraw its entire deposit and
             // carry the margin on paper profit alone. That state fails two ways:
-            // - Every fee in the protocol is charged against bucket collateral:
+            // - Every trading fee is charged against bucket collateral:
             //   MatchingEngineLib._checkMargin rejects any fill whose fee exceeds it and the
-            //   caller AUTO-CANCELS the order, and _chargeRelayerFee reverts — the holder could
-            //   not close through the book (nor use meta-transactions) until they re-deposited.
-            //   Either floor rate covers the worst-case closing fee with multiples to spare
-            //   (mmrBp never sits below 4x the taker insurance fee's hard cap).
+            //   caller AUTO-CANCELS the order — the holder could not close through the book
+            //   until they re-deposited. Either floor rate covers the worst-case closing fee
+            //   with multiples to spare (mmrBp never sits below 4x the taker insurance fee's
+            //   hard cap).
             // - Paper profit is only as good as the mark, and it evaporates in the same adverse
             //   move it would need to buffer.
             // The retained rate follows how the pair can move against that buffer:
@@ -551,8 +529,7 @@ library CollateralLib {
             // deposits, partially closes (which realizes PnL into collateral and shrinks the
             // floor), or goes flat — the flat path below has no floor.
             {
-                uint256 floorRateBp =
-                    params.isContinuouslyTraded ? params.marginReqs.mmrBp : params.marginReqs.imrBp;
+                uint256 floorRateBp = params.isContinuouslyTraded ? params.marginReqs.mmrBp : params.marginReqs.imrBp;
                 uint256 minRetained = Math.mulDiv(floorRateBp, currentState.currentNotional, BazaarTypes.BP_SCALE);
                 uint256 remaining = currentState.effectiveCollateral - params.amount;
                 if (remaining < minRetained) {
@@ -585,12 +562,10 @@ library CollateralLib {
                 caller, storageBucket, params.currentFundingIndex, params.marginReqs, params.pairId
             );
 
-            pairVault.totalCollateralDeposited -= params.amount;
+            _debitLedger(pairVault, params.amount);
 
-            result.withdrawAmount = params.amount;
-            result.totalCollateralDecrease = params.amount;
-            emit BazaarTypes.CollateralWithdrawn(params.pairId, caller, result.withdrawAmount, result.positionClosed);
-            return result;
+            emit BazaarTypes.CollateralWithdrawn(params.pairId, caller, params.amount);
+            return params.amount;
         }
 
         // ------------------------------------------------------------------
@@ -616,12 +591,39 @@ library CollateralLib {
 
         // Persist updated collateral (keep same position fields)
         BazaarTypes.PositionBucket storage noExpBucket = positionBuckets[caller];
-        noExpBucket.collateral = bucket.collateral - params.amount;
+        // Guarded above: params.amount <= bucket.collateral (uint128).
+        noExpBucket.collateral = uint128(uint256(bucket.collateral) - params.amount);
         BucketLib.emitBucketUpdate(caller, noExpBucket, params.currentFundingIndex, params.marginReqs, params.pairId);
 
-        pairVault.totalCollateralDeposited -= params.amount;
-        result.withdrawAmount = params.amount;
-        result.totalCollateralDecrease = params.amount;
-        emit BazaarTypes.CollateralWithdrawn(params.pairId, caller, result.withdrawAmount, result.positionClosed);
+        _debitLedger(pairVault, params.amount);
+        emit BazaarTypes.CollateralWithdrawn(params.pairId, caller, params.amount);
+        return params.amount;
+    }
+
+    /// @notice Debits the deposits ledger for a withdrawal off a live pair.
+    /// @dev Inter-user realized PnL never reaches this ledger: a winner closing against a fresh
+    ///      opener is credited into their bucket while the counterparty carrying the other side
+    ///      of that move still holds it unrealized. `Σ bucket.collateral - totalCollateralDeposited`
+    ///      is therefore the open book's aggregate unrealized loss, and a ledger below the sum of
+    ///      buckets is an ordinary state rather than a corrupted one — a caller's own bucket
+    ///      balance is no bound on what the ledger can fund, and every gate above bounds them by
+    ///      that balance alone.
+    ///
+    ///      Solvent positions alone cannot drive the ledger short: a bucket is solvent only while
+    ///      its equity covers its maintenance requirement, so its collateral covers the unrealized
+    ///      loss it contributes. Reaching the revert means the open book no longer backs the claims
+    ///      against it. The withdrawal is refused rather than paid down to the ledger, because a
+    ///      live pair has no frozen ratio to pay a partial claim at: settling this caller short
+    ///      would pick a rate for them alone and rank them ahead of everyone still in the book.
+    ///      Dividing a ledger too small for its claims is the terminated branch's job, where every
+    ///      withdrawal is scaled by the one `principalRatioBp` finalize froze.
+    /// @param pairVault The pair's vault aggregates.
+    /// @param amount The withdrawal to debit, in BAZAAR precision.
+    function _debitLedger(BazaarTypes.Vault storage pairVault, uint256 amount) private {
+        uint256 available = pairVault.totalCollateralDeposited;
+        if (amount > available) revert CollateralLib__LedgerShortfall(amount, available);
+        unchecked {
+            pairVault.totalCollateralDeposited = available - amount;
+        }
     }
 }

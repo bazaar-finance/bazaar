@@ -5,6 +5,7 @@ import {IntegrationBase} from "./IntegrationBase.sol";
 import {StdStorage, stdStorage} from "forge-std/Test.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 import {RiskParamsLib} from "../../src/libraries/RiskParamsLib.sol";
+import {BucketStore} from "../BucketStore.sol";
 
 /// @title PostFillAccountingTest
 /// @notice Everything that happens AFTER an arrival fill settles: position state transitions
@@ -18,9 +19,13 @@ contract PostFillAccountingTest is IntegrationBase {
     // ---------------------------- local helpers ----------------------------
 
     function _setVaultPendingLiq(uint256 size, uint256 entryPrice, uint256 bankruptcyPrice, bool isLong) internal {
+        uint256 entryNotional = size * entryPrice / BAZAAR_SCALE;
+        uint256 bankruptcyNotional = size * bankruptcyPrice / BAZAAR_SCALE;
         _stdstore.target(address(pair)).sig("pairVault()").depth(6).checked_write(size);
-        _stdstore.target(address(pair)).sig("pairVault()").depth(7).checked_write(size * entryPrice / BAZAAR_SCALE);
-        _stdstore.target(address(pair)).sig("pairVault()").depth(8).checked_write(size * bankruptcyPrice / BAZAAR_SCALE);
+        _stdstore.target(address(pair)).sig("pairVault()").depth(7).checked_write(entryNotional);
+        _stdstore.target(address(pair)).sig("pairVault()").depth(8).checked_write(bankruptcyNotional);
+        _stdstore.target(address(pair)).sig("pairVault()").depth(13)
+            .checked_write(isLong ? entryNotional - bankruptcyNotional : bankruptcyNotional - entryNotional);
         _stdstore.target(address(pair)).sig("pairVault()").depth(10).checked_write(isLong);
     }
 
@@ -37,7 +42,7 @@ contract PostFillAccountingTest is IntegrationBase {
         s.expirationBlock = uint64(vm.getBlockNumber() + 500_000);
         s.integrator = integrator;
         vm.prank(user);
-        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
         return _lastCreatedOrderId(pair);
     }
 
@@ -113,7 +118,11 @@ contract PostFillAccountingTest is IntegrationBase {
     // ============================ TP/SL oversize fence ============================
 
     /// @notice A TakeProfit larger than the shrunken position is auto-canceled by the fence.
-    function test_fence_oversizedTakeProfitCanceledOnPartialClose() public {
+    /// @notice A partial close leaves an oversized TP armed rather than cancelling it: the order
+    ///         caps itself at whatever the position holds when it fires. The pre-cap behaviour
+    ///         destroyed the protection on the surviving position, which is the moment it is
+    ///         most wanted.
+    function test_fence_oversizedTakeProfitSurvivesPartialClose_andCapsAtRemainder() public {
         _openAt50k(2 * BAZAAR_SCALE / 10);
         uint256 tpId = _placeTakeProfit(alice, false, 2 * BAZAAR_SCALE / 10, 55_000 * BAZAAR_SCALE, 500);
         assertEq(_takeProfitOrderId(alice), tpId, "TP attached");
@@ -126,14 +135,23 @@ contract PostFillAccountingTest is IntegrationBase {
         _placeLimit(carol, true, BAZAAR_SCALE / 10, 51_000 * BAZAAR_SCALE);
         assertEq(_posSize(alice), BAZAAR_SCALE / 10, "partial close filled");
 
-        assertEq(_takeProfitOrderId(alice), 0, "oversized TP detached");
-        assertGt(_canceledBlock(tpId), 0, "TP order canceled");
+        assertEq(_takeProfitOrderId(alice), tpId, "oversized TP still attached");
+        assertEq(_canceledBlock(tpId), 0, "TP not canceled by the shrink");
+
+        // Firing it closes the 0.1 that is left, not the 0.2 it was written for.
+        _deposit(dave, 60_000 * BAZAAR_SCALE);
+        _placeLimitAt(dave, true, 2 * BAZAAR_SCALE / 10, 54_900 * BAZAAR_SCALE, 55_000);
+        assertEq(_executeTriggerAt(tpId, 55_000), 1, "TP fired");
+
+        assertEq(_filledSize(tpId), BAZAAR_SCALE / 10, "closed exactly the surviving position");
+        assertEq(_posSize(alice), 0, "flat, not flipped short");
     }
 
-    /// @notice Same fence for an oversized StopLoss.
-    function test_fence_oversizedStopLossCanceledOnPartialClose() public {
+    /// @notice Same for an oversized StopLoss: it survives the shrink and caps on firing, so it
+    ///         cannot take past flat and open a short for the owner it was protecting.
+    function test_fence_oversizedStopLossSurvivesPartialClose_andCapsAtRemainder() public {
         _openAt50k(2 * BAZAAR_SCALE / 10);
-        uint256 slId = _placeStopLoss(alice, false, 2 * BAZAAR_SCALE / 10, 45_000 * BAZAAR_SCALE, 500);
+        uint256 slId = _placeStopLoss(alice, false, 2 * BAZAAR_SCALE / 10, 49_000 * BAZAAR_SCALE, 500);
         assertEq(_stopLossOrderId(alice), slId, "SL attached");
 
         _deposit(carol, 20_000 * BAZAAR_SCALE);
@@ -142,8 +160,15 @@ contract PostFillAccountingTest is IntegrationBase {
         _placeLimit(carol, true, BAZAAR_SCALE / 10, 51_000 * BAZAAR_SCALE);
         assertEq(_posSize(alice), BAZAAR_SCALE / 10, "partial close filled");
 
-        assertEq(_stopLossOrderId(alice), 0, "oversized SL detached");
-        assertGt(_canceledBlock(slId), 0, "SL order canceled");
+        assertEq(_stopLossOrderId(alice), slId, "oversized SL still attached");
+        assertEq(_canceledBlock(slId), 0, "SL not canceled by the shrink");
+
+        _deposit(dave, 60_000 * BAZAAR_SCALE);
+        _placeLimitAt(dave, true, 2 * BAZAAR_SCALE / 10, 48_900 * BAZAAR_SCALE, 49_000);
+        assertEq(_executeTriggerAt(slId, 49_000), 1, "SL fired");
+
+        assertEq(_filledSize(slId), BAZAAR_SCALE / 10, "closed exactly the surviving position");
+        assertEq(_posSize(alice), 0, "flat, not flipped short");
     }
 
     // ============================ vault OI aggregates ============================
@@ -151,7 +176,7 @@ contract PostFillAccountingTest is IntegrationBase {
     /// @notice OI and weighted entry sums track real fills: symmetric on open, zero after close.
     function test_oiAggregates_openThenCloseRoundTrip() public {
         _openAt50k(BAZAAR_SCALE / 10);
-        (uint256 longOI, uint256 shortOI, uint256 longSum, uint256 shortSum,,,,,,,,) = pair.pairVault();
+        (uint256 longOI, uint256 shortOI, uint256 longSum, uint256 shortSum,,,,,,,,,,) = pair.pairVault();
         assertEq(longOI, BAZAAR_SCALE / 10, "long OI == size");
         assertEq(shortOI, BAZAAR_SCALE / 10, "short OI == size");
         assertEq(longSum, 5_000 * BAZAAR_SCALE, "long weighted entry == fill notional");
@@ -163,7 +188,7 @@ contract PostFillAccountingTest is IntegrationBase {
         _placeLimit(bob, true, BAZAAR_SCALE / 10, 51_000 * BAZAAR_SCALE);
         assertEq(_posSize(alice), 0, "closed");
 
-        (longOI, shortOI, longSum, shortSum,,,,,,,,) = pair.pairVault();
+        (longOI, shortOI, longSum, shortSum,,,,,,,,,,) = pair.pairVault();
         assertEq(longOI, 0, "long OI zeroed");
         assertEq(shortOI, 0, "short OI zeroed");
         assertEq(longSum, 0, "long sum zeroed");
@@ -179,9 +204,9 @@ contract PostFillAccountingTest is IntegrationBase {
     function test_feePipeline_conservationAndRouting() public {
         address bugBounty = makeAddr("bugBounty"); // same label the deployment used
         // Seed open interest, then drain the insurance fund below its target ratio: at genesis
-        // the $5k seed fully covers $5k of OI (deep surplus), where the dynamic taker rate
-        // legitimately prices at ZERO — which would leave the taker leg untested. Under-target,
-        // the deficit curve prices it at or above the base rate.
+        // the $5k seed fully covers $5k of OI, where the dynamic taker rate sits flat on its
+        // base. Under-target the deficit curve prices it strictly above that base, so the taker
+        // leg exercises the dynamic arm rather than the floor the maker leg already pins.
         _openAt50k(BAZAAR_SCALE / 10);
         _drainInsuranceTo(50 * BAZAAR_SCALE);
 
@@ -197,7 +222,10 @@ contract PostFillAccountingTest is IntegrationBase {
         uint256 dCollBefore = _posCollateral(dave);
         uint256 aggBefore = _totalDeposited();
         uint256 insBefore = _insuranceBal();
-        uint256 bbUsdcBefore = usdc.balanceOf(bugBounty);
+        // Escrow balance, not wallet balance: the bounty share accrues and is claimed later, so
+        // the earlier setup fills have left a balance here that this fill must be measured
+        // against rather than added to.
+        uint256 bbOwedBefore = _escrowOwed(bugBounty);
 
         _placeLimit(dave, false, size, 49_000 * BAZAAR_SCALE); // taker, crosses at carol's $50k
 
@@ -222,12 +250,13 @@ contract PostFillAccountingTest is IntegrationBase {
         uint256 totalFees = carolDebit + daveDebit;
         assertEq(aggBefore - _totalDeposited(), totalFees, "aggregate books mirror the user debits");
 
-        uint256 bbGain = (usdc.balanceOf(bugBounty) - bbUsdcBefore) * 1e12;
+        uint256 bbGain = _escrowOwed(bugBounty) - bbOwedBefore;
         uint256 insGain = _insuranceBal() - insBefore;
         // 1% of the insurance stream goes to the bug bounty; the rest accrues to the fund.
-        // Tolerances absorb the USDC-flooring dust on the bounty transfer.
         assertApproxEqAbs(bbGain, totalFees / 100, 2e12, "bug bounty tax = 1% of total fees");
         assertApproxEqAbs(insGain + bbGain, totalFees, 2e12, "conservation: fees fully routed");
+        // And the accrued share is really payable: claiming moves exactly it (floored to USDC).
+        assertEq(_claimFees(bugBounty) * 1e12, (bbOwedBefore + bbGain) / 1e12 * 1e12, "escrowed bounty is claimable");
     }
 
     /// @notice Integrator routing: each side's integrator fee goes to that order's integrator
@@ -250,19 +279,20 @@ contract PostFillAccountingTest is IntegrationBase {
         uint256 takerSideFee = fillNotional * BazaarTypes.TAKER_INTEGRATOR_FEE_EBP / BazaarTypes.EBP_SCALE;
         uint256 expectedNetX = (makerSideFee * 9_900 / 10_000) / 1e12; // 99%, floored to USDC
         uint256 expectedNetY = (takerSideFee * 9_900 / 10_000) / 1e12;
-        assertEq(usdc.balanceOf(integratorX), expectedNetX, "maker integrator paid its side's fee");
-        assertEq(usdc.balanceOf(integratorY), expectedNetY, "taker integrator paid its side's fee");
+        assertEq(_claimFees(integratorX), expectedNetX, "maker integrator paid its side's fee");
+        assertEq(_claimFees(integratorY), expectedNetY, "taker integrator paid its side's fee");
 
         // Cross 2: both sides integrator address(0) -> NO integrator fee is charged at all.
         // Alice's resting $49k ask closes her long; bob's crossing buy closes his short. The
         // realized PnL is an exact +-$100 wash between the two buckets, so the summed collateral
         // debits equal the summed fees — and full conservation into insurance + bug bounty
-        // proves nothing was routed to any integrator. The fund is drained below target first:
-        // in the genesis surplus the closing rate prices at zero, which would leave the taker
-        // fee assertion vacuous.
+        // proves nothing was routed to any integrator. The fund is drained below target first so
+        // the dynamic taker rate sits far above its base — bob's fill is pure closing, so it
+        // must still price on the base curve.
         _drainInsuranceTo(50 * BAZAAR_SCALE);
         uint256 insBefore = _insuranceBal();
-        uint256 bbUsdcBefore = usdc.balanceOf(makeAddr("bugBounty"));
+        // Escrow balance, not wallet balance — the bounty share accrues rather than transferring.
+        uint256 bbOwedBefore = _escrowOwed(makeAddr("bugBounty"));
         uint256 aCollBefore = _posCollateral(alice);
         uint256 bCollBefore = _posCollateral(bob);
 
@@ -280,20 +310,28 @@ contract PostFillAccountingTest is IntegrationBase {
             100 * BAZAAR_SCALE + makerInsFee,
             "maker debit = realized loss + 0.5bp insurance fee only"
         );
-        // Bob (taker) realizes a $100 gain net of the closing-rate insurance fee, which never
-        // prices below the curve's base rate.
+        // Bob (taker) realizes a $100 gain net of the closing-rate insurance fee: at least the
+        // base curve's floor, and no more than its ceiling — the drained fund's deficit
+        // multiplier is an order of magnitude past that ceiling and must not reach a close.
         uint256 takerFee = 100 * BAZAAR_SCALE - (_posCollateral(bob) - bCollBefore);
         assertGe(
             takerFee,
             closeNotional * RiskParamsLib.TAKER_INSURANCE_FEE_MIN_EBP / BazaarTypes.EBP_SCALE,
             "taker pays at least the base closing rate"
         );
+        assertLe(
+            takerFee,
+            closeNotional * RiskParamsLib.TAKER_INSURANCE_FEE_MAX_EBP / BazaarTypes.EBP_SCALE,
+            "closing size never pays the deficit multiplier"
+        );
 
         uint256 insGain = _insuranceBal() - insBefore;
-        uint256 bbGain = (usdc.balanceOf(makeAddr("bugBounty")) - bbUsdcBefore) * 1e12;
+        uint256 bbGain = _escrowOwed(makeAddr("bugBounty")) - bbOwedBefore;
         assertApproxEqAbs(insGain + bbGain, makerInsFee + takerFee, 2e12, "all fees land in insurance + bounty");
-        assertEq(usdc.balanceOf(integratorX), expectedNetX, "integrator X unchanged by integrator-less cross");
-        assertEq(usdc.balanceOf(integratorY), expectedNetY, "integrator Y unchanged by integrator-less cross");
+        // Both integrators claimed their cross-1 fees above and accrued nothing since: an
+        // integrator-less cross routes no integrator fee.
+        assertEq(_escrowOwed(integratorX), 0, "integrator X unchanged by integrator-less cross");
+        assertEq(_escrowOwed(integratorY), 0, "integrator Y unchanged by integrator-less cross");
     }
 
     /// @notice One arrival can sweep several makers carrying DISTINCT integrators: every maker's
@@ -319,14 +357,14 @@ contract PostFillAccountingTest is IntegrationBase {
         assertEq(_filledSize(cL), size, "maker 2 filled");
         assertEq(_filledSize(dL), size, "maker 3 filled");
 
-        uint256 makerNet = (5_000 * BAZAAR_SCALE * BazaarTypes.MAKER_INTEGRATOR_FEE_EBP / BazaarTypes.EBP_SCALE)
-            * 9_900 / 10_000 / 1e12;
+        uint256 makerNet = (5_000 * BAZAAR_SCALE * BazaarTypes.MAKER_INTEGRATOR_FEE_EBP / BazaarTypes.EBP_SCALE) * 9_900
+            / 10_000 / 1e12;
         uint256 takerNet = (15_000 * BAZAAR_SCALE * BazaarTypes.TAKER_INTEGRATOR_FEE_EBP / BazaarTypes.EBP_SCALE)
             * 9_900 / 10_000 / 1e12;
-        assertEq(usdc.balanceOf(makeAddr("uniqInt1")), makerNet, "maker integrator 1 paid");
-        assertEq(usdc.balanceOf(makeAddr("uniqInt2")), makerNet, "maker integrator 2 paid");
-        assertEq(usdc.balanceOf(makeAddr("uniqInt3")), makerNet, "maker integrator 3 paid");
-        assertEq(usdc.balanceOf(makeAddr("uniqInt4")), takerNet, "taker integrator accumulated all three fills");
+        assertEq(_claimFees(makeAddr("uniqInt1")), makerNet, "maker integrator 1 paid");
+        assertEq(_claimFees(makeAddr("uniqInt2")), makerNet, "maker integrator 2 paid");
+        assertEq(_claimFees(makeAddr("uniqInt3")), makerNet, "maker integrator 3 paid");
+        assertEq(_claimFees(makeAddr("uniqInt4")), takerNet, "taker integrator accumulated all three fills");
     }
 
     // ============================ vault-unload maker safety ============================
@@ -340,8 +378,7 @@ contract PostFillAccountingTest is IntegrationBase {
         uint256 longId = _placeLimit(alice, true, liqSize, 49_800 * BAZAAR_SCALE);
 
         // Alice's collateral evaporates after creation (simulating consumption elsewhere).
-        _stdstore.target(address(pair)).sig("positionBuckets(address)").with_key(alice).depth(3)
-            .checked_write(uint256(100 * BAZAAR_SCALE));
+        BucketStore.setCollateral(address(pair), alice, uint256(100 * BAZAAR_SCALE));
 
         _setVaultPendingLiq(liqSize, 51_000 * BAZAAR_SCALE, 49_000 * BAZAAR_SCALE, true);
         _roll(2);
@@ -350,7 +387,7 @@ contract PostFillAccountingTest is IntegrationBase {
         assertEq(unloaded, 0, "no fill against an under-margined maker");
         assertEq(_filledSize(longId), 0, "order unfilled");
         assertGt(_canceledBlock(longId), 0, "failing maker auto-canceled");
-        (,,,,,, uint256 pendSize,,,,,) = pair.pairVault();
+        (,,,,,, uint256 pendSize,,,,,,,) = pair.pairVault();
         assertEq(pendSize, liqSize, "vault inventory untouched");
     }
 

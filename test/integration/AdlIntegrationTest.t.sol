@@ -7,7 +7,7 @@ import {IntegrationBase} from "./IntegrationBase.sol";
 
 /// @title AdlIntegrationTest
 /// @notice Full ADL lifecycle on the live pair: a deep-underwater liquidation hands the vault an
-///         exposure whose expected loss exceeds 80% of the insurance fund → ADL triggers (freezing
+///         exposure whose expected loss exceeds the fund's free capital above its reserve → ADL triggers (freezing
 ///         trading) → once the auction's score threshold decays the opposite-side winner is
 ///         deleveraged at the vault's bankruptcy price, insurance funds the credit, the vault
 ///         exposure clears, and the margin curve is recomputed on completion.
@@ -24,7 +24,8 @@ contract AdlIntegrationTest is IntegrationBase {
         _assertBooksSettled("adl: after open");
 
         // Phantom deep-underwater long for dave: bankruptcy price $50,990/BTC → at the $50k oracle the
-        // vault-inherited loss is (254,950 − 250,000) = $4,950 > 80% of the ~$4k insurance fund.
+        // vault-inherited loss is (254,950 − 250,000) = $4,950 > the ~$4k insurance fund's free
+        // capital above its reserve.
         _deposit(dave, 10 * BAZAAR_SCALE);
         _writePosition(dave, true, size, 254_960 * BAZAAR_SCALE);
         // _writePosition only rewrites size/entryValue (not collateral), so the cash books still balance.
@@ -37,7 +38,7 @@ contract AdlIntegrationTest is IntegrationBase {
 
         // The same liquidate call re-evaluated vault health → ADL pending, vault holds dave's long.
         assertTrue(pair.isAdlPending(), "ADL triggered by the deep-underwater inheritance");
-        (,,,,,, uint256 pendSize,,,, bool pendIsLong,) = pair.pairVault();
+        (,,,,,, uint256 pendSize,,,, bool pendIsLong,,,) = pair.pairVault();
         assertEq(pendSize, size, "vault inherited the 5 BTC");
         assertTrue(pendIsLong, "vault holds the long side");
 
@@ -64,14 +65,19 @@ contract AdlIntegrationTest is IntegrationBase {
         _assertBooks("adl: after winner deleverage");
 
         assertFalse(pair.isAdlPending(), "ADL resolved");
-        (,,,,,, uint256 pendAfter,,,,,) = pair.pairVault();
-        assertEq(pendAfter, 0, "vault exposure fully closed");
-        assertEq(_posSize(bob), 0, "bob deleveraged");
+        (,,,,,, uint256 pendAfter,,,,,,,) = pair.pairVault();
+        // Bob alone covers the whole 5 BTC the vault inherited, but the batch is capped at the
+        // size that restores the fund: it closes the part the exposure required and leaves the
+        // rest with him. Closing all 5 would settle the remainder at the estates' bankruptcy
+        // price for no protective gain, and pay the executor a cut of every unit of it.
+        assertGt(pendAfter, 0, "the batch took only what the exposure required");
+        assertLt(pendAfter, size, "and it took what the exposure did require");
+        assertEq(_posSize(bob), pendAfter, "bob keeps the units the fund did not need closed");
         assertGt(_posCollateral(bob), bobCollBefore, "bob credited settlement PnL at the bankruptcy price");
         assertLt(_insuranceBal(), insBefore, "insurance funded the winner credit");
 
         // ADL completion also refreshes the margin curve (the MMR-recompute wiring).
-        (,, uint256 lastTs,) = pair.marginRequirements();
+        (,, uint256 lastTs,,) = pair.marginRequirements();
         assertEq(lastTs, vm.getBlockTimestamp(), "IMR/MMR recomputed on ADL completion");
     }
 
@@ -93,7 +99,10 @@ contract AdlIntegrationTest is IntegrationBase {
     ///         size stays live and oversized: a later arrival could fill it past flat and open a
     ///         fresh opposite position for its owner — the opposite of what a close-only order
     ///         may do — and a fired StopLoss could keep taking after its position was gone.
-    function test_adl_partialClose_cancelsOversizedTakeProfit() public {
+    /// @notice A partial deleverage leaves the winner's TP armed. ADL is exactly the moment a
+    ///         trader least wants their protection silently removed, and the order is safe to
+    ///         leave: it caps at whatever position survived the deleverage.
+    function test_adl_partialClose_leavesTakeProfitArmedAndCapped() public {
         // Bob builds a short of 8 across two fills, both at $51,000, so his entry basis matches
         // the single-fill scenario: 5 against alice, then 3 against carol. A winner LARGER than
         // the vault's inventory is what makes the deleverage partial.
@@ -115,7 +124,7 @@ contract AdlIntegrationTest is IntegrationBase {
         assertEq(_takeProfitOrderId(bob), tp, "TP slot anchored");
 
         // Deep-underwater long of 5: bankruptcy ≈ $50,990/BTC, so the vault's expected loss
-        // (~$4,950) exceeds 80% of the fund and the settlement price stays just below bob's
+        // (~$4,950) exceeds the fund's capital above its reserve and the settlement price stays just below bob's
         // entry — he settles at a small profit, which eligibility requires.
         _deposit(dave, 10 * BAZAAR_SCALE);
         _writePosition(dave, true, 5 * BAZAAR_SCALE, 254_960 * BAZAAR_SCALE);
@@ -123,7 +132,7 @@ contract AdlIntegrationTest is IntegrationBase {
         assertEq(pair.liquidate(_arr1(dave), _freshPrice()), 1, "dave liquidated");
         assertTrue(pair.isAdlPending(), "ADL triggered");
         {
-            (,,,,,, uint256 pend,,,,,) = pair.pairVault();
+            (,,,,,, uint256 pend,,,,,,,) = pair.pairVault();
             assertEq(pend, 5 * BAZAAR_SCALE, "vault inherited exactly 5 BTC");
         }
         assertEq(_canceledBlock(tp), 0, "TP untouched by the liquidation");
@@ -133,10 +142,22 @@ contract AdlIntegrationTest is IntegrationBase {
         vm.prank(carol);
         pair.executeAdl(_arr1(bob), pu);
 
-        assertFalse(pair.isPairTerminatedEmergency(), "pair survives the deleverage");
-        assertEq(_posSize(bob), 3 * BAZAAR_SCALE, "bob partially deleveraged: 8 - 5");
-        assertGt(_canceledBlock(tp), 0, "oversized TakeProfit canceled by the fence");
-        assertEq(_takeProfitOrderId(bob), 0, "TP slot cleared");
+        assertEq(pair.settlementPriceFixedTs(), 0, "pair survives the deleverage");
+        // The batch is capped at the size that restores the fund, so it takes less than the 5 BTC
+        // of inventory bob could have covered and he keeps more than the 3 that would leave.
+        uint256 bobLeft = _posSize(bob);
+        assertGt(bobLeft, 3 * BAZAAR_SCALE, "deleveraged only by what the exposure required");
+        assertLt(bobLeft, 8 * BAZAAR_SCALE, "but he was deleveraged");
+        assertEq(_canceledBlock(tp), 0, "TakeProfit survives the deleverage");
+        assertEq(_takeProfitOrderId(bob), tp, "TP slot still anchored");
         _assertBooks("adl: after partial deleverage");
+
+        // The 8-sized TP now covers a smaller position: firing it buys back exactly what is left.
+        _deposit(alice, 200_000 * BAZAAR_SCALE);
+        _placeLimitAt(alice, false, 8 * BAZAAR_SCALE, 45_100 * BAZAAR_SCALE, 45_000);
+        assertEq(_executeTriggerAt(tp, 45_000), 1, "TP fired");
+        assertEq(_filledSize(tp), bobLeft, "capped at the post-ADL position");
+        assertEq(_posSize(bob), 0, "flat, not flipped long");
+        _assertBooks("adl: after the capped take-profit");
     }
 }

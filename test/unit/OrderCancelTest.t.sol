@@ -22,9 +22,9 @@ contract OrderCancelHarness {
         if (ot == BazaarTypes.OrderType.Limit || ot == BazaarTypes.OrderType.StopLimit) {
             userActiveLimitOrders[o.creator].add(id);
         } else if (ot == BazaarTypes.OrderType.TakeProfit) {
-            positionBuckets[o.creator].takeProfitOrderId = id;
+            positionBuckets[o.creator].takeProfitOrderId = uint64(id);
         } else if (ot == BazaarTypes.OrderType.StopLoss) {
-            positionBuckets[o.creator].stopLossOrderId = id;
+            positionBuckets[o.creator].stopLossOrderId = uint64(id);
         }
     }
 

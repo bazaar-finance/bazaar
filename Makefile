@@ -8,7 +8,7 @@ help:
 	@echo "Available commands:"
 	@echo "  make anvil                    - Start Anvil with tracing enabled"
 	@echo "  make deploy-anvil             - Deploy Bazaar to local Anvil"
-	@echo "  make deploy-pair-anvil        - Deploy a pair (FEED_ID=0x... CONTINUOUS=true|false DESC=...)"
+	@echo "  make deploy-pair-anvil        - Deploy a pair (FEED_ID=0x... CONTINUOUS=true|false DESC=... [PRICE=2000])"
 	@echo "  make deploy-libs-arb-sepolia  - Step 1/2: deploy libraries to Arbitrum Sepolia"
 	@echo "  make deploy-arb-sepolia       - Step 2/2: deploy Bazaar to Arbitrum Sepolia"
 	@echo "  make deploy-libs-arb-mainnet  - Step 1/2: deploy libraries to Arbitrum Mainnet"
@@ -179,11 +179,21 @@ create-order-anvil:
 	echo "=== Order created ==="
 
 # Deploy a pair on Anvil
-# Usage: make deploy-pair-anvil FEED_ID=0xff61... CONTINUOUS=true DESC="ETH/USD"
+# Usage: make deploy-pair-anvil FEED_ID=0xff61... CONTINUOUS=true DESC="ETH/USD" [PRICE=2000]
+# The factory lists a raw feed only once Pyth holds a price for it, so a feed the mock has never
+# seen is seeded through set-price-anvil first; PRICE is required only in that case.
 .PHONY: deploy-pair-anvil
 deploy-pair-anvil:
-	@if [ -z "$(FEED_ID)" ]; then echo "Usage: make deploy-pair-anvil FEED_ID=0x... CONTINUOUS=true|false DESC=\"ETH/USD\""; exit 1; fi
+	@if [ -z "$(FEED_ID)" ]; then echo "Usage: make deploy-pair-anvil FEED_ID=0x... CONTINUOUS=true|false DESC=\"ETH/USD\" [PRICE=2000]"; exit 1; fi
 	@set -e && . ./.anvil-addresses && \
+	PYTH=$$(cast call $$ORACLE "pyth()(address)" --rpc-url $(ANVIL_RPC_URL)) && \
+	if [ "$$(cast call $$PYTH "priceFeedExists(bytes32)(bool)" $(FEED_ID) --rpc-url $(ANVIL_RPC_URL))" != "true" ]; then \
+		if [ -z "$(PRICE)" ]; then \
+			echo "ERROR: MockPyth holds no price for $(FEED_ID); the factory lists a feed only once Pyth has priced it. Pass PRICE=<usd> or run make set-price-anvil first."; exit 1; \
+		fi; \
+		echo "=== Step 0: Seeding MockPyth with $(PRICE) USD for the feed ===" && \
+		$(MAKE) --no-print-directory set-price-anvil FEED_ID=$(FEED_ID) PRICE=$(PRICE) > /dev/null; \
+	fi && \
 	AMOUNT=5000000000000000000000 && \
 	AMOUNT_USDC=5000000000 && \
 	echo "=== Step 1: Approving 5000 USDC for Factory ===" && \

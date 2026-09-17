@@ -12,6 +12,7 @@ import {MockUSDC} from "../mocks/MockUSDC.sol";
 import {MockOptimisticOracleV3} from "../mocks/MockOptimisticOracleV3.sol";
 import {MockArbSys} from "../mocks/MockArbSys.sol";
 import {MockPyth} from "@pythnetwork/pyth-sdk-solidity/MockPyth.sol";
+import {PythSeed} from "../PythSeed.sol";
 import {PythErrors} from "@pythnetwork/pyth-sdk-solidity/PythErrors.sol";
 
 /// @notice Unit tests for BazaarOracle composite (two-feed) price support:
@@ -429,6 +430,8 @@ contract CompositeOracleTest is Test {
 contract CompositeFactoryTest is Test {
     bytes32 constant ASSET_JPY_FEED = keccak256("test.EQUITY.7203/JPY");
     bytes32 constant USD_JPY_FEED = keccak256("test.FX.USD/JPY");
+    bytes32 constant ASSET_GBP_FEED = keccak256("test.EQUITY.LLOY/GBP");
+    bytes32 constant GBP_USD_FEED = keccak256("test.FX.GBP/USD");
     int32 constant PYTH_EXPO = -8;
 
     uint256 constant BAZAAR_SCALE = 1e18;
@@ -486,9 +489,11 @@ contract CompositeFactoryTest is Test {
     }
 
     function test_DeploymentClaim_EnforcesLinearAssetRules() public {
+        bytes32 rawFeed = keccak256("test.BTC/USD");
+        PythSeed.seed(address(mockPyth), rawFeed);
         vm.startPrank(user1);
         usdc.approve(address(factory), PROPOSAL_TOTAL_USDC);
-        bytes32 assertionId = factory.proposePairDeployment(keccak256("test.BTC/USD"), true, PROPOSAL_TOTAL, "BTC/USD");
+        bytes32 assertionId = factory.proposePairDeployment(rawFeed, true, PROPOSAL_TOTAL, "BTC/USD");
         vm.stopPrank();
 
         bytes memory claim = mockOOv3.claims(assertionId);
@@ -504,9 +509,13 @@ contract CompositeFactoryTest is Test {
         assertTrue(
             _contains(
                 claim,
-                "EXCEPTION: a 1:1 tracker IS eligible if the underlying asset or index it tracks has NO active Pyth price feed"
+                "EXCEPTION: a 1:1 tracker IS eligible if the underlying asset or index it tracks has NO active Pyth Core price feed"
             )
         );
+        assertTrue(_contains(claim, "SAME SECURITY IN MULTIPLE MARKETS"));
+        assertTrue(_contains(claim, "only the USD-quoted Core feed is eligible"));
+        assertTrue(_contains(claim, "classes differing only in voting rights or denomination are NOT distinct"));
+        assertTrue(_contains(claim, "Dual-listed company structures"));
         assertTrue(_contains(claim, "Base feed ID"));
         // Leveraged assets get no blanket carve-out: naming them as eligible would contradict the
         // 1:1-tracker exception above, which turns on whether the underlying has its own Pyth feed.
@@ -563,6 +572,50 @@ contract CompositeFactoryTest is Test {
         vm.expectRevert(BazaarFactory.Factory__CompositePairMustBeNonContinuous.selector);
         factory.proposePairDeployment(compositeId, true, PROPOSAL_TOTAL, "Toyota on TSE");
         vm.stopPrank();
+    }
+
+    /// @notice A composite ID nobody has registered is not a feed Pyth knows, so it cannot be
+    ///         proposed as a single feed and turned into a composite by registering the legs later.
+    ///         Once registered it is adjudicated as a composite: the continuous flag is refused and
+    ///         the claim names both legs.
+    function test_ProposeUnregisteredCompositeId_Reverts() public {
+        bytes32 gbpComposite = oracle.getCompositeId(ASSET_GBP_FEED, GBP_USD_FEED, false);
+
+        vm.startPrank(user1);
+        usdc.approve(address(factory), PROPOSAL_TOTAL_USDC);
+        vm.expectRevert(abi.encodeWithSelector(BazaarFactory.Factory__FeedNotOnPyth.selector, gbpComposite));
+        factory.proposePairDeployment(gbpComposite, true, PROPOSAL_TOTAL, "Lloyds on LSE");
+        vm.stopPrank();
+
+        oracle.registerComposite(ASSET_GBP_FEED, GBP_USD_FEED, false);
+
+        vm.startPrank(user1);
+        vm.expectRevert(BazaarFactory.Factory__CompositePairMustBeNonContinuous.selector);
+        factory.proposePairDeployment(gbpComposite, true, PROPOSAL_TOTAL, "Lloyds on LSE");
+        bytes32 assertionId = factory.proposePairDeployment(gbpComposite, false, PROPOSAL_TOTAL, "Lloyds on LSE");
+        vm.stopPrank();
+
+        bytes memory claim = mockOOv3.claims(assertionId);
+        assertTrue(_contains(claim, "Composite feed ID (USD price = base leg MULTIPLIED by quote leg)"));
+        assertTrue(_contains(claim, "Quote leg inverted: false"));
+    }
+
+    /// @notice A raw feed ID is listable only after Pyth has stored a price for it on this chain.
+    function test_ProposeRawFeed_RequiresStoredPythPrice() public {
+        bytes32 neverPulled = keccak256("test.EQUITY.NEVER-PULLED/USD");
+
+        vm.startPrank(user1);
+        usdc.approve(address(factory), PROPOSAL_TOTAL_USDC);
+        vm.expectRevert(abi.encodeWithSelector(BazaarFactory.Factory__FeedNotOnPyth.selector, neverPulled));
+        factory.proposePairDeployment(neverPulled, false, PROPOSAL_TOTAL, "Never pulled");
+        vm.stopPrank();
+
+        _pushLeg(neverPulled, 100e8, uint64(block.timestamp));
+
+        vm.prank(user1);
+        bytes32 assertionId = factory.proposePairDeployment(neverPulled, false, PROPOSAL_TOTAL, "Never pulled");
+        assertTrue(assertionId != bytes32(0));
+        assertTrue(_contains(mockOOv3.claims(assertionId), "Base feed ID"));
     }
 
     function test_CompositePair_DeploysAndPricesEndToEnd() public {

@@ -10,6 +10,7 @@ contract RiskParamsHarness {
     BazaarTypes.Vault internal pairVault;
     BazaarTypes.PairPrice internal lastPairPrice;
     BazaarTypes.LiquidationGapEma internal liquidationGapEma;
+    BazaarTypes.ReopenGapEma internal reopenGapEma;
 
     function setInsurance(uint256 balance) external {
         pairVault.insuranceFundBalance = balance;
@@ -24,8 +25,10 @@ contract RiskParamsHarness {
         lastPairPrice.emaVarianceBp = emaVarianceBp;
     }
 
-    function takerFeeEbp(uint256 currentPrice) external view returns (uint256) {
-        return RiskParamsLib.getTakerInsuranceFeeEbp(pairVault, lastPairPrice, liquidationGapEma, currentPrice, 0);
+    function takerFeeEbp(uint256 currentPrice) external view returns (uint256 f) {
+        (f,) = RiskParamsLib.getInsuranceFeeRates(
+            pairVault, lastPairPrice, liquidationGapEma, reopenGapEma, currentPrice, true, 0
+        );
     }
 }
 
@@ -40,7 +43,7 @@ contract RiskParamsLibTest is Test {
 
     function setUp() public {
         h = new RiskParamsHarness();
-        h.setOI(1_000_000 * SCALE, 0); // $1M OI notional at PRICE
+        h.setOI(1_000_000 * SCALE, 1_000_000 * SCALE); // matched book, $1M OI notional per side at PRICE
     }
 
     /// @notice Base fee endpoints: 0.5 bp (50 EBP) at the 2% target, 2 bp (200 EBP) at the 10% target.
@@ -57,10 +60,11 @@ contract RiskParamsLibTest is Test {
         assertEq(h.takerFeeEbp(PRICE), 50, "0.5 bp when fund is at target");
     }
 
-    /// @notice Fund at 2x target → surplus discount reaches zero fee.
-    function test_TakerInsuranceFee_SurplusReachesZero() public {
+    /// @notice Fund at 2x target → still the base fee. The base rate is a floor: however
+    ///         overfull the fund is, new flow pays for the coverage it consumes.
+    function test_TakerInsuranceFee_AboveTargetFloorsAtBase() public {
         h.setInsurance(40_000 * SCALE); // 4% vs 2% target
-        assertEq(h.takerFeeEbp(PRICE), 0, "fee fully discounted at 2x target");
+        assertEq(h.takerFeeEbp(PRICE), 50, "no discount above target");
     }
 
     /// @notice 75% deficit → fBase x (1 + 49 x 0.75^2) = 50 x 28.5625 → 1,428 EBP ≈ 14.3 bp.
@@ -69,17 +73,17 @@ contract RiskParamsLibTest is Test {
         assertEq(h.takerFeeEbp(PRICE), 1_428, "quadratic deficit multiplier");
     }
 
-    /// @notice Worst case — max-vol target, empty fund → uncapped 200 x 50 = 10,000 EBP, capped at 4,500 EBP = 45 bp.
+    /// @notice Worst case — extreme vol, empty fund → uncapped 96 x 50 = 4,800 EBP, capped at 4,500 EBP = 45 bp.
     function test_TakerInsuranceFee_CapsAt45Bp() public {
-        h.setVariance(100_000_000); // VARIANCE_EXTREME → 10% target, fBase = 200 EBP
+        h.setVariance(100_000_000); // VARIANCE_EXTREME → 4.5% target, fBase = 96 EBP
         h.setInsurance(0); // full deficit, δ = 1
         assertEq(h.takerFeeEbp(PRICE), 4_500, "hard cap is 45 bp, not 45%");
     }
 
-    /// @notice No open interest → infinite coverage → zero fee.
+    /// @notice No open interest → infinite coverage, which is the above-target arm → base fee.
     function test_TakerInsuranceFee_ZeroOI() public {
         h.setOI(0, 0);
         h.setInsurance(1 * SCALE);
-        assertEq(h.takerFeeEbp(PRICE), 0, "no OI, no fee");
+        assertEq(h.takerFeeEbp(PRICE), 50, "infinite coverage still pays the base rate");
     }
 }

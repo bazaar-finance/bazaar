@@ -39,10 +39,11 @@ make deploy-anvil    # terminal 2 — full stack + MockPyth/MockUSDC/MockOOv3, m
 Deployed addresses land in `.anvil-addresses`. From there:
 
 ```bash
-# List a market (proposes via mock UMA, warps past liveness, settles)
-make deploy-pair-anvil FEED_ID=0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace DESC="ETH/USD"
+# List a market (seeds a mock Pyth price for a feed the mock has never seen, proposes via
+# mock UMA, warps past liveness, settles)
+make deploy-pair-anvil FEED_ID=0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace DESC="ETH/USD" PRICE=2000
 
-# Push a mock Pyth price
+# Push a fresh mock Pyth price
 make set-price-anvil FEED_ID=0xff61... PRICE=2000
 
 # Rest a limit order

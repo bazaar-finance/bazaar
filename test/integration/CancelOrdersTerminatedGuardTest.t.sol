@@ -3,22 +3,17 @@ pragma solidity 0.8.34;
 
 import {IntegrationBase} from "./IntegrationBase.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
-import {BazaarPair} from "../../src/BazaarPair.sol";
 import {MetaTxLib} from "../../src/libraries/MetaTxLib.sol";
 
-/// @notice The terminated-pair arm of the cancelOrders relayer-fee guard.
+/// @notice The terminated-pair arm of the relayer-fee tests.
 ///
-///         `_requireNoSweepWindow` deliberately LIFTS once the pair terminates
-///         (`&& !isPairTerminatedEmergency && !isPairTerminatedNormal`), and `_terminatePair`
-///         force-clears `isAdlPending` — it must, or terminal settlement withdrawals would
-///         brick. So on a terminated pair neither of those blocks anything on its own, and a
-///         relayer-fee debit reading raw `bucket.collateral` would bypass the terminal haircut
-///         that the sanctioned exit applies: a user entitled to 50 cents on the dollar could
-///         self-relay cancelOrders and take 100.
-///
-///         The guard therefore has to test the terminated flags EXPLICITLY rather than lean on
-///         the sweep-window helper — that is what `_requireNotHalted` is for, and this test is
-///         what pins it.
+///         `_requireNoSweepWindow` deliberately LIFTS once the pair terminates, and
+///         `_terminatePair` force-clears `isAdlPending` — it must, or terminal settlement
+///         withdrawals would brick. So on a terminated pair no lifecycle gate stands between a
+///         relayed cancel and the bucket; what keeps the terminal haircut intact is that the fee
+///         never comes from the bucket at all. A user entitled to 50 cents on the dollar cannot
+///         self-relay cancelOrders and take 100: the dollar the relayer is owed is the user's
+///         own wallet USDC, and the principal stays inside the settlement untouched.
 ///
 ///         Termination is reached through the real two-stage path (fix price → wait out the
 ///         48h window → finalize) rather than by poking storage: the terminated flags are
@@ -37,8 +32,6 @@ contract CancelOrdersTerminatedGuardTest is IntegrationBase {
         return abi.encodePacked(r, s, v);
     }
 
-    /// @dev Build without submitting — the build makes external calls that would swallow a
-    ///      preceding vm.expectRevert. See the sibling suite for the full note.
     function _buildRelayedCancel(address user, uint256 pk, uint256[] memory ids) internal returns (CancelReq memory r) {
         r.nonce = pair.metaTxNonces(user);
         r.deadline = vm.getBlockTimestamp() + MetaTxLib.MAX_DEADLINE_WINDOW;
@@ -49,43 +42,53 @@ contract CancelOrdersTerminatedGuardTest is IntegrationBase {
         r.sig = _sign(pk, structHash);
     }
 
-    /// @dev Real normal termination: stage 1 fixes the settlement price and opens the 48h sweep
-    ///      window, stage 2 is permissionless once it elapses.
+    /// @dev Real termination: stage 1 fixes the settlement price and opens the settlement
+    ///      window; with no position open, stage 2 is permissionless at once.
     function _terminateForReal() internal {
         vm.prank(pair.umaContract());
         pair.fixSettlementPrice(50_000 * BAZAAR_SCALE);
-        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
         pair.finalizeTermination();
-        assertTrue(pair.isPairTerminatedNormal(), "pair terminated");
+        assertTrue(pair.isPairTerminated(), "pair terminated");
         assertFalse(pair.isAdlPending(), "termination clears the ADL flag");
     }
 
-    function test_relayedCancel_blockedAfterTermination() public {
+    /// @notice A relayed cancel on a terminated pair cancels the order and accrues the relayer's
+    ///         fee from the signer's wallet — claimable even though the pair is terminated; the
+    ///         bucket and D stay inside the terminal settlement.
+    function test_relayedCancel_allowedAfterTermination_principalStaysInSettlement() public {
         (address user, uint256 pk) = makeAddrAndKey("terminatedGuard");
         address relayerEoa = makeAddr("terminatedSecondEOA");
         usdc.mint(user, 200_000 * USDC_SCALE);
 
         _deposit(user, 10_000 * BAZAAR_SCALE);
+        // _deposit approves exactly the deposit; the relayed fee needs its own allowance.
+        vm.prank(user);
+        usdc.approve(address(pair), type(uint256).max);
         // Placed before termination — createOrder is itself halted once terminated.
         uint256 orderId = _placeLimit(user, true, BAZAAR_SCALE / 10, 45_000 * BAZAAR_SCALE);
 
         _terminateForReal();
 
         uint256 collBefore = _posCollateral(user);
+        uint256 dBefore = _totalDeposited();
+        uint256 walletBefore = usdc.balanceOf(user);
         uint256[] memory ids = _one(orderId);
         CancelReq memory r = _buildRelayedCancel(user, pk, ids);
 
         vm.prank(relayerEoa);
-        vm.expectRevert(BazaarPair.BazaarPair__TradingHalted.selector);
-        pair.cancelOrders(ids, r.nonce, r.deadline, r.fee, r.sig);
+        pair.cancelOrders(ids, r.nonce, r.deadline, r.fee, r.sig, "");
 
+        uint256 feeUsdc = MetaTxLib.MAX_RELAYER_FEE / 1e12;
+        assertGt(_canceledBlock(orderId), 0, "relayed cancel works when terminated");
         assertEq(_posCollateral(user), collBefore, "principal stays inside the terminal settlement");
-        assertEq(usdc.balanceOf(relayerEoa), 0, "no pre-haircut extraction");
-        assertEq(_canceledBlock(orderId), 0, "order untouched");
+        assertEq(_totalDeposited(), dBefore, "D untouched");
+        assertEq(_escrowOwed(relayerEoa), MetaTxLib.MAX_RELAYER_FEE, "fee accrued to the relayer");
+        assertEq(walletBefore - usdc.balanceOf(user), feeUsdc, "...from the signer's wallet");
+        assertEq(_claimFees(relayerEoa), feeUsdc, "claimable on a terminated pair");
     }
 
-    /// @notice A terminated pair must still let users cancel under their own gas — the guard is
-    ///         scoped to the fee debit, not to cancellation itself.
+    /// @notice A terminated pair must still let users cancel under their own gas: no signature,
+    ///         no fee, no wallet pull.
     function test_selfSubmittedCancel_allowedAfterTermination() public {
         (address user,) = makeAddrAndKey("terminatedSelf");
         usdc.mint(user, 200_000 * USDC_SCALE);
@@ -98,7 +101,7 @@ contract CancelOrdersTerminatedGuardTest is IntegrationBase {
         uint256 collBefore = _posCollateral(user);
 
         vm.prank(user);
-        pair.cancelOrders(_one(orderId), 0, 0, 0, "");
+        pair.cancelOrders(_one(orderId), 0, 0, 0, "", "");
 
         assertGt(_canceledBlock(orderId), 0, "self-submitted cancel still works when terminated");
         assertEq(_posCollateral(user), collBefore, "and moves no collateral");

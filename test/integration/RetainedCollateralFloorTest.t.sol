@@ -8,10 +8,10 @@ import {CollateralLib} from "../../src/libraries/CollateralLib.sol";
 
 /// @notice The withdrawal margin check is EQUITY-based (collateral + unrealized PnL), so without a
 ///         retention floor a deeply profitable position could withdraw 100% of its deposit and keep
-///         the position open on paper profit alone. That state fails two ways: every fee is charged
-///         against `bucket.collateral` (MatchingEngineLib._checkMargin rejects a fill whose fee
-///         exceeds collateral and the caller then AUTO-CANCELS the order, and _chargeRelayerFee
-///         reverts), and paper profit evaporates in the same adverse move it would need to buffer.
+///         the position open on paper profit alone. That state fails two ways: every trading fee is
+///         charged against `bucket.collateral` (MatchingEngineLib._checkMargin rejects a fill whose
+///         fee exceeds collateral and the caller then AUTO-CANCELS the order), and paper profit
+///         evaporates in the same adverse move it would need to buffer.
 ///         A position-holding account must therefore retain real cash: mmrBp of current notional
 ///         on a continuously traded pair (liquidation can interpose at the maintenance line), and
 ///         imrBp on a session-bound pair (a reopen jumps liquidation entirely). This suite runs on
@@ -24,7 +24,7 @@ contract RetainedCollateralFloorTest is IntegrationBase {
     function _floorForLong(uint256 sizeWad, uint256 spotUsd) internal view returns (uint256) {
         uint256 lowPrice = (spotUsd - spotUsd / 1000) * BAZAAR_SCALE;
         uint256 notional = sizeWad * lowPrice / BAZAAR_SCALE;
-        (, uint256 mmrBp,,) = pair.marginRequirements();
+        (, uint256 mmrBp,,,) = pair.marginRequirements();
         return notional * mmrBp / BazaarTypes.BP_SCALE;
     }
 

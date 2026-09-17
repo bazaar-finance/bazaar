@@ -5,9 +5,11 @@ import {IntegrationBase} from "./IntegrationBase.sol";
 import {StdStorage, stdStorage} from "forge-std/Test.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 import {CollateralLib} from "../../src/libraries/CollateralLib.sol";
+import {BucketStore} from "../BucketStore.sol";
 
 /// @title StaleAndRewardEdgeTest
-/// @notice Stale-oracle margin/liquidation posture and the liquidator-reward soft-fail arms.
+/// @notice Stale-oracle margin/liquidation posture and the liquidator-reward edge arms (an
+///         unreachable liquidator, an unaffordable reward).
 contract StaleAndRewardEdgeTest is IntegrationBase {
     using stdStorage for StdStorage;
 
@@ -26,7 +28,7 @@ contract StaleAndRewardEdgeTest is IntegrationBase {
         s.limitPrice = limitPrice;
         s.expirationBlock = uint64(vm.getBlockNumber() + 500_000);
         vm.prank(user);
-        aaplPair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        aaplPair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
     }
 
     // ============================ stale creation margin ============================
@@ -48,7 +50,7 @@ contract StaleAndRewardEdgeTest is IntegrationBase {
 
         // Cancel, stale the cache, retry with an empty update: the SAME 1x IMR still clears.
         vm.prank(alice);
-        aaplPair.cancelOrders(ids, 0, 0, 0, "");
+        aaplPair.cancelOrders(ids, 0, 0, 0, "", "");
         vm.warp(vm.getBlockTimestamp() + 30);
         _placeLimitAapl(alice, 1 * BAZAAR_SCALE, 200 * BAZAAR_SCALE, new bytes[](0));
         (uint256[] memory staleIds,,,) = aaplPair.getUserActiveLimitOrders(alice);
@@ -70,11 +72,9 @@ contract StaleAndRewardEdgeTest is IntegrationBase {
         aaplPair.refreshPrice(new bytes[](0));
 
         _depositAapl(dave, 200 * BAZAAR_SCALE);
-        _stdstore.target(address(aaplPair)).sig("positionBuckets(address)").with_key(dave).depth(0).checked_write(true);
-        _stdstore.target(address(aaplPair)).sig("positionBuckets(address)").with_key(dave).depth(1)
-            .checked_write(1 * BAZAAR_SCALE); // size
-        _stdstore.target(address(aaplPair)).sig("positionBuckets(address)").with_key(dave).depth(2)
-            .checked_write(200 * BAZAAR_SCALE); // entryValue
+        BucketStore.setIsLong(address(aaplPair), dave, true);
+        BucketStore.setSize(address(aaplPair), dave, 1 * BAZAAR_SCALE); // size
+        BucketStore.setEntryValue(address(aaplPair), dave, 200 * BAZAAR_SCALE); // entryValue
 
         vm.warp(vm.getBlockTimestamp() + 30); // stale the cache (MAX_PRICE_STALENESS = 2s)
         vm.prank(dave);
@@ -123,11 +123,9 @@ contract StaleAndRewardEdgeTest is IntegrationBase {
         aaplPair.refreshPrice(new bytes[](0));
 
         _depositAapl(dave, 10 * BAZAAR_SCALE);
-        _stdstore.target(address(aaplPair)).sig("positionBuckets(address)").with_key(dave).depth(0).checked_write(true);
-        _stdstore.target(address(aaplPair)).sig("positionBuckets(address)").with_key(dave).depth(1)
-            .checked_write(1 * BAZAAR_SCALE);
-        _stdstore.target(address(aaplPair)).sig("positionBuckets(address)").with_key(dave).depth(2)
-            .checked_write(300 * BAZAAR_SCALE);
+        BucketStore.setIsLong(address(aaplPair), dave, true);
+        BucketStore.setSize(address(aaplPair), dave, 1 * BAZAAR_SCALE);
+        BucketStore.setEntryValue(address(aaplPair), dave, 300 * BAZAAR_SCALE);
 
         vm.warp(vm.getBlockTimestamp() + 30); // stale (MAX_PRICE_STALENESS = 2s)
         vm.prank(bob);
@@ -145,25 +143,36 @@ contract StaleAndRewardEdgeTest is IntegrationBase {
         pair.liquidate(_arr1(alice), new bytes[](0));
     }
 
-    // ============================ liquidator reward soft-fail ============================
+    // ============================ liquidator reward edges ============================
 
     /// @notice A liquidator that cannot receive USDC does not poison the liquidation: the reward
-    ///         debit is restored to insurance and the liquidation still commits.
-    function test_reward_transferFailureRestoresInsurance() public {
+    ///         accrues to its claimable balance with insurance debited exactly once, the
+    ///         liquidation commits, and only the later claim — the liquidator's own call — fails
+    ///         while the address stays unreachable, leaving the balance intact for a retry.
+    function test_reward_unreachableLiquidator_accruesAndClaimFails() public {
         _setupInsolventAlice();
         address liquidator = makeAddr("unreachableLiquidator");
         uint256 insBefore = _insuranceBal();
 
         bytes[] memory pu = _freshPrice();
+        vm.prank(liquidator);
+        assertEq(pair.liquidate(_arr1(alice), pu), 1, "liquidation commits regardless");
+
+        uint256 reward = _escrowOwed(liquidator);
+        assertGt(reward, 0, "reward accrued");
+        assertEq(usdc.balanceOf(liquidator), 0, "nothing pushed");
+        // Insurance ends at +seized collateral - reward: the debit funds the escrow credit.
+        assertEq(_insuranceBal() + reward - insBefore, 10 * BAZAAR_SCALE, "seizure in, reward out");
+        _assertBooks("after liquidation");
+
         // Any USDC transfer to this liquidator silently fails (e.g. blacklisted).
         vm.mockCall(address(usdc), abi.encodeWithSignature("transfer(address,uint256)", liquidator), abi.encode(false));
         vm.prank(liquidator);
-        assertEq(pair.liquidate(_arr1(alice), pu), 1, "liquidation commits regardless");
+        vm.expectRevert(CollateralLib.CollateralLib__ClaimTransferFailed.selector);
+        pair.claimFees();
         vm.clearMockedCalls();
 
-        assertEq(usdc.balanceOf(liquidator), 0, "no reward received");
-        // Insurance ends at +seized collateral exactly: the reward debit was restored.
-        assertEq(_insuranceBal() - insBefore, 10 * BAZAAR_SCALE, "reward restored, seizure kept");
+        assertEq(_escrowOwed(liquidator), reward, "failed claim leaves the balance for a retry");
     }
 
     /// @notice When insurance cannot afford the reward at all, it is skipped and the liquidation
@@ -172,14 +181,13 @@ contract StaleAndRewardEdgeTest is IntegrationBase {
         // Zero-collateral phantom victim (nothing seized) + insurance crushed to zero.
         _deposit(dave, 10 * BAZAAR_SCALE);
         _writePosition(dave, true, BAZAAR_SCALE / 10, 5_005 * BAZAAR_SCALE);
-        _stdstore.target(address(pair)).sig("positionBuckets(address)").with_key(dave).depth(3)
-            .checked_write(uint256(0));
+        BucketStore.setCollateral(address(pair), dave, uint256(0));
         _stdstore.target(address(pair)).sig("pairVault()").depth(5).checked_write(uint256(0));
 
         address liquidator = makeAddr("unpaidLiquidator");
         bytes[] memory pu = _freshPrice();
         vm.prank(liquidator);
         assertEq(pair.liquidate(_arr1(dave), pu), 1, "liquidation commits");
-        assertEq(usdc.balanceOf(liquidator), 0, "reward skipped, not reverted");
+        assertEq(_escrowOwed(liquidator), 0, "reward skipped, not reverted");
     }
 }

@@ -2,6 +2,7 @@
 pragma solidity 0.8.34;
 
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {BazaarTypes} from "./BazaarTypes.sol";
 import {BazaarMathLib} from "./BazaarMathLib.sol";
 
@@ -10,7 +11,9 @@ import {BazaarMathLib} from "./BazaarMathLib.sol";
 ///         Inlined at compile time — shared between BazaarPair and MatchingEngineLib.
 library BucketLib {
     /// @notice Calculates bucket state from a memory bucket snapshot and current market data.
-    /// @dev Pure function — does not access storage. Caller passes all needed inputs.
+    /// @dev Pure — reads neither storage nor the environment. The caller passes all needed inputs,
+    ///      including the batch's lagged MMR sample, so the same bucket image evaluates identically
+    ///      whether it is read from storage or carried through a matching walk in memory.
     /// @param bucket The position bucket (memory copy)
     /// @param currentPrice The current spot price (BAZAAR precision)
     /// @param currentFundingIndex The current global funding index
@@ -21,7 +24,7 @@ library BucketLib {
         uint256 currentPrice,
         int256 currentFundingIndex,
         BazaarTypes.MarginRequirements memory marginReqs
-    ) internal view returns (BazaarTypes.BucketState memory result) {
+    ) internal pure returns (BazaarTypes.BucketState memory result) {
         result.effectiveCollateral = bucket.collateral;
         result.entryMmrBp = bucket.entryMmrBp;
         result.mmrUpdateTs = bucket.mmrUpdateTs;
@@ -71,8 +74,9 @@ library BucketLib {
         result.availableEquity = signedEquity > 0 ? uint256(signedEquity) : 0;
 
         // Min required collateral (using the 24h-lagged effective MMR)
-        uint256 effectiveMmrBp =
-            effectiveMmr(bucket.mmrUpdateTs, bucket.entryMmrBp, marginReqs.laggedMmrBp, marginReqs.mmrBp);
+        uint256 effectiveMmrBp = effectiveMmr(
+            bucket.mmrUpdateTs, bucket.entryMmrBp, marginReqs.laggedMmrBp, marginReqs.laggedMmrTs, marginReqs.mmrBp
+        );
         result.minRequiredCollateral = Math.mulDiv(effectiveMmrBp, result.currentNotional, BazaarTypes.BP_SCALE);
 
         // Solvency
@@ -84,27 +88,43 @@ library BucketLib {
     /// @notice Resolves the maintenance-margin rate a position is judged against, implementing
     ///         the 24h-lagged grace: a rising MMR cannot liquidate an existing position for
     ///         MMR_GRACE_PERIOD, while a falling MMR helps immediately.
-    /// @dev `view` (not pure) because it reads block.timestamp. Shared by calculateState and the
-    ///      partial-close margin check in MatchingEngineLib so the two stay consistent.
+    /// @dev The lagged sample is adopted only when it was recorded at or after the position's own
+    ///      mmrUpdateTs. That single comparison also subsumes the age gate the grace needs:
+    ///      laggedMmr only ever returns a sample stamped a full MMR_GRACE_PERIOD before the mark
+    ///      being valued against, and that mark is never dated after the current block, so
+    ///      laggedMmrTs >= mmrUpdateTs already implies the position is at least MMR_GRACE_PERIOD
+    ///      old, and a younger position necessarily fails it and keeps its entry MMR.
+    ///
+    ///      The comparison is load-bearing, not a refinement. The sample grid is
+    ///      MMR_SAMPLE_INTERVAL-spaced while the rate moves on IMR_UPDATE_COOLDOWN, so a rate
+    ///      increase landing between two grid points is recorded under the *later* point's
+    ///      timestamp. A position opened in that shadow carries the raised entryMmrBp, and at the
+    ///      moment it crosses the grace period its cutoff equals its own mmrUpdateTs exactly —
+    ///      selecting the last sample taken before it existed. Without the check that pre-open
+    ///      rate would replace the entry rate, handing the position a requirement it never opened
+    ///      under until the cutoff walks past its first post-open sample.
+    ///
+    ///      Shared by calculateState and the partial-close margin check in MatchingEngineLib so
+    ///      the two stay consistent.
     /// @param mmrUpdateTs  Timestamp the position's entry MMR was last set (0 when flat).
-    /// @param entryMmrBp   The position's entry MMR.
-    /// @param laggedMmrBp  Newest sample >= MMR_GRACE_PERIOD old for this batch (0 if none).
+    /// @param entryMmrBp   The position's entry MMR, i.e. the rate as of mmrUpdateTs.
+    /// @param laggedMmrBp  Newest sample a full MMR_GRACE_PERIOD before this batch's mark (0 if none).
+    /// @param laggedMmrTs  Timestamp that sample was recorded at (0 when there is none).
     /// @param currentMmrBp The pair's current MMR.
     /// @return The effective maintenance MMR in basis points.
-    function effectiveMmr(uint256 mmrUpdateTs, uint256 entryMmrBp, uint256 laggedMmrBp, uint256 currentMmrBp)
-        internal
-        view
-        returns (uint256)
-    {
-        // Reference MMR: a position older than the grace period is judged against the lagged
-        // sample; a newer position — or an older one with no sample that old yet — uses its
-        // entry MMR. A 0 reference (entry MMR never set) falls back to the current rate.
-        uint256 refMmr;
-        if (mmrUpdateTs != 0 && block.timestamp - mmrUpdateTs >= BazaarTypes.MMR_GRACE_PERIOD && laggedMmrBp != 0) {
-            refMmr = laggedMmrBp;
-        } else {
-            refMmr = entryMmrBp;
-        }
+    function effectiveMmr(
+        uint256 mmrUpdateTs,
+        uint256 entryMmrBp,
+        uint256 laggedMmrBp,
+        uint256 laggedMmrTs,
+        uint256 currentMmrBp
+    ) internal pure returns (uint256) {
+        // Reference MMR: the lagged sample when it describes a rate this position actually opened
+        // under, otherwise the position's own entry MMR. The mmrUpdateTs != 0 guard keeps a bucket
+        // that was never stamped (flat, or reached before its first fill) out of the lagged branch,
+        // where a 0 stamp would compare true against any sample; it falls to entryMmrBp == 0 and
+        // then to the current rate below.
+        uint256 refMmr = (mmrUpdateTs != 0 && laggedMmrTs >= mmrUpdateTs) ? laggedMmrBp : entryMmrBp;
         // Lower of reference vs current.
         return (refMmr != 0 && refMmr < currentMmrBp) ? refMmr : currentMmrBp;
     }
@@ -115,12 +135,48 @@ library BucketLib {
     function updateFromState(BazaarTypes.PositionBucket storage bucket, BazaarTypes.BucketState memory newState)
         internal
     {
-        bucket.size = newState.adjustedSize;
-        bucket.entryValue = newState.entryValue;
-        bucket.collateral = newState.effectiveCollateral;
+        bucket.size = SafeCast.toUint128(newState.adjustedSize);
+        bucket.entryValue = SafeCast.toUint128(newState.entryValue);
+        bucket.collateral = SafeCast.toUint128(newState.effectiveCollateral);
         bucket.entryFundingIndex = newState.adjustedEntryFundingIndex;
-        bucket.entryMmrBp = newState.entryMmrBp;
-        bucket.mmrUpdateTs = newState.mmrUpdateTs;
+        bucket.entryMmrBp = SafeCast.toUint32(newState.entryMmrBp);
+        bucket.mmrUpdateTs = SafeCast.toUint64(newState.mmrUpdateTs);
+    }
+
+    /// @notice Memory twin of updateFromState, for a bucket image carried across a matching
+    ///         walk (the taker's). Field mapping must stay identical to updateFromState: the
+    ///         image is re-read by calculateState between fills exactly as a stored bucket
+    ///         would be, and is flushed to storage once at walk end.
+    /// @param bucket Memory image of the bucket
+    /// @param newState The calculated bucket state to apply
+    function updateMemoryFromState(BazaarTypes.PositionBucket memory bucket, BazaarTypes.BucketState memory newState)
+        internal
+        pure
+    {
+        bucket.size = SafeCast.toUint128(newState.adjustedSize);
+        bucket.entryValue = SafeCast.toUint128(newState.entryValue);
+        bucket.collateral = SafeCast.toUint128(newState.effectiveCollateral);
+        bucket.entryFundingIndex = newState.adjustedEntryFundingIndex;
+        bucket.entryMmrBp = SafeCast.toUint32(newState.entryMmrBp);
+        bucket.mmrUpdateTs = SafeCast.toUint64(newState.mmrUpdateTs);
+    }
+
+    /// @notice Flush a walk-carried bucket image back to storage — the write half of the
+    ///         memory-taker pattern. Writes only the fields the fill path owns (the same set
+    ///         updateFromState writes, plus the position side and the TP/SL slot pointers,
+    ///         which the walk maintains in the image).
+    function storeFromMemory(BazaarTypes.PositionBucket storage bucket, BazaarTypes.PositionBucket memory image)
+        internal
+    {
+        bucket.isLong = image.isLong;
+        bucket.size = image.size;
+        bucket.entryValue = image.entryValue;
+        bucket.collateral = image.collateral;
+        bucket.entryFundingIndex = image.entryFundingIndex;
+        bucket.takeProfitOrderId = image.takeProfitOrderId;
+        bucket.stopLossOrderId = image.stopLossOrderId;
+        bucket.entryMmrBp = image.entryMmrBp;
+        bucket.mmrUpdateTs = image.mmrUpdateTs;
     }
 
     /// @notice Emits the PositionBucketUpdated event for off-chain indexers.

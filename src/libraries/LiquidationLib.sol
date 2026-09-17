@@ -5,7 +5,9 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {BazaarTypes} from "./BazaarTypes.sol";
 import {BucketLib} from "./BucketLib.sol";
 import {BazaarMathLib} from "./BazaarMathLib.sol";
+import {FeeEscrowLib} from "./FeeEscrowLib.sol";
 import {OrderBookLib} from "./OrderBookLib.sol";
+import {RiskParamsLib} from "./RiskParamsLib.sol";
 
 /// @title LiquidationLib
 /// @notice External library for liquidation processing logic.
@@ -37,15 +39,19 @@ library LiquidationLib {
     /// @notice Processes liquidations for a list of users
     /// @dev Iterates through users, checks solvency, and aggregates liquidated positions into
     ///      the vault's pending liquidation tracking. Opposing liquidations are netted immediately.
-    ///      Caller is responsible for USDC transfer of totalUpfrontReward to the liquidator.
     ///      Reward per position = max(MIN_LIQUIDATOR_REWARD, LIQUIDATION_FEE_EBP of notional),
-    ///      paid unconditionally at liquidation time (no profit-contingent component).
+    ///      earned at liquidation time with no profit-contingent component; the batch total is
+    ///      debited from insurance, capped at the fund's free capital, and accrued to the
+    ///      liquidator's claimable balance here, to be pulled via BazaarPair.claimFees.
+    ///      `LiquidateResult.totalUpfrontReward` reports what the cap left, not what the rate
+    ///      came to.
     function processLiquidations(
         address[] calldata usersToLiquidate,
         mapping(uint256 => BazaarTypes.Order) storage orders,
         BazaarTypes.OrderBook storage book,
         mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
         BazaarTypes.Vault storage pairVault,
+        BazaarTypes.FeeEscrow storage feeEscrow,
         BazaarTypes.LiquidateParams memory params
     ) external returns (BazaarTypes.LiquidateResult memory result) {
         for (uint256 i = 0; i < usersToLiquidate.length; i++) {
@@ -122,9 +128,10 @@ library LiquidationLib {
                 params.currentBlock
             );
 
-            // Unconditional liquidator reward: max(floor, LIQUIDATION_FEE_EBP of notional),
-            // paid now regardless of how the vault later closes the inherited position.
-            // The floor covers gas on small positions; the bps term scales with size.
+            // Liquidator reward: max(floor, LIQUIDATION_FEE_EBP of notional), earned now
+            // regardless of how the vault later closes the inherited position and paid after
+            // the batch from the fund's free capital. The floor covers gas on small positions;
+            // the bps term scales with size.
             uint256 notional = Math.mulDiv(positionSize, params.currentPrice, BAZAAR_SCALE);
             uint256 bpsReward = Math.mulDiv(notional, BazaarTypes.LIQUIDATION_FEE_EBP, BazaarTypes.EBP_SCALE);
             result.totalUpfrontReward += bpsReward > MIN_LIQUIDATOR_REWARD ? bpsReward : MIN_LIQUIDATOR_REWARD;
@@ -146,6 +153,7 @@ library LiquidationLib {
                 pairVault.pendingLiqSize = positionSize;
                 pairVault.pendingLiqEntryNotional = entryNotional;
                 pairVault.pendingLiqBankruptcyNotional = bankruptcyNotional;
+                pairVault.pendingLiqSeized = seized;
                 pairVault.pendingLiqEntryFundingIndex = state.adjustedEntryFundingIndex;
                 pairVault.pendingLiqIsLong = isLong;
             } else if (isLong == pairVault.pendingLiqIsLong) {
@@ -159,10 +167,17 @@ library LiquidationLib {
                 pairVault.pendingLiqSize = newTotalSize;
                 pairVault.pendingLiqEntryNotional += entryNotional;
                 pairVault.pendingLiqBankruptcyNotional += bankruptcyNotional;
+                pairVault.pendingLiqSeized += seized;
             } else {
                 // Opposite direction — net against existing aggregate
                 _netOpposingLiquidation(
-                    pairVault, positionSize, entryNotional, bankruptcyNotional, isLong, state.adjustedEntryFundingIndex
+                    pairVault,
+                    positionSize,
+                    entryNotional,
+                    bankruptcyNotional,
+                    seized,
+                    isLong,
+                    state.adjustedEntryFundingIndex
                 );
             }
 
@@ -183,37 +198,24 @@ library LiquidationLib {
             }
         }
 
-        // Pay the liquidator reward here rather than in BazaarPair (EIP-170 relief; DELEGATECALL
-        // preserves msg.sender = caller and address(this) = pair). Debited from insurance so the
-        // bookkeeping tracks the real USDC leaving the contract (Check-3 invariant); soft-fail
-        // restores the debit — the liquidations themselves still commit. Skipped entirely when
-        // the fund can't cover it (no partial payment).
-        if (result.totalUpfrontReward > 0 && pairVault.insuranceFundBalance >= result.totalUpfrontReward) {
-            pairVault.insuranceFundBalance -= result.totalUpfrontReward;
-            if (!_trySendReward(params.usdc, msg.sender, result.totalUpfrontReward)) {
-                pairVault.insuranceFundBalance += result.totalUpfrontReward;
-            }
+        // The reward moves from insurance into the fee escrow here rather than in BazaarPair
+        // (DELEGATECALL preserves msg.sender = caller), keeping the pair's EIP-170 budget free
+        // of it. Insurance and the escrow liability move together, so the books-vs-cash check
+        // stays exact, and the liquidation never runs a token transfer — nothing a liquidator's
+        // address does can revert or strand it. Capped at the fund's free capital, which the
+        // seizures just credited do not raise: they are earmarked against the inventory they
+        // arrived with, and a reward drawn from them would resurface as a shortfall when that
+        // inventory settles — deficit on an unload fill, funding withheld from a deleveraged
+        // winner. The reserve may pay it; the earmark may not. The liquidations themselves
+        // commit whatever is paid.
+        uint256 reward = result.totalUpfrontReward;
+        uint256 free = RiskParamsLib.insuranceFreeCapital(pairVault);
+        if (reward > free) reward = free;
+        result.totalUpfrontReward = reward;
+        if (reward > 0) {
+            pairVault.insuranceFundBalance -= reward;
+            FeeEscrowLib.credit(feeEscrow, params.pairId, msg.sender, reward);
         }
-    }
-
-    /// @notice Soft-fail USDC transfer for the liquidator reward (mirrors BazaarPair's
-    ///         _trySendUsdcReward). Returns false instead of reverting so an unreceivable
-    ///         liquidator (blacklisted, reverting receiver) can never block liquidations.
-    function _trySendReward(address usdc, address to, uint256 amountBazaarPrecision) internal returns (bool) {
-        if (usdc == address(0) || to == address(0) || amountBazaarPrecision == 0) return false;
-        uint256 usdcAmount = uint256(
-            BazaarMathLib.convertExponent(
-                int256(amountBazaarPrecision), BazaarTypes.BAZAAR_EXPONENT, BazaarTypes.USDC_EXPONENT
-            )
-        );
-        if (usdcAmount == 0) return false;
-        (bool callOk, bytes memory data) =
-            usdc.call(
-                abi.encodeWithSelector(0xa9059cbb, to, usdcAmount) // transfer(address,uint256)
-            );
-        if (!callOk) return false;
-        if (data.length == 0) return true; // non-compliant token that doesn't return bool
-        return abi.decode(data, (bool));
     }
 
     // -------------------- Internal --------------------
@@ -229,6 +231,7 @@ library LiquidationLib {
         uint256 newSize,
         uint256 newEntryNotional,
         uint256 newBankruptcyNotional,
+        uint256 newSeized,
         bool newIsLong,
         int256 newEntryFundingIndex
     ) internal {
@@ -286,11 +289,14 @@ library LiquidationLib {
             }
         }
 
-        // Reduce existing aggregate proportionally
+        // Reduce existing aggregate proportionally. The netted portion's seizure stays in the
+        // fund as realized: it is no longer earmarked against anything.
         uint256 existingBankruptcyPortion = Math.mulDiv(pairVault.pendingLiqBankruptcyNotional, netSize, existingSize);
+        uint256 existingSeizedPortion = Math.mulDiv(pairVault.pendingLiqSeized, netSize, existingSize);
         pairVault.pendingLiqSize -= netSize;
         pairVault.pendingLiqEntryNotional -= existingEntryPortion;
         pairVault.pendingLiqBankruptcyNotional -= existingBankruptcyPortion;
+        pairVault.pendingLiqSeized -= existingSeizedPortion;
 
         // Handle remainder of the new liquidation
         uint256 remainingNewSize = newSize - netSize;
@@ -301,6 +307,7 @@ library LiquidationLib {
             pairVault.pendingLiqSize = remainingNewSize;
             pairVault.pendingLiqEntryNotional = remainingEntryNotional;
             pairVault.pendingLiqBankruptcyNotional = remainingBankruptcyNotional;
+            pairVault.pendingLiqSeized = Math.mulDiv(newSeized, remainingNewSize, newSize);
             pairVault.pendingLiqEntryFundingIndex = newEntryFundingIndex;
             pairVault.pendingLiqIsLong = newIsLong;
         }

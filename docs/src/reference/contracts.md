@@ -13,12 +13,13 @@ One EIP-1167 clone per market. Initialized once by the factory.
 | `executeTriggeredOrders(execs[], …)` | anyone | fires triggered stops against a fresh Pyth price for a $0.25 tip per stop, charged to each stop's owner |
 | `unloadVault(maxSteps, …)` | anyone | crosses the vault's pending liquidation inventory into the book for a reward — see [Liquidations](../protocol/liquidations.md) |
 | `sweepExpired(orderIds[])` | anyone | janitor: cancels-and-unlinks expired orders that no walk has touched yet |
-| `liquidate(users[], …)` | anyone | full liquidation of insolvent buckets — and, once a settlement price is fixed, the terminal-settlement entry point (no price update, no ETH, no solvency threshold) |
+| `liquidate(users[], …)` | anyone | full liquidation of insolvent buckets — and, once a settlement price is fixed, the terminal-settlement entry point (no price update, no ETH, no solvency threshold; a $0.10 tip per position settled for someone else) |
 | `executeAdl(winners[], …)` | anyone | Dutch-auction deleveraging |
-| `depositToInsurance` / `requestInsuranceWithdrawal` / `executeInsuranceWithdrawal` | anyone / meta-tx | insurance LP flows |
+| `depositToInsurance` / `requestInsuranceWithdrawal` / `executeInsuranceWithdrawal` | anyone / meta-tx | insurance LP flows; the deposit and the execute both carry a `priceUpdate` and price shares at the mark — the execute needs a fresh one on a live pair (none once terminated), the deposit only while the vault holds liquidated inventory (empty update and no ETH otherwise) |
 | `refreshPrice` | anyone | push a Pyth update, roll funding/margin state |
+| `claimFees` / `claimableFees(address)` | anyone (pays only the caller's own balance) / view | withdraw every payout the pair owes the caller — keeper rewards, integrator fees, the bug-bounty tax, relayer fees, the UMA proposer reward — see [Fees](../protocol/fees.md#how-payouts-are-paid); open in every pair state |
 | `creditInsurance` | wired (terminator) | books forfeited insurer bonds |
-| `setScheduledTermination` / `fixSettlementPrice` | wired (terminator) | lifecycle transitions (`finalizeTermination` is public after the 48 h settlement window; settling positions at the fixed price runs through `liquidate`) |
+| `setScheduledTermination` / `fixSettlementPrice` | wired (terminator) | lifecycle transitions (`finalizeTermination` is public once every position is settled at the fixed price, or 14 days after the fix; settling runs through `liquidate`) |
 
 Key views: `book` (list heads and counts), `positionBuckets`, `orders` (including each order's `prevInBook`/`nextInBook` links), `lastPairPrice`, `getSharesAsOf`, plus everything on the lens.
 
@@ -50,7 +51,7 @@ Key views: `book` (list heads and counts), `positionBuckets`, `orders` (includin
 
 | Function | Access |
 |---|---|
-| `proposeTermination` / `proposePostCessationTermination` / `settleTerminationProposal` | anyone (bonded) — both proposals take a `pairDescription` and a `reason`, [charset- and length-bounded](../protocol/termination.md#proposer-supplied-text) |
+| `proposeTermination` / `settleTerminationProposal` | anyone (bonded) — the proposal takes a `pairDescription` and a `reason`, [charset- and length-bounded](../protocol/termination.md#proposer-supplied-text) |
 | `terminateScheduledPair` / `terminateStalePair` | anyone |
 | `proposeInsurerTermination` / `voteForInsurerTermination` / `executeInsurerTermination` | insurance shareholders (bonded) / anyone to execute |
 | `registerPair` | wired (factory) |
@@ -59,7 +60,7 @@ Key views: `book` (list heads and counts), `positionBuckets`, `orders` (includin
 
 ## BazaarPairLens — `src/BazaarPairLens.sol`
 
-Stateless views: `getPositionBucket`, `checkBucketSolvency`, `getInsuranceSharePrice`, `getInsuranceDepositValue`, `getAdlScoreThreshold`, `getAdlScore` (a candidate's auction score and eligibility, exactly as `executeAdl` ranks them — sort submissions by it descending), `getTerminalEntitlement` (post-termination payout components: collateral, registered claim, frozen ratio), `getTerminalSettlementBounty` (a sweep keeper's reward for settling a position at the fixed price), `getMaxWithdrawable` (the largest withdrawal the margin/retention gates would accept — pass the conservative bracket price: spot − conf for a long, spot + conf for a short), `getPendingLiquidationExposure`, `getAuxState`, `getBookDepth` (a head-to-tail page of one book side, read through the pair's `book()` heads and `orders()` links — for depth displays and hint computation), `findPredecessor` (the resume-able hint helper for `MatchHints.pred`), plus constant getters for EIP-712 domains/typehashes, order lifetimes, min collateral, insurance-withdrawal limits, and vault-health thresholds. Note: the pair's `getUserActiveLimitOrders` mutates (lazy cleanup) — `eth_call` it, don't index it as pure.
+Read-only views (its only state is the immutable `factory` it was deployed against): `getPositionBucket`, `checkBucketSolvency`, `getInsuranceSharePrice` / `getInsuranceDepositValue` (insurance share value at the pair's stored mark, on the redemption basis), `quoteInsuranceDeposit` / `quoteInsuranceWithdrawal` (what a deposit of a given size would mint, or a redemption pay, at a caller-supplied mark — quote against the live Pyth price your transaction will carry, since the pair refuses a stale one while the vault holds inventory), `getAdlScoreThreshold`, `getAdlScore` (a candidate's auction score and eligibility, exactly as `executeAdl` ranks them — sort submissions by it descending), `getTerminalEntitlement` (post-termination payout components: collateral, registered claim, the two frozen ratios, payout), `getMaxWithdrawable` (the largest withdrawal the margin/retention gates would accept — pass the conservative bracket price: spot − conf for a long, spot + conf for a short), `getPendingLiquidationExposure`, `getClaimableFees` / `getClaimableFeesAll` (the unclaimed payout balance a claimant holds on each pair — for a chosen list, or every pair under the wired `factory`), `getAuxState`, `getBookDepth` (a head-to-tail page of one book side, read through the pair's `book()` heads and `orders()` links — for depth displays and hint computation), `findPredecessor` (the resume-able hint helper for `MatchHints.pred`), plus constant getters for EIP-712 domains/typehashes, order lifetimes, min collateral, insurance-withdrawal limits, and the vault-health constants (the ADL reserve share, the unload band cap, the ADL timeout and batch size). Note: the pair's `getUserActiveLimitOrders` mutates (lazy cleanup) — `eth_call` it, don't index it as pure.
 
 ## External dependencies
 

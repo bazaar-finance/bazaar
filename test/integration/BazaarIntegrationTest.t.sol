@@ -15,7 +15,7 @@ contract BazaarIntegrationTest is IntegrationBase {
         (, uint256 aliceSize,,,,,,,) = pair.positionBuckets(alice);
         assertEq(aliceSize, BAZAAR_SCALE / 10, "alice holds a 0.1 BTC long");
 
-        (,,,,, uint256 insBefore,,,,,,) = pair.pairVault();
+        (,,,,, uint256 insBefore,,,,,,,,) = pair.pairVault();
 
         vm.prank(bob);
         assertEq(pair.liquidate(_arr1(alice), _freshPrice()), 1, "alice liquidated");
@@ -24,7 +24,7 @@ contract BazaarIntegrationTest is IntegrationBase {
         assertEq(aliceSizeAfter, 0, "position closed");
         assertEq(aliceColl, 0, "collateral fully seized");
 
-        (,,,,, uint256 insAfter, uint256 pendSize,,,, bool pendIsLong,) = pair.pairVault();
+        (,,,,, uint256 insAfter, uint256 pendSize,,,, bool pendIsLong,,,) = pair.pairVault();
         assertGt(insAfter, insBefore, "insurance grew from the seizure");
         assertEq(pendSize, BAZAAR_SCALE / 10, "vault inherited the 0.1 BTC");
         assertTrue(pendIsLong, "vault holds the long side");
@@ -51,19 +51,30 @@ contract BazaarIntegrationTest is IntegrationBase {
     }
 
     /// @notice Insurance-fund lifecycle: an insurer deposits and receives shares, then a liquidation
-    ///         seizure grows the fund — raising the value of the insurer's (unchanged) share count.
-    function test_e2e_InsurerShareValue_GrowsFromLiquidationSeizure() public {
+    ///         banks its seizure into the fund alongside the inventory the vault now holds. A
+    ///         redemption does not see that seizure — it is earmarked against the inventory and
+    ///         leaves again when it unloads, and the surplus beyond it is never paid to a leaver —
+    ///         while a newcomer pays for the surplus the moment it exists.
+    function test_e2e_InsurerShareValue_SeizureEarmarkedUntilUnload() public {
         _depositInsurance(carol, 1_000 * BAZAAR_SCALE);
 
         uint256 sharesBefore = pair.insuranceShares(carol);
         assertGt(sharesBefore, 0, "carol received insurance shares");
         uint256 valueBefore = lens.getInsuranceDepositValue(address(pair), carol);
+        uint256 mark = 50_000 * BAZAAR_SCALE;
+        uint256 quoteBefore = lens.quoteInsuranceDeposit(address(pair), 1_000 * BAZAAR_SCALE, mark);
 
         _setupInsolventAlice();
         vm.prank(bob);
         assertEq(pair.liquidate(_arr1(alice), _freshPrice()), 1, "liquidated");
 
         assertEq(pair.insuranceShares(carol), sharesBefore, "share count unchanged");
-        assertGt(lens.getInsuranceDepositValue(address(pair), carol), valueBefore, "share value grew");
+        // The liquidator's reward came out of free capital; the seizure adds nothing a leaver can take.
+        assertLe(lens.getInsuranceDepositValue(address(pair), carol), valueBefore, "redemption value did not grow");
+        assertLt(
+            lens.quoteInsuranceDeposit(address(pair), 1_000 * BAZAAR_SCALE, mark),
+            quoteBefore,
+            "a newcomer pays for the inventory's surplus"
+        );
     }
 }

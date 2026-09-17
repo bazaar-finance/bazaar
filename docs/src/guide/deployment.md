@@ -30,6 +30,10 @@ The per-chain file only helps if the RPC alias actually serves the chain the tar
 
 The terminator is pre-deployed against the predicted address because inlining its deployment in the factory constructor would push the factory's initcode past the EIP-3860 limit.
 
+## The bug-bounty recipient
+
+`BUG_BOUNTY_ADDRESS` must be set before deploying to any chain but Anvil; the script aborts before the first broadcast if it is missing, and prints the resolved address in the banner alongside USDC, Pyth and the OOv3. It receives 1% (`BUG_BOUNTY_TAX_BP`) of the integrator and insurance fee streams on every fill. The factory holds it `immutable` and copies it into every pair at listing, so there is no setter and no governance path — changing it means redeploying the factory and re-listing every pair. Anvil keeps an implicit default of the deploying account, since a local chain has no revenue to misdirect.
+
 ## The genesis UMA identifier
 
 `DeployBazaar.s.sol` passes the factory a `UMA_IDENTIFIER` constant, currently **`ASSERT_TRUTH2`**, and the constructor validates it against UMA's *live* `IdentifierWhitelist` before storing it. A value that is not whitelisted, or is not named `ASSERT_TRUTH…`, reverts the deployment — which is the only acceptable place to discover it, since every `assertTruth` the protocol ever makes would otherwise revert. Note that OOv3's own `defaultIdentifier` constant is `ASSERT_TRUTH`, which UMA has de-whitelisted in favour of the successor on the same oracle, so deriving the value from the oracle is exactly wrong. After deployment the identifier moves only through the [governance track](../protocol/listing.md#the-only-governance-swapping-the-uma-identifier). Mock networks accept any identifier, because the mock whitelist reports everything as supported.
@@ -40,6 +44,7 @@ The terminator is pre-deployed against the predicted address because inlining it
 |---|---|
 | `ARBITRUM_MAINNET_RPC_URL`, `ARBITRUM_SEPOLIA_RPC_URL` | `foundry.toml` RPC endpoints |
 | `ACCOUNT`, `SENDER` | keystore account for `forge script` |
+| `BUG_BOUNTY_ADDRESS` | bug-bounty fee recipient — **required on live chains** |
 | `ARBISCAN_API_KEY` | contract verification |
 | `ANVIL_RPC_URL`, `ANVIL_PRIVATE_KEY`, `ANVIL_WALLET` | local Makefile targets |
 

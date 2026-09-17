@@ -2,8 +2,10 @@
 pragma solidity 0.8.34;
 
 import {IntegrationBase} from "./IntegrationBase.sol";
+import {OrderView} from "../OrderView.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 import {StdStorage, stdStorage} from "forge-std/Test.sol";
+import {BucketStore} from "../BucketStore.sol";
 
 /// @title ArrivalMatchTest
 /// @notice Behavioral coverage of arrival matching: an incoming order walks the opposing side of
@@ -25,7 +27,7 @@ contract ArrivalMatchTest is IntegrationBase {
     }
 
     function _limitPriceOf(uint256 orderId) internal view returns (uint256 p) {
-        (,,, p,,,,,,,,,,,,,,) = pair.orders(orderId);
+        return OrderView.order(pair, orderId).limitPrice;
     }
 
     // ============================================================
@@ -123,9 +125,9 @@ contract ArrivalMatchTest is IntegrationBase {
 
         bytes[] memory pu = _freshPrice();
         BazaarTypes.OrderSpec memory s = _limitSpec(true, 3 * BTC / 10, 50_200 * BAZAAR_SCALE);
-        s.isIoc = true;
+        s.tif = BazaarTypes.TimeInForce.IOC;
         vm.prank(alice);
-        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
         uint256 taker = _lastCreatedOrderId(pair);
 
         assertEq(_filledSize(taker), BTC / 10, "IOC filled the crossing portion");
@@ -142,7 +144,7 @@ contract ArrivalMatchTest is IntegrationBase {
         BazaarTypes.OrderSpec memory s = _limitSpec(true, BTC / 10, 49_500 * BAZAAR_SCALE);
         s.isPostOnly = true;
         vm.prank(alice);
-        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
         uint256 id = _lastCreatedOrderId(pair);
 
         assertTrue(_inBook(id), "non-crossing post-only rests");
@@ -158,7 +160,7 @@ contract ArrivalMatchTest is IntegrationBase {
         BazaarTypes.OrderSpec memory s = _limitSpec(true, BTC / 10, 50_300 * BAZAAR_SCALE);
         s.isPostOnly = true;
         vm.prank(alice);
-        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
         uint256 id = _lastCreatedOrderId(pair);
 
         assertEq(_filledSize(id), 0, "post-only never takes");
@@ -202,12 +204,18 @@ contract ArrivalMatchTest is IntegrationBase {
     }
 
     function test_arrival_dustRemainder_fullCloseExemption_rests() public {
-        // Alice opens a small long, then offers EXACTLY her whole position at a price where the
-        // close's notional sits below the $5 floor. Creation admits it under the full-close
+        // A position whose notional sits below the $5 floor at in-band prices: 0.00009 BTC is
+        // ~$4.4 near a $50k mark. Un-openable through the book (the open would fail the floor),
+        // so it is written directly — the state a position reaches by drifting or by partial
+        // closes. Offering EXACTLY the whole position is admitted under the full-close
         // exemption, and the walk's remainder disposition re-applies the same exemption — the
         // order rests instead of being canceled as dust.
-        _openPosition(alice, bob, true, BTC / 1000); // 0.001 BTC long
-        uint256 closeAsk = _placeLimit(alice, false, BTC / 1000, 4_900 * BAZAAR_SCALE); // ~$4.9 notional
+        _fund(alice);
+        uint256 tiny = 9 * BTC / 100_000; // 0.00009 BTC
+        BucketStore.setIsLong(address(pair), alice, true);
+        BucketStore.setSize(address(pair), alice, tiny);
+        BucketStore.setEntryValue(address(pair), alice, tiny * 50_000); // entry at $50k
+        uint256 closeAsk = _placeLimit(alice, false, tiny, 49_000 * BAZAAR_SCALE); // ~$4.4 notional
 
         assertTrue(_inBook(closeAsk), "full-close remainder rests despite sub-$5 notional");
         assertEq(_canceledBlock(closeAsk), 0);
@@ -229,7 +237,7 @@ contract ArrivalMatchTest is IntegrationBase {
         BazaarTypes.MatchHints memory hints;
         hints.maxSteps = 2;
         vm.prank(alice);
-        pair.createOrder(s, hints, pu, 0, 0, 0, "");
+        pair.createOrder(s, hints, pu, 0, 0, 0, "", "");
         uint256 taker = _lastCreatedOrderId(pair);
 
         assertEq(_filledSize(taker), 2 * BTC / 10, "two fills inside the cap");
@@ -256,7 +264,7 @@ contract ArrivalMatchTest is IntegrationBase {
         BazaarTypes.OrderSpec memory s = _limitSpec(false, BTC / 10, 50_100 * BAZAAR_SCALE);
         s.expirationBlock = uint64(vm.getBlockNumber() + 12); // minimum lifetime
         vm.prank(bob);
-        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
         uint256 expiring = _lastCreatedOrderId(pair);
         uint256 live = _placeLimit(carol, false, BTC / 10, 50_200 * BAZAAR_SCALE);
 
@@ -279,9 +287,7 @@ contract ArrivalMatchTest is IntegrationBase {
         uint256 strong = _placeLimit(carol, false, BTC / 10, 50_200 * BAZAAR_SCALE);
 
         // Strip bob's collateral after placement so his fill-time margin check fails.
-        _stdstore.target(address(pair)).sig("positionBuckets(address)").with_key(bob).depth(3).checked_write(
-            uint256(1e15)
-        );
+        BucketStore.setCollateral(address(pair), bob, uint256(1e15));
 
         uint256 taker = _placeLimit(alice, true, BTC / 10, 50_300 * BAZAAR_SCALE);
         assertGt(_canceledBlock(weak), 0, "margin-failing maker auto-canceled");
@@ -385,13 +391,13 @@ contract ArrivalMatchTest is IntegrationBase {
         BazaarTypes.MatchHints memory hints;
         hints.pred = uint64(a1);
         vm.prank(dave);
-        pair.createOrder(s, hints, pu, 0, 0, 0, "");
+        pair.createOrder(s, hints, pu, 0, 0, 0, "", "");
         uint256 mid = _lastCreatedOrderId(pair);
 
         // Traverse: a1 → mid → a3.
-        (,,,,,,,,,,,,,,,,, uint64 nextOfA1) = pair.orders(a1);
+        uint64 nextOfA1 = OrderView.order(pair, a1).nextInBook;
         assertEq(uint256(nextOfA1), mid, "hinted insert landed after its predecessor");
-        (,,,,,,,,,,,,,,,,, uint64 nextOfMid) = pair.orders(mid);
+        uint64 nextOfMid = OrderView.order(pair, mid).nextInBook;
         assertEq(uint256(nextOfMid), a3, "and before its successor");
     }
 }

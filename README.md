@@ -54,12 +54,15 @@ src/
     ├── BucketLib.sol           # Position solvency math
     ├── VaultHealthLib.sol      # ADL/termination triggers
     ├── MmrSampleLib.sol        # 24h-lagged MMR ring buffer
+    ├── FeeEscrowLib.sol        # Claimable-balance escrow behind every payout
     ├── BazaarMathLib.sol       # Fixed-point + effective-price helpers
     └── BazaarTypes.sol         # Structs, enums, protocol constants
 script/                         # DeployLibraries + DeployBazaar + network config
 test/
-├── unit/                       # 24 test files: per-library and per-mechanism
-└── integration/                # 31 test files: end-to-end, incl. zero-sum invariant
+├── unit/                       # 25 test files: per-library and per-mechanism
+├── integration/                # 38 test files: end-to-end, incl. zero-sum invariant
+├── mocks/                      # Pyth, USDC, UMA OOv3
+└── *.sol                       # Shared harness helpers (storage probes, Pyth seeding)
 ```
 
 ## Security

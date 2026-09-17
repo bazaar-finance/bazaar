@@ -26,10 +26,17 @@ contract CheckMarginHarness {
         uint256 imrBp,
         uint256 mmrBp,
         uint256 laggedMmrBp
-    ) external view returns (bool) {
-        return MatchingEngineLib._checkMargin(
-            bucket, state, isLong, fillSize, executionPrice, fee, cachedPrice, imrBp, mmrBp, laggedMmrBp
-        );
+    ) external pure returns (bool) {
+        // laggedMmrTs 0 keeps the lagged branch out of these cases: a 0 stamp never satisfies
+        // effectiveMmr's `laggedMmrTs >= mmrUpdateTs`, so the partial-close remainder is judged on
+        // its entry MMR. The lagged selection itself is covered against EffectiveMmrHarness.
+        BazaarTypes.MarginRequirements memory marginReqs = BazaarTypes.MarginRequirements({
+            imrBp: imrBp, mmrBp: mmrBp, lastUpdateTs: 0, laggedMmrBp: laggedMmrBp, laggedMmrTs: 0
+        });
+        return
+            MatchingEngineLib._checkMargin(
+                bucket, state, isLong, fillSize, executionPrice, fee, cachedPrice, marginReqs
+            );
     }
 }
 
@@ -59,7 +66,7 @@ contract CheckMarginTest is Test {
         returns (BazaarTypes.PositionBucket memory bucket, BazaarTypes.BucketState memory state)
     {
         bucket.size = 0;
-        bucket.collateral = collateral;
+        bucket.collateral = uint128(collateral);
         state.effectiveCollateral = collateral;
         state.availableEquity = collateral;
         state.isSolvent = true;
@@ -74,9 +81,9 @@ contract CheckMarginTest is Test {
         uint256 currentOraclePrice
     ) internal pure returns (BazaarTypes.PositionBucket memory bucket, BazaarTypes.BucketState memory state) {
         bucket.isLong = isLong;
-        bucket.size = size;
-        bucket.entryValue = (size * entryPrice) / SCALE;
-        bucket.collateral = collateral;
+        bucket.size = uint128(size);
+        bucket.entryValue = uint128((size * entryPrice) / SCALE);
+        bucket.collateral = uint128(collateral);
 
         state.adjustedSize = size;
         state.entryValue = bucket.entryValue;
@@ -333,8 +340,20 @@ contract MmrSampleHarness {
         MmrSampleLib.record(buf, mmrBp);
     }
 
-    function lagged() external view returns (uint256) {
-        return MmrSampleLib.laggedMmr(buf);
+    /// @dev Anchors the lookback to the calling block, i.e. what the pair resolves when the caller
+    ///      supplies a fresh price.
+    function lagged() external view returns (uint256 mmrBp) {
+        (mmrBp,) = MmrSampleLib.laggedMmr(buf, block.timestamp);
+    }
+
+    function laggedWithTs() external view returns (uint256 mmrBp, uint256 ts) {
+        return MmrSampleLib.laggedMmr(buf, block.timestamp);
+    }
+
+    /// @dev Anchors the lookback to an explicit mark timestamp, i.e. what the pair resolves when a
+    ///      call falls back to a stored price older than the block.
+    function laggedAt(uint256 refTs) external view returns (uint256 mmrBp, uint256 ts) {
+        return MmrSampleLib.laggedMmr(buf, refTs);
     }
 
     function count() external view returns (uint256) {
@@ -356,12 +375,14 @@ contract MmrSampleHarness {
 
 /// @notice Exposes BucketLib.effectiveMmr (the per-position threshold selector).
 contract EffectiveMmrHarness {
-    function effectiveMmr(uint256 mmrUpdateTs, uint256 entryMmrBp, uint256 laggedMmrBp, uint256 currentMmrBp)
-        external
-        view
-        returns (uint256)
-    {
-        return BucketLib.effectiveMmr(mmrUpdateTs, entryMmrBp, laggedMmrBp, currentMmrBp);
+    function effectiveMmr(
+        uint256 mmrUpdateTs,
+        uint256 entryMmrBp,
+        uint256 laggedMmrBp,
+        uint256 laggedMmrTs,
+        uint256 currentMmrBp
+    ) external pure returns (uint256) {
+        return BucketLib.effectiveMmr(mmrUpdateTs, entryMmrBp, laggedMmrBp, laggedMmrTs, currentMmrBp);
     }
 }
 
@@ -481,60 +502,154 @@ contract MmrLagTest is Test {
         assertEq(samples.lagged(), 300, "25-slot ring retains a 24h-old sample");
     }
 
+    /// @notice The returned timestamp must be the one the winning sample was recorded at, not the
+    ///         cutoff: effectiveMmr compares it against each position's mmrUpdateTs, so a stamp
+    ///         that overstated how recent the sample is would readmit pre-open rates.
+    function test_lagged_returnsWinningSampleTimestamp() public {
+        samples.record(200); // T0
+        vm.warp(T0 + HOUR);
+        samples.record(210); // T0+1h
+        // Query 30h after T0: cutoff = T0+6h, so the T0+1h sample wins on both value and stamp.
+        vm.warp(T0 + 30 * HOUR);
+        (uint256 mmrBp, uint256 ts) = samples.laggedWithTs();
+        assertEq(mmrBp, 210, "newest qualifying sample");
+        assertEq(ts, T0 + HOUR, "stamp is the sample's own record time");
+    }
+
+    function test_lagged_noQualifyingSampleReturnsZeroTimestamp() public {
+        samples.record(200);
+        vm.warp(T0 + HOUR);
+        (uint256 mmrBp, uint256 ts) = samples.laggedWithTs();
+        assertEq(mmrBp, 0, "nothing >= 24h old yet");
+        assertEq(ts, 0, "a 0 stamp is what routes callers back to entryMmrBp");
+    }
+
+    /// @notice The lookback is measured back from the reference instant the caller passes, not from
+    ///         the block. Two reads of the SAME ring at the same block resolve different samples
+    ///         purely because the mark they are anchored to differs.
+    function test_lagged_lookbackIsMeasuredFromTheReferenceInstant() public {
+        // Rising MMR sampled hourly at T0 .. T0+5h.
+        for (uint256 i = 0; i <= 5; i++) {
+            vm.warp(T0 + i * HOUR);
+            samples.record(200 + i * 10); // 200,210,...,250
+        }
+        vm.warp(T0 + GRACE + 3 * HOUR);
+
+        // Anchored to the block: cutoff = T0+3h, so the T0+3h sample (230) wins.
+        assertEq(samples.lagged(), 230, "block anchor selects the T0+3h sample");
+
+        // Anchored to a mark two hours behind the block: cutoff = T0+1h, so the older, lower
+        // T0+1h sample (210) wins instead.
+        (uint256 mmrBp, uint256 ts) = samples.laggedAt(block.timestamp - 2 * HOUR);
+        assertEq(mmrBp, 210, "mark anchor selects the sample in force 24h before the mark");
+        assertEq(ts, T0 + HOUR, "stamp is the winning sample's own record time");
+    }
+
+    /// @notice The ratchet the grace period implies advances with the MARK, not with wall time. A
+    ///         stored price that stops advancing freezes the threshold with it, so waiting for the
+    ///         cutoff to roll onto a higher sample cannot raise the requirement a position is
+    ///         judged against while the mark it is judged at stays put.
+    function test_lagged_staleMarkFreezesTheRatchet() public {
+        samples.record(200); // T0
+        vm.warp(T0 + HOUR);
+        samples.record(900); // T0+1h — a sharply higher requirement
+
+        uint256 markTs = T0 + GRACE; // cutoff = T0: only the 200 sample qualifies
+
+        vm.warp(markTs);
+        (uint256 atMark,) = samples.laggedAt(markTs);
+        assertEq(atMark, 200, "the T0+1h step has not aged into the window yet");
+
+        // An hour of wall time later the block-anchored cutoff would admit the 900 sample.
+        vm.warp(markTs + HOUR);
+        assertEq(samples.lagged(), 900, "block anchor ratchets onto the higher sample");
+
+        // Anchored to the same unchanged mark it does not.
+        (uint256 stillAtMark,) = samples.laggedAt(markTs);
+        assertEq(stillAtMark, 200, "mark anchor holds the threshold with the price");
+    }
+
     // ----------------------------------------------------------------
     // BucketLib.effectiveMmr — per-position threshold selection
     // ----------------------------------------------------------------
 
-    function test_eff_newPosition_risingMmr_graced() public {
-        // age < grace => reference = entryMmrBp; entry(200) < current(400) => 200
-        uint256 v = eff.effectiveMmr(block.timestamp, 200, 999, 400);
+    // laggedMmr only ever yields a sample stamped at or before now - GRACE, so every case below
+    // passes a laggedMmrTs no newer than that; what varies is where it sits relative to the
+    // position's own mmrUpdateTs.
+    function test_eff_newPosition_risingMmr_graced() public view {
+        // Sample predates a position opened now => reference = entryMmrBp; entry(200) < current(400)
+        uint256 v = eff.effectiveMmr(block.timestamp, 200, 999, block.timestamp - GRACE, 400);
         assertEq(v, 200);
     }
 
-    function test_eff_newPosition_fallingMmr_appliesImmediately() public {
+    function test_eff_newPosition_fallingMmr_appliesImmediately() public view {
         // entry(400) > current(200) => min => 200 (a drop helps right away)
-        uint256 v = eff.effectiveMmr(block.timestamp, 400, 999, 200);
+        uint256 v = eff.effectiveMmr(block.timestamp, 400, 999, block.timestamp - GRACE, 200);
         assertEq(v, 200);
     }
 
-    function test_eff_oldPosition_usesLaggedSample() public {
-        // age >= grace and lagged != 0 => reference = lagged(300); current(500) => 300
+    function test_eff_oldPosition_usesLaggedSample() public view {
+        // Sample stamped exactly at the position's open => adopted; lagged(300) < current(500)
         uint256 updated = block.timestamp - GRACE; // exactly grace old
-        uint256 v = eff.effectiveMmr(updated, 200, 300, 500);
+        uint256 v = eff.effectiveMmr(updated, 200, 300, updated, 500);
         assertEq(v, 300, "old position judged on lagged sample, not entry");
     }
 
-    function test_eff_oldPosition_laggedAboveCurrent_usesCurrent() public {
+    function test_eff_oldPosition_laggedAboveCurrent_usesCurrent() public view {
         // lagged(600) > current(400) => min => 400
         uint256 updated = block.timestamp - GRACE - HOUR;
-        uint256 v = eff.effectiveMmr(updated, 200, 600, 400);
+        uint256 v = eff.effectiveMmr(updated, 200, 600, block.timestamp - GRACE, 400);
         assertEq(v, 400);
     }
 
-    function test_eff_oldPosition_noSample_fallsBackToEntry() public {
-        // age >= grace but laggedMmrBp == 0 => reference = entryMmrBp(200); current(500) => 200
+    function test_eff_oldPosition_noSample_fallsBackToEntry() public view {
+        // Ring held nothing old enough => (0, 0) => reference = entryMmrBp(200); current(500)
         uint256 updated = block.timestamp - GRACE - HOUR;
-        uint256 v = eff.effectiveMmr(updated, 200, 0, 500);
+        uint256 v = eff.effectiveMmr(updated, 200, 0, 0, 500);
         assertEq(v, 200, "no >=24h sample => entry MMR fallback");
     }
 
-    function test_eff_zeroEntry_fallsBackToCurrent() public {
-        // entryMmrBp == 0 and lagged == 0 => reference 0 => use current (never returns 0 MMR)
-        uint256 v = eff.effectiveMmr(block.timestamp, 0, 0, 350);
+    function test_eff_zeroEntry_fallsBackToCurrent() public view {
+        // entryMmrBp == 0 and no sample => reference 0 => use current (never returns 0 MMR)
+        uint256 v = eff.effectiveMmr(block.timestamp, 0, 0, 0, 350);
         assertEq(v, 350, "zero reference must not disable liquidation");
     }
 
-    function test_eff_flatPosition_mmrUpdateTsZero_usesEntryOrCurrent() public {
-        // mmrUpdateTs == 0 => the lagged branch is skipped even if old/lagged provided.
-        uint256 v = eff.effectiveMmr(0, 250, 300, 500);
+    function test_eff_flatPosition_mmrUpdateTsZero_usesEntryOrCurrent() public view {
+        // mmrUpdateTs == 0 => the lagged branch is skipped even though any sample stamp would
+        // otherwise compare >= 0 and win the branch.
+        uint256 v = eff.effectiveMmr(0, 250, 300, block.timestamp - GRACE, 500);
         assertEq(v, 250, "ts==0 uses entry, not lagged");
     }
 
-    function test_eff_oldPosition_justUnderGrace_stillUsesEntry() public {
-        // age = grace - 1 => not yet old => entry path
+    function test_eff_oldPosition_justUnderGrace_stillUsesEntry() public view {
+        // age = grace - 1: the newest qualifying sample is capped at now - GRACE, so it
+        // necessarily predates a position this young and the entry path holds.
         uint256 updated = block.timestamp - (GRACE - 1);
-        uint256 v = eff.effectiveMmr(updated, 220, 300, 500);
+        uint256 v = eff.effectiveMmr(updated, 220, 300, block.timestamp - GRACE, 500);
         assertEq(v, 220, "below grace boundary uses entry");
+    }
+
+    /// @notice A rate increase landing between two grid points is recorded under the later point's
+    ///         stamp, so a position opened in that shadow crosses the grace period with its cutoff
+    ///         equal to its own mmrUpdateTs — selecting the last sample taken before it existed.
+    ///         That sample must not replace the entry rate it actually opened under.
+    function test_eff_samplePredatesPosition_keepsEntryMmr() public view {
+        uint256 updated = block.timestamp - GRACE; // just crossed the grace period
+        uint256 sampleTs = updated - 39 minutes; // last grid point before the position opened
+        uint256 v = eff.effectiveMmr(updated, 2_000, 200, sampleTs, 2_000);
+        assertEq(v, 2_000, "a pre-open sample must not undercut the entry MMR");
+    }
+
+    /// @notice The entry rate is a floor only while every qualifying sample predates the position.
+    ///         Once the cutoff reaches a sample taken after it opened, that sample governs even
+    ///         when it sits far below entry — the grace defers increases, it does not pin a
+    ///         position to its opening rate.
+    function test_eff_samplePostdatesPosition_adoptsLaggedBelowEntry() public view {
+        uint256 updated = block.timestamp - GRACE - HOUR;
+        uint256 sampleTs = updated + 30 minutes; // first grid point after the position opened
+        uint256 v = eff.effectiveMmr(updated, 2_000, 200, sampleTs, 2_000);
+        assertEq(v, 200, "a post-open sample governs even below the entry MMR");
     }
 }
 
@@ -662,9 +777,9 @@ contract ApplyFillHarness {
     ) external {
         BazaarTypes.PositionBucket storage b = positionBuckets[user];
         b.isLong = isLong;
-        b.size = size;
-        b.entryValue = entryValue;
-        b.collateral = collateral;
+        b.size = uint128(size);
+        b.entryValue = uint128(entryValue);
+        b.collateral = uint128(collateral);
         b.entryFundingIndex = entryFundingIndex;
     }
 
@@ -677,7 +792,7 @@ contract ApplyFillHarness {
         int256 currentFundingIndex
     ) external returns (BazaarTypes.FillResult memory) {
         BazaarTypes.MarginRequirements memory reqs = BazaarTypes.MarginRequirements({
-            imrBp: 2_000, mmrBp: 1_000, lastUpdateTs: 0, laggedMmrBp: 0
+            imrBp: 2_000, mmrBp: 1_000, lastUpdateTs: 0, laggedMmrBp: 0, laggedMmrTs: 0
         });
         BazaarTypes.PositionBucket memory bucketMem = positionBuckets[user];
         BazaarTypes.BucketState memory state =
@@ -686,8 +801,8 @@ contract ApplyFillHarness {
         ctx.cachedPrice = currentPrice;
         ctx.cachedFundingIdx = currentFundingIndex;
         ctx.marginReqs = reqs;
-        return MatchingEngineLib._applyFillWithState(
-            user, state, orderIsLong, fillSize, executionPrice, 0, ctx, orders, positionBuckets, book
+        return MatchingEngineLib._applyFillMaker(
+            orders, positionBuckets, book, user, state, orderIsLong, fillSize, executionPrice, 0, ctx
         );
     }
 

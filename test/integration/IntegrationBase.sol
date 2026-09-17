@@ -9,9 +9,12 @@ import {BazaarPair} from "../../src/BazaarPair.sol";
 import {BazaarPairLens} from "../../src/BazaarPairLens.sol";
 import {BazaarOracle} from "../../src/BazaarOracle.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
+import {OrderView} from "../OrderView.sol";
 import {MockUSDC} from "../mocks/MockUSDC.sol";
 import {MockArbSys} from "../mocks/MockArbSys.sol";
 import {MockPyth} from "@pythnetwork/pyth-sdk-solidity/MockPyth.sol";
+import {PythSeed} from "../PythSeed.sol";
+import {BucketStore} from "../BucketStore.sol";
 
 /// @title IntegrationBase
 /// @notice Shared deployment harness for the Bazaar integration suite. Every integration test
@@ -70,7 +73,10 @@ abstract contract IntegrationBase is Test {
         usdc = MockUSDC(usdcAddr);
         oracle = factory.oracle();
         mockPyth = MockPyth(address(oracle.pyth()));
-        lens = new BazaarPairLens();
+        lens = factory.lens();
+        // The factory lists a raw feed only once Pyth has stored a price for it.
+        PythSeed.seed(address(mockPyth), BTC_USD_FEED_ID);
+        PythSeed.seed(address(mockPyth), AAPL_USD_FEED_ID);
 
         usdc.mint(deployer, INITIAL_USER_BALANCE);
         usdc.mint(alice, INITIAL_USER_BALANCE);
@@ -143,10 +149,16 @@ abstract contract IntegrationBase is Test {
         vm.stopPrank();
     }
 
+    /// @dev Carries a fresh BTC update at the pair's current mark ($50k before any is stored): the
+    ///      deposit reads it only while the vault holds inventory, and re-stamping the mark the
+    ///      test already set keeps the deposit from moving it. Built before the prank because the
+    ///      Pyth helper's external call would consume one.
     function _depositInsurance(address user, uint256 amount) internal {
+        (uint256 spot,,,,) = pair.lastPairPrice();
+        bytes[] memory pu = _priceAt(spot == 0 ? 50_000 : spot / BAZAAR_SCALE);
         vm.startPrank(user);
         usdc.approve(address(pair), amount * USDC_SCALE / BAZAAR_SCALE);
-        pair.depositToInsurance(amount, 0, 0, 0, "", "");
+        pair.depositToInsurance(amount, pu, 0, 0, 0, "", "");
         vm.stopPrank();
     }
 
@@ -166,8 +178,7 @@ abstract contract IntegrationBase is Test {
         uint256 w = _idProbe[address(p)];
         if (w == 0) w = 1;
         while (true) {
-            (address creator,,,,,,,,,,,,,,,,,) = p.orders(w);
-            if (creator == address(0)) break;
+            if (OrderView.order(p, w).creator == address(0)) break;
             ++w;
         }
         _idProbe[address(p)] = w;
@@ -196,7 +207,7 @@ abstract contract IntegrationBase is Test {
     function _placeLimit(address user, bool isLong, uint256 size, uint256 limitPrice) internal returns (uint256) {
         bytes[] memory pu = _freshPrice(); // build BEFORE the prank (external mockPyth call would consume it)
         vm.prank(user);
-        pair.createOrder(_limitSpec(isLong, size, limitPrice), _hintsNone(), pu, 0, 0, 0, "");
+        pair.createOrder(_limitSpec(isLong, size, limitPrice), _hintsNone(), pu, 0, 0, 0, "", "");
         return _lastCreatedOrderId(pair);
     }
 
@@ -210,7 +221,7 @@ abstract contract IntegrationBase is Test {
         vm.warp(vm.getBlockTimestamp() + 3);
         bytes[] memory pu = _priceUpdate(oraclePriceUsd, uint64(vm.getBlockTimestamp()));
         vm.prank(user);
-        pair.createOrder(_limitSpec(isLong, size, limitPrice), _hintsNone(), pu, 0, 0, 0, "");
+        pair.createOrder(_limitSpec(isLong, size, limitPrice), _hintsNone(), pu, 0, 0, 0, "", "");
         return _lastCreatedOrderId(pair);
     }
 
@@ -222,7 +233,7 @@ abstract contract IntegrationBase is Test {
         s.size = size;
         s.maxSlippageBp = maxSlippageBp;
         vm.prank(user);
-        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
         return _lastCreatedOrderId(pair);
     }
 
@@ -239,7 +250,7 @@ abstract contract IntegrationBase is Test {
         s.limitPrice = limitPrice;
         s.expirationBlock = uint64(block.number + 500_000);
         vm.prank(user);
-        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
         return _lastCreatedOrderId(pair);
     }
 
@@ -255,7 +266,7 @@ abstract contract IntegrationBase is Test {
         s.triggerPrice = triggerPrice;
         s.maxSlippageBp = maxSlippageBp;
         vm.prank(user);
-        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
         return _lastCreatedOrderId(pair);
     }
 
@@ -273,7 +284,7 @@ abstract contract IntegrationBase is Test {
         s.triggerPrice = triggerPrice;
         s.maxSlippageBp = maxSlippageBp;
         vm.prank(user);
-        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
         return _lastCreatedOrderId(pair);
     }
 
@@ -328,19 +339,19 @@ abstract contract IntegrationBase is Test {
     }
 
     function _filledSize(uint256 orderId) internal view returns (uint256 s) {
-        (,,,,,, s,,,,,,,,,,,) = pair.orders(orderId);
+        return OrderView.order(pair, orderId).filledSize;
     }
 
     function _orderSize(uint256 orderId) internal view returns (uint256 s) {
-        (,,,,, s,,,,,,,,,,,,) = pair.orders(orderId);
+        return OrderView.order(pair, orderId).size;
     }
 
     function _canceledBlock(uint256 orderId) internal view returns (uint64 cb) {
-        (,,,,,,,,,,,,,, cb,,,) = pair.orders(orderId);
+        return OrderView.order(pair, orderId).canceledBlock;
     }
 
     function _inBook(uint256 orderId) internal view returns (bool b) {
-        (,,,,,,,,,,, b,,,,,,) = pair.orders(orderId);
+        return OrderView.order(pair, orderId).inBook;
     }
 
     function _position(address user) internal view returns (bool isLong, uint256 size) {
@@ -356,7 +367,7 @@ abstract contract IntegrationBase is Test {
     }
 
     function _insuranceBal() internal view returns (uint256 b) {
-        (,,,,, b,,,,,,) = pair.pairVault();
+        (,,,,, b,,,,,,,,) = pair.pairVault();
     }
 
     // ---------------------------- misc array helpers ----------------------------
@@ -383,14 +394,16 @@ abstract contract IntegrationBase is Test {
 
     /// @dev totalCollateralDeposited (D) — Vault field index 4.
     function _totalDeposited() internal view returns (uint256 d) {
-        (,,,, d,,,,,,,) = pair.pairVault();
+        (,,,, d,,,,,,,,,) = pair.pairVault();
     }
 
-    /// @dev The Check-3 expected balance, insuranceFundBalance (I) + totalCollateralDeposited (D),
-    ///      in BAZAAR (1e18) precision.
+    /// @dev The Check-3 expected balance: insuranceFundBalance (I) + totalCollateralDeposited (D)
+    ///      + the unclaimed fee escrow, in BAZAAR (1e18) precision. Earned-but-unclaimed fees are
+    ///      cash the contract still holds against a third-party claim, so they belong on the
+    ///      books side of the comparison exactly like I and D.
     function _ledgerBaz() internal view returns (uint256) {
-        (,,,, uint256 d, uint256 i,,,,,,) = pair.pairVault();
-        return d + i;
+        (,,,, uint256 d, uint256 i,,,,,,,,) = pair.pairVault();
+        return d + i + _escrowTotal();
     }
 
     /// @dev The contract's actual USDC balance, scaled to BAZAAR (1e18) precision.
@@ -429,22 +442,61 @@ abstract contract IntegrationBase is Test {
         vm.roll(vm.getBlockNumber() + n);
     }
 
+    /// @dev Unclaimed fees owed to `who`, and the escrow's total liability.
+    function _escrowOwed(address who) internal view returns (uint256 owed) {
+        (owed,) = pair.claimableFees(who);
+    }
+
+    function _escrowTotal() internal view returns (uint256 total) {
+        (, total) = pair.claimableFees(address(0));
+    }
+
+    /// @dev Claim `who`'s escrowed fees and return the USDC that actually landed. Every third-party
+    ///      payout (fee shares, keeper rewards, relayer fees) accrues to a claimable balance
+    ///      instead of being pushed, so a test asserting "they got paid" claims first.
+    function _claimFees(address who) internal returns (uint256 receivedUsdc) {
+        uint256 before = usdc.balanceOf(who);
+        vm.prank(who);
+        pair.claimFees();
+        return usdc.balanceOf(who) - before;
+    }
+
+    /// @dev Stage inventory `target`'s vault holds — one unit long at `entryNotional` — with
+    ///      `seized` of collateral banked into its insurance fund alongside it. A long's
+    ///      bankruptcy notional sits below its entry by that collateral, which is how the seizure
+    ///      is recovered without being tracked. Vault struct depths: 6 pendingLiqSize,
+    ///      7 pendingLiqEntryNotional, 8 pendingLiqBankruptcyNotional, 10 pendingLiqIsLong.
+    function _stageHeldInventory(BazaarPair target, uint256 entryNotional, uint256 seized) internal {
+        _stdstore.target(address(target)).sig("pairVault()").depth(6).checked_write(1 * BAZAAR_SCALE);
+        _stdstore.target(address(target)).sig("pairVault()").depth(7).checked_write(entryNotional);
+        _stdstore.target(address(target)).sig("pairVault()").depth(8).checked_write(entryNotional - seized);
+        _stdstore.target(address(target)).sig("pairVault()").depth(10).checked_write(true);
+        _stdstore.target(address(target)).sig("pairVault()").depth(13).checked_write(seized);
+    }
+
+    function _stageHeldInventory(uint256 entryNotional, uint256 seized) internal {
+        _stageHeldInventory(pair, entryNotional, seized);
+    }
+
+    /// @dev Write the vault's cached insurance target (Vault struct depth 12), which sizes the
+    ///      reserve the unload walk keeps and the share-pricing loss cap.
+    function _setTargetInsuranceRatioBp(BazaarPair target, uint256 targetBp) internal {
+        _stdstore.target(address(target)).sig("pairVault()").depth(12).checked_write(targetBp);
+    }
+
     /// @dev Overwrite a user's position bucket via stdstore (isLong/size/entryValue). Collateral must
     ///      come from a real _deposit so the vault's USDC accounting stays backed.
     function _writePosition(address user, bool isLong, uint256 size, uint256 entryValue) internal {
-        _stdstore.target(address(pair)).sig("positionBuckets(address)").with_key(user).depth(0).checked_write(isLong);
-        _stdstore.target(address(pair)).sig("positionBuckets(address)").with_key(user).depth(1).checked_write(size);
-        _stdstore.target(address(pair)).sig("positionBuckets(address)").with_key(user).depth(2)
-            .checked_write(entryValue);
+        BucketStore.setIsLong(address(pair), user, isLong);
+        BucketStore.setSize(address(pair), user, size);
+        BucketStore.setEntryValue(address(pair), user, entryValue);
     }
 
     /// @dev Write an underwater 0.1 BTC long for alice (thin $10 collateral, liquidatable at $50k).
     function _setupInsolventAlice() internal {
         _deposit(alice, 10 * BAZAAR_SCALE);
-        _stdstore.target(address(pair)).sig("positionBuckets(address)").with_key(alice).depth(0).checked_write(true); // isLong
-        _stdstore.target(address(pair)).sig("positionBuckets(address)").with_key(alice).depth(1)
-            .checked_write(BAZAAR_SCALE / 10); // size
-        _stdstore.target(address(pair)).sig("positionBuckets(address)").with_key(alice).depth(2)
-            .checked_write(5_005 * BAZAAR_SCALE); // entryValue
+        BucketStore.setIsLong(address(pair), alice, true); // isLong
+        BucketStore.setSize(address(pair), alice, BAZAAR_SCALE / 10); // size
+        BucketStore.setEntryValue(address(pair), alice, 5_005 * BAZAAR_SCALE); // entryValue
     }
 }

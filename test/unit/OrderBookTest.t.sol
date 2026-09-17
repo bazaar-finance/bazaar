@@ -18,7 +18,7 @@ contract OrderBookHarness {
         o.creator = msg.sender;
         o.orderType = BazaarTypes.OrderType.Limit;
         o.isLong = isLong;
-        o.limitPrice = limitPrice;
+        o.limitPrice = uint128(limitPrice);
         o.size = 1e18;
     }
 
@@ -254,19 +254,23 @@ contract OrderBookTest is Test {
 
     function test_insert_repairCapBoundary() public {
         // Build an ascending ask ladder with exact hints (each insert is O(1)).
-        uint256 n = BazaarTypes.MAX_WALK_STEPS + 1; // 65 nodes: tail insert needs exactly 64 advances
+        // One node past the cap, so a tail insert from the head anchor needs exactly
+        // MAX_WALK_STEPS advances.
+        uint256 n = BazaarTypes.MAX_WALK_STEPS + 1;
         uint256 prev = _mk(false, 1 * P, 0);
         for (uint256 i = 2; i <= n; ++i) {
             prev = _mk(false, i * P, uint64(prev));
         }
 
-        // From the head anchor, linking after node 65 takes 64 advances — at the cap, succeeds.
+        // From the head anchor, linking after the last node takes exactly MAX_WALK_STEPS advances —
+        // at the cap, succeeds.
         uint256 okId = h.create(false, (n + 1) * P);
         h.insert(okId, _hints(0));
         (,,, uint64 askCount) = h.heads();
         assertEq(uint256(askCount), n + 1, "cap-edge insert landed");
 
-        // Now the list is 66 nodes: a fresh tail insert from the head needs 65 advances — reverts.
+        // The list is one node longer now: a fresh tail insert from the head needs
+        // MAX_WALK_STEPS + 1 advances — past the cap, reverts.
         uint256 failId = h.create(false, (n + 2) * P);
         vm.expectRevert(abi.encodeWithSelector(OrderBookLib.OrderBookLib__HintRepairExhausted.selector, failId));
         h.insert(failId, _hints(0));
@@ -343,43 +347,58 @@ contract OrderBookTest is Test {
     ///      unlinks of members and non-members) and after every op checks both sides against an
     ///      in-test sorted reference. Small price set forces equal-price tiebreak coverage; op
     ///      count stays under the repair cap so zero-hint inserts can never exhaust it.
+    /// @dev The fuzz reference model, held in STORAGE rather than as loop locals. Two array
+    ///      pointers plus the op's own locals plus the two inlined per-op list assertions
+    ///      overflow via-IR's stack scheduler; keeping the model in storage leaves the loop
+    ///      frame holding little more than the seed.
+    uint256[] private fzBids;
+    uint256[] private fzAsks;
+
     function testFuzz_randomOpsPreserveInvariants(uint256 seed) public {
-        uint256[] memory refBids = new uint256[](0);
-        uint256[] memory refAsks = new uint256[](0);
+        delete fzBids;
+        delete fzAsks;
 
         for (uint256 op; op < 48; ++op) {
             seed = uint256(keccak256(abi.encode(seed, op)));
-            bool side = seed % 2 == 0;
-            uint256[] memory ref = side ? refBids : refAsks;
-            uint256 action = (seed / 2) % 4; // 0..2 insert variants, 3 unlink
+            _fuzzStep(seed, op);
+            _assertList(true, fzBids);
+            _assertList(false, fzAsks);
+        }
+    }
 
-            if (action == 3 && ref.length > 0) {
-                uint256 victim = ref[(seed / 8) % ref.length];
-                h.unlink(victim);
-                ref = _refRemove(ref, victim);
-            } else if (action == 3) {
+    /// @dev One op of the fuzz sequence: an insert (exact, garbage, or zero hint) or an unlink
+    ///      of a member or a non-member, applied to both the book and the reference model.
+    function _fuzzStep(uint256 seed, uint256 op) internal {
+        bool side = seed % 2 == 0;
+        uint256[] memory ref = side ? fzBids : fzAsks;
+        uint256 action = (seed / 2) % 4; // 0..2 insert variants, 3 unlink
+
+        if (action == 3) {
+            if (ref.length == 0) {
                 h.unlink(1_000_000 + op); // non-member: must be a no-op
-            } else {
-                uint256 price = (((seed / 8) % 6) + 1) * P;
-                uint256 id = h.create(side, price);
-                BazaarTypes.MatchHints memory hints;
-                if (action == 1 && ref.length > 0) {
-                    // Garbage hint: random id — dead, wrong-side, or arbitrary member.
-                    hints.pred = uint64((seed / 64) % (id + 4));
-                } else if (action == 2) {
-                    hints.pred = uint64(_refPredecessor(ref, side, id, price));
-                }
-                h.insert(id, hints);
-                ref = _refInsert(ref, side, id, price);
+                return;
             }
+            uint256 victim = ref[(seed / 8) % ref.length];
+            h.unlink(victim);
+            ref = _refRemove(ref, victim);
+        } else {
+            uint256 price = (((seed / 8) % 6) + 1) * P;
+            uint256 id = h.create(side, price);
+            BazaarTypes.MatchHints memory hints;
+            if (action == 1 && ref.length > 0) {
+                // Garbage hint: random id — dead, wrong-side, or arbitrary member.
+                hints.pred = uint64((seed / 64) % (id + 4));
+            } else if (action == 2) {
+                hints.pred = uint64(_refPredecessor(ref, side, id, price));
+            }
+            h.insert(id, hints);
+            ref = _refInsert(ref, side, id, price);
+        }
 
-            if (side) {
-                refBids = ref;
-            } else {
-                refAsks = ref;
-            }
-            _assertList(true, refBids);
-            _assertList(false, refAsks);
+        if (side) {
+            fzBids = ref;
+        } else {
+            fzAsks = ref;
         }
     }
 

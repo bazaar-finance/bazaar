@@ -7,8 +7,9 @@ import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 
 /// @dev Storage host for the three STATEFUL RiskParamsLib functions: `calculateVariance` (the
 ///      volatility EMA), `updateLiquidationGapEmaBatch` (the liquidation-gap EMA), and
-///      `calculateIMRandMMR` (the composed margin curve). Together these are the
-///      volatility/liquidation → leverage-limit feedback loop.
+///      `calculateIMRandMMR` (the margin curve and the cached fund target, both composed off
+///      the stress move). Together these are the volatility/liquidation → leverage-limit
+///      feedback loop.
 contract RiskParamsStatefulHarness {
     BazaarTypes.MarginRequirements internal marginRequirements;
     BazaarTypes.PairPrice internal lastPairPrice;
@@ -76,7 +77,8 @@ contract RiskParamsStatefulHarness {
             currentPrice,
             isContinuouslyTraded,
             pairCreatedTs,
-            priceUpdateCount
+            priceUpdateCount,
+            0
         );
     }
 
@@ -95,6 +97,10 @@ contract RiskParamsStatefulHarness {
 
     function marginReqs() external view returns (uint256, uint256, uint256) {
         return (marginRequirements.imrBp, marginRequirements.mmrBp, marginRequirements.lastUpdateTs);
+    }
+
+    function cachedTargetBp() external view returns (uint256) {
+        return pairVault.targetInsuranceRatioBp;
     }
 }
 
@@ -366,40 +372,60 @@ contract RiskParamsStatefulTest is Test {
     // calculateIMRandMMR
     // =====================================================================
 
-    /// @notice Low vol / healthy fund / continuous / past warmup: all multipliers = 1x, base IMR
-    ///         300bp floored to MIN_IMR_BP = 400. MMR = IMR/2.
+    /// @notice Low vol / healthy fund / continuous / past warmup: the vol leg reads 150bp,
+    ///         floored to MIN_STRESS_MOVE_BP = 200, so IMR = 2 x 200 = MIN_IMR_BP and the target
+    ///         lands on INSURANCE_TARGET_BASE. The floor of the one reading carries both.
     function test_imr_minClamp_continuousPastWarmup() public {
         h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
-        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 0}); // 300bp ratio >= 200bp target
+        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 1_000_000e18}); // 300bp ratio >= 200bp target
         h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: true, pairCreatedTs: 0, priceUpdateCount: 50_000});
         (uint256 imr, uint256 mmr, uint256 ts) = h.marginReqs();
         assertEq(imr, 400, "floored at MIN_IMR_BP");
-        assertEq(mmr, 200, "MMR = IMR/2");
+        assertEq(mmr, 200, "MMR = IMR/2 = the stress move");
         assertEq(ts, BASE_TS, "lastUpdateTs stamped");
+        assertEq(h.cachedTargetBp(), 200, "target = the same stress move");
     }
 
-    /// @notice Non-continuous applies the 2x multiplier: 300bp -> 600bp (above the 400 floor).
+    /// @notice A session-bound pair takes the WHOLE vol curve as its stress move where a 24/7
+    ///         pair takes half: 300bp of stress move, IMR 600, target 300. That is the closure
+    ///         prior, and it now reaches the fund target as well as margin.
     function test_imr_nonContinuousMultiplier() public {
         h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
-        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 0});
+        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 1_000_000e18});
         h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: false, pairCreatedTs: 0, priceUpdateCount: 50_000});
         (uint256 imr, uint256 mmr,) = h.marginReqs();
-        assertEq(imr, 600, "2x non-continuous multiplier");
+        assertEq(imr, 600, "the whole vol curve, doubled into IMR");
         assertEq(mmr, 300, "MMR = IMR/2");
+        assertEq(h.cachedTargetBp(), 300, "target tracks the same 300bp");
     }
 
-    /// @notice The gap leg binds when the gap EMA exceeds the (pre-doubling) vol estimate, and
-    ///         the winner is doubled: calm vol reads 300bp, a learned 15% reopen gap gives
-    ///         IMR = 2 x 1500 = 3000bp — so MMR (1500) covers a full repeat of the demonstrated
-    ///         reopen and IMR covers twice it.
+    /// @notice The reopen leg binds when the peak-hold exceeds the vol curve: calm vol reads
+    ///         300bp, a learned 15% reopen gives a 1500bp stress move, so IMR = 3000bp and MMR
+    ///         covers a full repeat of the demonstrated reopen. The fund sits at the (capped)
+    ///         target here so the health leg reads 1x and the margin claim is exact.
     function test_imr_reopenGapBinds_doubled() public {
         h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
-        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 0});
+        h.setVault({insuranceFundBalance: 100_000e18, totalLongOI: 1_000_000e18, totalShortOI: 1_000_000e18}); // 1000bp ratio = the capped target
         h.setReopenGap({gapEmaBp: 1500, lastObsTs: uint64(BASE_TS)});
         h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: false, pairCreatedTs: 0, priceUpdateCount: 50_000});
         (uint256 imr, uint256 mmr,) = h.marginReqs();
-        assertEq(imr, 3000, "IMR = 2 x max(vol 300, gap 1500)");
+        assertEq(imr, 3000, "IMR = 2 x max(vol 300, reopen 1500)");
         assertEq(mmr, 1500, "MMR = the full demonstrated reopen");
+        assertEq(h.cachedTargetBp(), 1_000, "a 15% stress move pins the 10% target cap");
+    }
+
+    /// @notice An underfunded pair raises MARGIN but never the target: the same 1500bp stress
+    ///         move with the fund at 300bp against its 1000bp target reads a 2.4x health
+    ///         multiplier on IMR, while the cached target is unmoved. Were the target taken from
+    ///         the multiplied figure it would chase its own shortfall upward.
+    function test_imr_fundHealthLiftsMarginNotTarget() public {
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
+        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 1_000_000e18}); // 300bp vs a 1000bp target
+        h.setReopenGap({gapEmaBp: 1500, lastObsTs: uint64(BASE_TS)});
+        h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: false, pairCreatedTs: 0, priceUpdateCount: 50_000});
+        (uint256 imr,,) = h.marginReqs();
+        assertEq(imr, 7200, "2 x 1500 x 2.4 health multiplier");
+        assertEq(h.cachedTargetBp(), 1_000, "the target reads the pair's risk, not the fund's level");
     }
 
     /// @notice A reopen gap below the (pre-doubling) vol estimate is inert: the estimators
@@ -407,11 +433,12 @@ contract RiskParamsStatefulTest is Test {
     ///         is never charged through both.
     function test_imr_reopenGapBelowVolEstimate_noEffect() public {
         h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
-        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 0});
+        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 1_000_000e18});
         h.setReopenGap({gapEmaBp: 250, lastObsTs: uint64(BASE_TS)});
         h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: false, pairCreatedTs: 0, priceUpdateCount: 50_000});
         (uint256 imr,,) = h.marginReqs();
-        assertEq(imr, 600, "gap below the vol estimate is inert: 2 x max(300, 250)");
+        assertEq(imr, 600, "reopen below the vol curve is inert: 2 x max(300, 250)");
+        assertEq(h.cachedTargetBp(), 300, "and inert in the target for the same reason");
     }
 
     /// @notice A cap-sized reopen gap (40%) doubles to exactly MAX_IMR_BP: a catastrophic
@@ -419,18 +446,19 @@ contract RiskParamsStatefulTest is Test {
     ///         decays, with MMR at the full 40% cap.
     function test_imr_cappedGapDoublesToMaxClamp() public {
         h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
-        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 0});
+        h.setVault({insuranceFundBalance: 100_000e18, totalLongOI: 1_000_000e18, totalShortOI: 1_000_000e18}); // at the capped target, so the health leg is 1x
         h.setReopenGap({gapEmaBp: 4000, lastObsTs: uint64(BASE_TS)});
         h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: false, pairCreatedTs: 0, priceUpdateCount: 50_000});
         (uint256 imr, uint256 mmr,) = h.marginReqs();
-        assertEq(imr, 8000, "2 x capped gap lands exactly on MAX_IMR_BP");
+        assertEq(imr, 8000, "the reopen cap is MAX_STRESS_MOVE_BP, so 2x it is exactly MAX_IMR_BP");
         assertEq(mmr, 4000, "MMR = the 40% gap cap");
+        assertEq(h.cachedTargetBp(), 1_000, "the target stops at its own 10% ceiling");
     }
 
     /// @notice Continuously traded pairs never consume the reopen-gap floor, whatever is stored.
     function test_imr_reopenGapIgnoredForContinuous() public {
         h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
-        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 0});
+        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 1_000_000e18});
         h.setReopenGap({gapEmaBp: 4000, lastObsTs: uint64(BASE_TS)});
         h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: true, pairCreatedTs: 0, priceUpdateCount: 50_000});
         (uint256 imr,,) = h.marginReqs();
@@ -443,29 +471,57 @@ contract RiskParamsStatefulTest is Test {
     ///         (10% of OI), not merely above the calm-market one.
     function test_imr_volCapAt6x_flowsThroughCurve() public {
         h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 247_000_000});
-        h.setVault({insuranceFundBalance: 100_000e18, totalLongOI: 1_000_000e18, totalShortOI: 0}); // 10% ratio = max target
+        h.setVault({insuranceFundBalance: 100_000e18, totalLongOI: 1_000_000e18, totalShortOI: 1_000_000e18}); // 10% ratio = max target
         h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: true, pairCreatedTs: 0, priceUpdateCount: 50_000});
         (uint256 imr, uint256 mmr,) = h.marginReqs();
         assertEq(imr, 1800, "vol leg saturates at 6x: 300 x 6");
         assertEq(mmr, 900, "MMR = IMR/2");
     }
 
-    /// @notice Extreme vol + extreme gap + empty fund: combined 3x*3x*3x -> 8100bp, clamped to
-    ///         MAX_IMR_BP = 8000. MMR = 4000.
+    /// @notice Saturating vol (6x -> a 900bp stress move) plus a 500bp realized gap gives
+    ///         1400bp; an empty fund's 3x health multiplier takes 2 x 1400 x 3 = 8400bp, clamped
+    ///         to MAX_IMR_BP. The target, which never sees the health leg, stops at its own 10%
+    ///         ceiling.
     function test_imr_maxClamp() public {
-        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: BazaarTypes.VARIANCE_EXTREME});
-        h.setGapEma({emaGapBp: 300, lastLiquidationTs: BASE_TS, decayedSize: 1e18});
-        h.setVault({insuranceFundBalance: 0, totalLongOI: 1_000_000e18, totalShortOI: 0}); // 0bp ratio -> 3x
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 247_000_000});
+        h.setGapEma({emaGapBp: 500, lastLiquidationTs: BASE_TS, decayedSize: 1e18});
+        h.setVault({insuranceFundBalance: 0, totalLongOI: 1_000_000e18, totalShortOI: 1_000_000e18}); // 0bp ratio -> 3x
         h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: true, pairCreatedTs: 0, priceUpdateCount: 50_000});
         (uint256 imr, uint256 mmr,) = h.marginReqs();
         assertEq(imr, 8000, "clamped at MAX_IMR_BP");
         assertEq(mmr, 4000, "MMR = IMR/2");
+        assertEq(h.cachedTargetBp(), 1_000, "target capped at INSURANCE_TARGET_MAX");
+    }
+
+    /// @notice A realized liquidation gap ADDS to the stress move at its own size rather than
+    ///         multiplying it, so the same 300bp of bad fills costs the same 300bp of
+    ///         maintenance margin whatever the volatility regime. Fund at the target throughout,
+    ///         so the health leg reads 1x.
+    function test_imr_liquidationGapAddsFlatAcrossVolRegimes() public {
+        // Calm pair: stress move 150 + 300 = 450 -> IMR 900, target 450.
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
+        h.setGapEma({emaGapBp: 300, lastLiquidationTs: BASE_TS, decayedSize: 1e18});
+        h.setVault({insuranceFundBalance: 100_000e18, totalLongOI: 1_000_000e18, totalShortOI: 1_000_000e18});
+        h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: true, pairCreatedTs: 0, priceUpdateCount: 50_000});
+        (uint256 calmImr,,) = h.marginReqs();
+        assertEq(calmImr, 900, "calm: 2 x (150 + 300)");
+        assertEq(h.cachedTargetBp(), 450, "target tracks the same reading");
+
+        // Volatile pair, same gap: stress move 450 + 300 = 750 -> IMR 1500. The gap contributed
+        // exactly 300bp of stress move in both regimes.
+        vm.warp(BASE_TS + 60);
+        h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: BazaarTypes.VARIANCE_EXTREME});
+        h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: true, pairCreatedTs: 0, priceUpdateCount: 50_000});
+        (uint256 wildImr,,) = h.marginReqs();
+        assertEq(wildImr, 1500, "volatile: 2 x (450 + 300)");
+        assertEq(wildImr - calmImr, 600, "the vol leg moved 600; the gap's 600 is unchanged");
+        assertEq(h.cachedTargetBp(), 750, "target still one-for-one with the stress move");
     }
 
     /// @notice Continuous pair during warmup: 400bp computed value floored to WARMUP_MIN_IMR_BP = 2000.
     function test_imr_warmupFloor_continuous() public {
         h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
-        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 0});
+        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 1_000_000e18});
         // pairCreatedTs = now (elapsed 0 < 5 days) AND priceUpdateCount 0 < 50k -> warmup active
         h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: true, pairCreatedTs: BASE_TS, priceUpdateCount: 0});
         (uint256 imr, uint256 mmr,) = h.marginReqs();
@@ -478,18 +534,19 @@ contract RiskParamsStatefulTest is Test {
     ///         cold-start gap risk).
     function test_imr_warmupFloor_nonContinuous() public {
         h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
-        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 0});
+        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 1_000_000e18});
         h.calcIMRandMMR({currentPrice: 1e18, isContinuouslyTraded: false, pairCreatedTs: BASE_TS, priceUpdateCount: 0});
         (uint256 imr, uint256 mmr,) = h.marginReqs();
         assertEq(imr, 4000, "non-continuous warmup floor = 40% IMR");
         assertEq(mmr, 2000, "MMR = IMR/2");
+        assertEq(h.cachedTargetBp(), 300, "the warmup floor lifts margin only, never the target");
     }
 
     /// @notice Within the 1-minute IMR cooldown the call early-returns and leaves margins untouched;
     ///         at exactly +60s it recomputes. Pins the strict-`<` cooldown boundary.
     function test_imr_cooldownBoundary() public {
         h.setPairPrice({spotPrice: 100e18, updateTs: BASE_TS, emaVarianceBp: 0});
-        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 0});
+        h.setVault({insuranceFundBalance: 30_000e18, totalLongOI: 1_000_000e18, totalShortOI: 1_000_000e18});
         h.setMarginReqs({imrBp: 1234, mmrBp: 617, lastUpdateTs: BASE_TS});
 
         // Same timestamp: block.timestamp < lastUpdateTs + 60 -> early return, sentinel preserved.
@@ -497,6 +554,9 @@ contract RiskParamsStatefulTest is Test {
         (uint256 imr0,, uint256 ts0) = h.marginReqs();
         assertEq(imr0, 1234, "cooldown blocks recompute");
         assertEq(ts0, BASE_TS, "lastUpdateTs unchanged during cooldown");
+        // The target is cached BEFORE the cooldown gate, so the ADL reserve tracks it even on a
+        // call that leaves margin alone.
+        assertEq(h.cachedTargetBp(), 200, "target refreshed despite the cooldown");
 
         // Exactly +60s: no longer < cooldown -> recomputes to the floored 400.
         vm.warp(BASE_TS + 60);

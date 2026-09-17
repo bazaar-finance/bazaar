@@ -5,6 +5,8 @@ import {IntegrationBase} from "./IntegrationBase.sol";
 import {StdStorage, stdStorage} from "forge-std/Test.sol";
 import {BazaarPair} from "../../src/BazaarPair.sol";
 import {BazaarPairTerminator} from "../../src/BazaarPairTerminator.sol";
+import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
+import {BucketStore} from "../BucketStore.sol";
 
 /// @title CrisisBackstopIntegrationTest
 /// @notice The protocol's last-resort insolvency backstops, end-to-end: a recorded deficit
@@ -20,7 +22,7 @@ contract CrisisBackstopIntegrationTest is IntegrationBase {
     function test_e2e_Deficit_TerminatesPairOnNextHealthCheck() public {
         // Record phantom bad debt directly (the netting-overrun producer is unit-tested elsewhere).
         _stdstore.target(address(pair)).sig("pairVault()").depth(11).checked_write(100 * BAZAAR_SCALE);
-        (,,,,,,,,,,, uint256 deficit) = pair.pairVault();
+        (,,,,,,,,,,, uint256 deficit,,) = pair.pairVault();
         assertEq(deficit, 100 * BAZAAR_SCALE, "deficit seeded");
 
         // Any liquidation re-runs isVaultHealthy; Check 0 fires before everything else.
@@ -32,11 +34,12 @@ contract CrisisBackstopIntegrationTest is IntegrationBase {
         vm.prank(bob);
         pair.liquidate(_arr1(alice), _freshPrice());
 
-        // Two-stage insolvency: the deficit check FIXES the settlement price and opens the 48h
-        // window (freezing withdrawals immediately — the point of Check 0) rather than
-        // terminating mid-transaction. Finalize completes it, charging the deficit to insurance.
+        // Two-stage insolvency: the deficit check FIXES the settlement price and opens the
+        // settlement window (freezing withdrawals immediately — the point of Check 0) rather than
+        // terminating mid-transaction. Finalize completes it, folding the deficit into what is
+        // owed and charging it to the insurers' residual.
         assertGt(pair.settlementPriceFixedTs(), 0, "deficit opened the settlement window");
-        assertFalse(pair.isPairTerminatedNormal(), "not terminated until finalize");
+        assertFalse(pair.isPairTerminated(), "not terminated until finalize");
 
         // The pair is halted: no further deposits — INCLUDING at the stamping timestamp itself.
         // The deposit sweep guard keys on settlementPriceFixedTs directly (no timestamp
@@ -53,11 +56,9 @@ contract CrisisBackstopIntegrationTest is IntegrationBase {
         pair.depositCollateral(1 * BAZAAR_SCALE, 0, 0, 0, "", "");
         vm.stopPrank();
 
-        // After the window, anyone finalizes → normal (equity) termination.
-        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
+        // Nothing is left open (alice was liquidated), so anyone finalizes at once.
         pair.finalizeTermination();
-        assertTrue(pair.isPairTerminatedNormal(), "deficit settled the pair via the equity path");
-        assertFalse(pair.isPairTerminatedEmergency(), "live price -> normal, not emergency");
+        assertTrue(pair.isPairTerminated(), "deficit settled the pair via the equity path");
     }
 
     /// @notice Check 0 while an accepted scheduled termination's cutoff is still in the future:
@@ -86,7 +87,9 @@ contract CrisisBackstopIntegrationTest is IntegrationBase {
         bytes[] memory noPu = new bytes[](0);
         vm.prank(carol);
         vm.expectRevert(BazaarPair.BazaarPair__PairScheduledForTermination.selector);
-        pair.createOrder(_limitSpec(true, BAZAAR_SCALE / 10, 49_000 * BAZAAR_SCALE), _hintsNone(), noPu, 0, 0, 0, "");
+        pair.createOrder(
+            _limitSpec(true, BAZAAR_SCALE / 10, 49_000 * BAZAAR_SCALE), _hintsNone(), noPu, 0, 0, 0, "", ""
+        );
 
         vm.prank(seq);
         vm.expectRevert(BazaarPair.BazaarPair__PairScheduledForTermination.selector);
@@ -98,14 +101,13 @@ contract CrisisBackstopIntegrationTest is IntegrationBase {
         vm.expectRevert(BazaarPair.BazaarPair__SweepWindowActive.selector);
         pair.depositCollateral(1 * BAZAAR_SCALE, 0, 0, 0, "", "");
         vm.expectRevert(BazaarPair.BazaarPair__SweepWindowActive.selector);
-        pair.depositToInsurance(10 * BAZAAR_SCALE, 0, 0, 0, "", "");
+        pair.depositToInsurance(10 * BAZAAR_SCALE, new bytes[](0), 0, 0, 0, "", "");
         vm.stopPrank();
 
         // Sweep settlement stays live, and finalize completes inside the original notice period.
         assertEq(pair.liquidate(_arr1(carol), noPu), 0, "flat user: settlement path callable");
-        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
         pair.finalizeTermination();
-        assertTrue(pair.isPairTerminatedNormal(), "finalized before the original cutoff arrived");
+        assertTrue(pair.isPairTerminated(), "finalized before the original cutoff arrived");
     }
 
     /// @notice ADL timeout: an ADL that stays pending past ADL_TIMEOUT_DURATION (24h) is treated as
@@ -135,24 +137,46 @@ contract CrisisBackstopIntegrationTest is IntegrationBase {
         address eve = makeAddr("eve");
         usdc.mint(eve, 1_000 * USDC_SCALE);
         _deposit(eve, 10 * BAZAAR_SCALE);
-        _stdstore.target(address(pair)).sig("positionBuckets(address)").with_key(eve).depth(0).checked_write(true);
-        _stdstore.target(address(pair)).sig("positionBuckets(address)").with_key(eve).depth(1)
-            .checked_write(BAZAAR_SCALE / 10);
-        _stdstore.target(address(pair)).sig("positionBuckets(address)").with_key(eve).depth(2)
-            .checked_write(5_005 * BAZAAR_SCALE);
+        BucketStore.setIsLong(address(pair), eve, true);
+        BucketStore.setSize(address(pair), eve, BAZAAR_SCALE / 10);
+        BucketStore.setEntryValue(address(pair), eve, 5_005 * BAZAAR_SCALE);
 
         vm.prank(carol);
         assertEq(pair.liquidate(_arr1(eve), _freshPrice()), 1, "eve liquidated after the timeout");
 
+        // The first price stored past the timeout arms the runway rather than terminating: the
+        // auction is owed a fresh-priced window before anyone may pull the plug, so that a feed
+        // outage spanning the deadline cannot leave both paths unblocking in the same block.
+        assertEq(
+            pair.adlTerminationTs(),
+            vm.getBlockTimestamp() + BazaarTypes.ADL_TERMINATION_GRACE,
+            "runway armed off the stored price"
+        );
+        assertEq(pair.settlementPriceFixedTs(), 0, "arming must not terminate in the same block");
+
+        // Let the runway lapse; the next priced call fires the expired clock.
+        vm.warp(pair.adlTerminationTs());
+        pair.refreshPrice(_freshPrice());
+
         // Two-stage: the timed-out ADL is treated as price-driven insolvency → fix the price and
         // open the settlement window, then finalize to settle via the equity path.
         assertGt(pair.settlementPriceFixedTs(), 0, "adl timeout opened the settlement window");
-        assertFalse(pair.isPairTerminatedNormal(), "not terminated until finalize");
+        assertFalse(pair.isPairTerminated(), "not terminated until finalize");
 
-        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
+        address[] memory both = new address[](2);
+        both[0] = alice;
+        both[1] = bob;
+        assertEq(pair.liquidate(both, new bytes[](0)), 2, "open positions settled at the fixed price");
         pair.finalizeTermination();
-        assertTrue(pair.isPairTerminatedNormal(), "timed-out ADL settled the pair via the equity path");
-        assertFalse(pair.isPairTerminatedEmergency(), "live price -> normal termination, not emergency");
+        assertTrue(pair.isPairTerminated(), "timed-out ADL settled the pair via the equity path");
+        assertFalse(pair.isAdlPending(), "finalize clears the ADL latch");
+
+        // Finalize retires the window whole. This route is where a clock is most likely to be left
+        // behind, since reaching it requires the runway to have been armed and elapsed, and a
+        // survivor would show a window that both has and has not ended.
+        assertEq(pair.adlPendingSince(), 0, "finalize clears the termination clock");
+        assertEq(pair.adlTerminationTs(), 0, "finalize clears the runway");
+        assertEq(pair.adlAuctionStartTs(), 0, "finalize clears the decay clock");
     }
 
     /// @notice Insurer-vote consensus that outlives the 7-day execution window: the proposer's bond
@@ -181,7 +205,7 @@ contract CrisisBackstopIntegrationTest is IntegrationBase {
         vm.warp(vm.getBlockTimestamp() + 14 days + 1);
         terminator.executeInsurerTermination(address(pair), new bytes[](0));
 
-        assertFalse(pair.isPairTerminatedNormal(), "stale consensus must not terminate");
+        assertFalse(pair.isPairTerminated(), "stale consensus must not terminate");
         assertEq(usdc.balanceOf(carol), carolAfterPropose + bond, "bond refunded on real consensus");
         (,,,,,, bool resolved, bool executed) = terminator.insurerProposals(address(pair));
         assertTrue(resolved, "proposal resolved");

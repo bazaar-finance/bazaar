@@ -9,8 +9,8 @@
                               ▼
                         ┌────────────────────┐   ┌──────────────────────┐
                         │     BazaarPair     │◄─►│ BazaarPairTerminator │
-                        │ one per market:    │   │ scheduled · cessation│
-                        │ book · matching    │   │ stale-oracle · vote  │
+                        │ one per market:    │   │ scheduled · insurer  │
+                        │ book · matching    │   │ vote · stale-oracle  │
                         │ margin · funding   │   │ wind-down paths      │
                         │ ADL · insurance    │   └──────────────────────┘
                         └───┬────────────┬───┘
@@ -29,8 +29,8 @@ One `BazaarPair` clone = one market. Each clone holds its own order book, positi
 `BazaarPair` would blow past the EIP-170 24 KB limit many times over, so the logic is split three ways:
 
 - **External DELEGATECALL libraries** — deployed once, linked by address, and executed in the pair's storage context: `MatchingEngineLib`, `OrderManagementLib`, `CollateralLib`, `LiquidationLib`, `AdlLib`, `InsuranceVaultLib`, `RiskParamsLib`, `FundingLib`, `TerminationLib`, `MetaTxLib`. Their bytecode does not count toward the pair's limit. All ten carry link references in `BazaarPair` and must be deployed on the target chain and passed as `--libraries` flags before it can be deployed — see [Self-Deployment](../guide/deployment.md).
-- **Inlined internal libraries** — small, hot helpers compiled into callers: `BazaarTypes` (structs/constants), `OrderBookLib` (the sorted doubly-linked book lists), `BucketLib` (solvency math), `VaultHealthLib` (ADL/termination triggers), `MmrSampleLib` (lagged-MMR ring buffer), `BazaarMathLib` (fixed-point + effective prices).
-- **`BazaarPairLens`** — computed views (solvency checks, share prices, ADL thresholds, EIP-712 constants) that never needed to be in the pair.
+- **Inlined internal libraries** — small, hot helpers compiled into callers: `BazaarTypes` (structs/constants), `OrderBookLib` (the sorted doubly-linked book lists), `BucketLib` (solvency math), `VaultHealthLib` (ADL/termination triggers), `MmrSampleLib` (lagged-MMR ring buffer), `FeeEscrowLib` (the claimable-balance escrow every payout accrues through), `BazaarMathLib` (fixed-point + effective prices).
+- **`BazaarPairLens`** — computed views (solvency checks, insurance share values and LP flow quotes, ADL scores and constants, EIP-712 constants) that never needed to be in the pair.
 
 Even split three ways the budget is tight: `BazaarPair` and `MatchingEngineLib` are the two artifacts nearest the EIP-170 ceiling, and `foundry.toml` compiles everything at a single global `optimizer_runs = 150` so the artifact the size gate measures is identical to the artifact that ships. The gas cost is modest — the hot paths (the matching walk, liquidation, settlement) are storage-dominated, where optimizer runs matter least. The limits are enforced as a test (`test/unit/ContractSizeTest.t.sol`, production contracts only) rather than via `forge build --sizes`, whose gate would also fail on test-only harnesses.
 
@@ -47,4 +47,4 @@ Even split three ways the budget is tight: `BazaarPair` and `MatchingEngineLib` 
 
 ## Accounting invariant
 
-The pair tracks two ledgers — `totalCollateralDeposited` (D, sum of every position bucket's collateral) and `insuranceFundBalance` (I). All internal value movements (vault PnL, ADL credits, fee flows) are booked as **I↔D transfers**, never bare credits, so `I + D` always equals the USDC the contract should hold. Every matching transaction, liquidation, unload, ADL execution, and withdrawal re-checks `balanceOf(pair) ≥ I + D` within a 0.1% tolerance; a shortfall triggers autonomous [emergency termination](termination.md). This is the protocol's tamper-evident seal: if value ever leaks, the market freezes into pro-rata withdrawal mode rather than letting a first-mover drain it.
+The pair tracks two ledgers — `totalCollateralDeposited` (D, the deposits ledger: every bucket's collateral plus the open positions' net unrealized PnL, since realized PnL moves buckets but not the ledger) and `insuranceFundBalance` (I). All internal value movements (vault PnL, ADL credits, fee flows) are booked as **I↔D transfers**, never bare credits. Alongside them sits a third claim on the same cash: the [fee escrow](fees.md#how-payouts-are-paid) (E), the unclaimed total the pair owes third parties. Every matching transaction, liquidation, unload, ADL execution, and withdrawal re-checks `balanceOf(pair) ≥ I + D + E` within a 0.1% tolerance; a shortfall opens the [settlement window](termination.md) at the live price. Escrowed fees belong in that expectation exactly like principal and insurance — omitting them would let the fund look solvent on cash already owed away. This is the protocol's tamper-evident seal: if value ever leaks, the market freezes and settles pro-rata on the cash actually held rather than letting a first-mover drain it.

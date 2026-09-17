@@ -4,13 +4,15 @@ pragma solidity 0.8.34;
 import {Test} from "forge-std/Test.sol";
 import {InsuranceVaultLib} from "../../src/libraries/InsuranceVaultLib.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
-import {MockUSDC} from "../mocks/MockUSDC.sol";
 
-/// @dev Hosts a Vault so the external (DELEGATECALL) InsuranceVaultLib.payUmaProposerReward runs in
-///      this contract's storage — the same context BazaarPair provides it. Mirrors the pair's
-///      insuranceFundBalance / USDC-holding role.
+/// @dev Hosts a Vault and a FeeEscrow so the external (DELEGATECALL) InsuranceVaultLib
+///      .payUmaProposerReward runs in this contract's storage — the same context BazaarPair
+///      provides it.
 contract PayRewardHarness {
+    bytes32 internal constant PAIR_ID = bytes32("TEST");
+
     BazaarTypes.Vault internal vault;
+    BazaarTypes.FeeEscrow internal feeEscrow;
 
     function setInsurance(uint256 b) external {
         vault.insuranceFundBalance = b;
@@ -20,81 +22,102 @@ contract PayRewardHarness {
         return vault.insuranceFundBalance;
     }
 
-    function pay(address usdc, address proposer) external {
-        InsuranceVaultLib.payUmaProposerReward(vault, usdc, proposer);
+    function claimable(address who) external view returns (uint256) {
+        return feeEscrow.claimable[who];
+    }
+
+    function escrowTotal() external view returns (uint256) {
+        return feeEscrow.total;
+    }
+
+    function pay(address proposer) external {
+        InsuranceVaultLib.payUmaProposerReward(vault, feeEscrow, PAIR_ID, proposer);
     }
 }
 
-/// @notice `payUmaProposerReward` debits the insurance fund mid-termination and had zero direct
-///         assertions. These pin the 1-bps computation, the $100 cap, the zero-reward early return,
-///         and the soft-fail restore (a blacklisted proposer must not DoS termination OR silently
-///         leak the fund) — an error in any arm breaks the I+D books during the termination flow.
+/// @notice `payUmaProposerReward` debits the insurance fund mid-termination. These pin the 1-bps
+///         computation, the $100 cap, the zero-reward early return, and the escrow booking: the
+///         debit and the proposer's claimable credit must move together, or the I + D + escrow
+///         books drift during the termination flow.
 contract TerminatorProposerRewardTest is Test {
     uint256 constant SCALE = 1e18;
-    uint256 constant USDC_SCALE = 1e6;
+    bytes32 constant PAIR_ID = bytes32("TEST");
 
     PayRewardHarness internal h;
-    MockUSDC internal usdc;
     address internal proposer = makeAddr("proposer");
-
-    // transfer(address,uint256) selector
-    bytes4 constant TRANSFER_SEL = 0xa9059cbb;
 
     function setUp() public {
         h = new PayRewardHarness();
-        usdc = new MockUSDC();
-        usdc.mint(address(h), 1_000_000 * USDC_SCALE); // fund the "pair" so real payouts can settle
     }
 
-    /// @notice A large fund makes 1 bps exceed $100, so the reward caps at $100 and the proposer
-    ///         receives exactly $100.
+    /// @notice A large fund makes 1 bps exceed $100, so the reward caps at $100 and exactly $100
+    ///         becomes claimable by the proposer.
     function test_reward_capsAt100() public {
         h.setInsurance(2_000_000 * SCALE); // 1 bps = $200 -> capped to $100
         uint256 fundBefore = h.insurance();
-        h.pay(address(usdc), proposer);
+
+        vm.expectEmit(true, true, false, true, address(h));
+        emit BazaarTypes.FeeAccrued(PAIR_ID, proposer, 100 * SCALE);
+        h.pay(proposer);
 
         assertEq(fundBefore - h.insurance(), 100 * SCALE, "fund debited exactly $100 (cap)");
-        assertEq(usdc.balanceOf(proposer), 100 * USDC_SCALE, "proposer paid $100");
+        assertEq(h.claimable(proposer), 100 * SCALE, "proposer owed $100");
+        assertEq(h.escrowTotal(), 100 * SCALE, "escrow liability matches the debit");
     }
 
     /// @notice Below the cap the reward is exactly 1 bps of the fund. $50k fund -> $50.
     function test_reward_oneBpsBelowCap() public {
         h.setInsurance(50_000 * SCALE); // 1 bps = $50
-        h.pay(address(usdc), proposer);
+        h.pay(proposer);
 
         assertEq(h.insurance(), 50_000 * SCALE - 50 * SCALE, "fund debited $50 (1 bps)");
-        assertEq(usdc.balanceOf(proposer), 50 * USDC_SCALE, "proposer paid $50");
+        assertEq(h.claimable(proposer), 50 * SCALE, "proposer owed $50");
     }
 
-    /// @notice A fund so small that 1 bps rounds to zero is a no-op — nothing debited, nothing sent.
+    /// @notice A fund so small that 1 bps rounds to zero is a no-op — nothing debited, nothing owed.
     function test_reward_zeroReward_noOp() public {
         h.setInsurance(999); // 999 * 10 / 10000 = 0
-        h.pay(address(usdc), proposer);
+        h.pay(proposer);
 
         assertEq(h.insurance(), 999, "no debit on zero reward");
-        assertEq(usdc.balanceOf(proposer), 0, "nothing sent");
+        assertEq(h.claimable(proposer), 0, "nothing owed");
+        assertEq(h.escrowTotal(), 0, "no liability recorded");
     }
 
-    /// @notice A reward positive in 1e18 terms but under one USDC micro-unit sends nothing, so the
-    ///         debit is restored (net-zero) — the fund is never silently drained by sub-µUSDC dust.
-    function test_reward_subMicroUsdc_restored() public {
-        h.setInsurance(1e14); // 1 bps = 1e11 (>0) but 1e11/1e12 = 0 USDC units
-        h.pay(address(usdc), proposer);
+    /// @notice A reward positive in 1e18 terms but under one USDC micro-unit still accrues: the
+    ///         escrow keeps BAZAAR precision, so dust accumulates toward a claimable amount
+    ///         instead of being dropped, and the fund is debited exactly what was credited.
+    function test_reward_subMicroUsdc_accrues() public {
+        h.setInsurance(1e14); // 1 bps = 1e11 (>0) but 1e11 / 1e12 = 0 USDC units
+        h.pay(proposer);
 
-        assertEq(h.insurance(), 1e14, "sub-microUSDC reward restored (net zero)");
-        assertEq(usdc.balanceOf(proposer), 0, "nothing sent");
+        assertEq(h.insurance(), 1e14 - 1e11, "fund debited the dust reward");
+        assertEq(h.claimable(proposer), 1e11, "dust accrues at full precision");
     }
 
-    /// @notice A failing transfer (e.g. a blacklisted proposer, transfer returns false) is soft-failed:
-    ///         the debit is restored so the fund is intact and the termination flow is not DoS'd.
-    function test_reward_transferReturnsFalse_restored() public {
+    /// @notice The reward path is pure storage — no token call for a blacklisted or reverting
+    ///         proposer address to break, so the termination callback that triggers it can never
+    ///         be reverted by the recipient. A contract that rejects everything is credited like
+    ///         any other address.
+    function test_reward_revertingRecipient_stillAccrues() public {
         h.setInsurance(50_000 * SCALE);
-        // Force transfer(...) -> false regardless of args.
-        vm.mockCall(address(usdc), abi.encodeWithSelector(TRANSFER_SEL), abi.encode(false));
+        address hostile = address(new RevertsOnEverything());
 
-        h.pay(address(usdc), proposer);
+        h.pay(hostile);
 
-        assertEq(h.insurance(), 50_000 * SCALE, "debit restored on failed transfer");
-        assertEq(usdc.balanceOf(proposer), 0, "blacklisted proposer receives nothing");
+        assertEq(h.insurance(), 50_000 * SCALE - 50 * SCALE, "fund debited despite a hostile recipient");
+        assertEq(h.claimable(hostile), 50 * SCALE, "credit recorded for the hostile recipient");
+    }
+}
+
+/// @dev Reverts on any call or plain transfer — the shape of a recipient that would poison a push
+///      payment.
+contract RevertsOnEverything {
+    fallback() external payable {
+        revert("no");
+    }
+
+    receive() external payable {
+        revert("no");
     }
 }

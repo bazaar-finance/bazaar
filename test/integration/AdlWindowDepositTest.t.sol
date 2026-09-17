@@ -11,8 +11,8 @@ contract AdlWindowDepositTest is IntegrationBase {
     // adlDepositEpoch / adlWindowDeposits are internal mappings (no getter); slots from
     // `forge inspect BazaarPair storage-layout`. The guard assertions below fail loudly if the
     // layout ever shifts, so hardcoding the slot can't silently read the wrong word.
-    uint256 constant SLOT_ADL_DEPOSIT_EPOCH = 122;
-    uint256 constant SLOT_ADL_WINDOW_DEPOSITS = 123;
+    uint256 constant SLOT_ADL_DEPOSIT_EPOCH = 121;
+    uint256 constant SLOT_ADL_WINDOW_DEPOSITS = 122;
 
     function _adlDepositEpoch(address u) internal view returns (uint256) {
         return uint256(vm.load(address(pair), keccak256(abi.encode(u, SLOT_ADL_DEPOSIT_EPOCH))));
@@ -24,7 +24,7 @@ contract AdlWindowDepositTest is IntegrationBase {
 
     /// @dev Drive the pair into a live ADL window via a deep-underwater liquidation the vault
     ///      inherits: a real matched 5 BTC book, then a phantom estate whose bankruptcy gap
-    ///      overruns 80% of the insurance fund.
+    ///      overruns the insurance fund's free capital above its reserve.
     function _triggerAdl() internal {
         _deposit(alice, 60_000 * BAZAAR_SCALE);
         _deposit(bob, 60_000 * BAZAAR_SCALE);

@@ -18,17 +18,20 @@ assertionResolvedCallback / settleDeploymentProposal
         └─ disputed-and-false → bond lost to disputer, seed refunded
 ```
 
+Submission is gated on the feed itself. `baseFeedId` must be either a composite already registered in `BazaarOracle` or a raw feed ID for which Arbitrum's Pyth contract already holds a price — a feed that has never been pulled on this chain needs one update posted before it can be proposed, and a mistyped ID is rejected before any seed is escrowed. The gate exists because the factory decides at submission, by reading the composite registry, whether the claim describes a single feed or two legs and whether the composite-must-not-be-continuous rule applies; the registry is permissionless and write-once, and every pair resolves its feed through it live. Without the gate an unregistered composite hash would be listed as a plain single feed and could have its legs registered after approval, producing a composite market — FX leg, inversion direction, 24/7 flag — that UMA never reviewed. A stored Pyth price makes that unrepresentable, since a composite can only ever be registered under the hash of its legs and never under a real feed ID.
+
 ## What UMA verifiers check
 
-The assertion text embeds seven objective criteria:
+The assertion text embeds eight objective criteria:
 
-1. **Feed validity** — `baseFeedId` exists in Pyth's registry and matches the description.
+1. **Feed validity** — `baseFeedId` exists in Pyth Core's registry and matches the description. Core and Pro are separate products with disjoint feed-ID namespaces, and only Core feeds are readable from the oracle contract, so the claim names Core explicitly rather than leaving verifiers to pick a registry.
 2. **Trading-schedule flag** — `isContinuouslyTraded = true` only for genuinely 24/7 assets (crypto). Stocks, FX, and anything with market hours must be `false` (their IMR is 2× the larger of the vol curve and the pair's observed reopen gap, and they get the stale-oracle regime). Composites must be `false`.
 3. **Eligible asset** — an actual tradeable asset or broad market index, USD-denominated.
 4. **Composite quote leg** — non-USD quotes only through approved fiat legs (EUR, GBP, JPY, CHF, CAD, AUD, NZD, SEK, NOK, DKK, SGD, HKD, CNH).
 5. **Linear, non-expiring spot exposure** — the test is: *could someone hold this asset indefinitely and experience exactly its price change?* Futures, options, bonds, leveraged/inverse products, volatility indices, rate products, pegged/rebased assets, and prediction markets are excluded.
-6. **No 1:1 duplicates** — no wrapped BTC next to BTC, no S&P 500 ETF next to the index (propose the index itself), unless the underlying has no Pyth feed.
+6. **No 1:1 duplicates** — derivative trackers only: no wrapped BTC next to BTC, no S&P 500 ETF next to the index (propose the index itself), unless the underlying has no Pyth Core feed on Arbitrum.
 7. **Non-USD assets only as composites.**
+8. **Same security in multiple markets** — one exposure, one listing, resolved toward the USD-quoted feed because it needs no FX leg: an ADR beats the foreign ordinary's composite, and a US line beats its foreign twin. Share classes count as the same security unless their economics actually differ — a perp conveys no vote, so a voting/non-voting split is not a difference that reaches the instrument, and the higher-volume class wins. Genuinely separate entities with stapled economics (dual-listed company structures) are distinct, and both are eligible.
 
 A market whose pair was previously [terminated](termination.md) can be re-proposed.
 
@@ -36,7 +39,7 @@ A market whose pair was previously [terminated](termination.md) can be re-propos
 
 ## Non-USD assets: composite feeds
 
-Assets quoted in another currency (e.g. DAX in EUR) trade against a **composite feed**: `price = base × quote` or `base ÷ quote` depending on the FX feed's direction. Composites are registered permissionlessly and idempotently in `BazaarOracle` (`registerComposite(baseId, quoteId, invertQuote)`); the composite ID — `keccak256(baseId ‖ quoteId ‖ invertQuote)` — is then used anywhere a feed ID is expected. A composite is only as fresh as its stalest leg, and both legs are confidence-checked.
+Assets quoted in another currency (e.g. DAX in EUR) trade against a **composite feed**: `price = base × quote` or `base ÷ quote` depending on the FX feed's direction. Composites are registered permissionlessly and idempotently in `BazaarOracle` (`registerComposite(baseId, quoteId, invertQuote)`); the composite ID — `keccak256(baseId ‖ quoteId ‖ invertQuote)` — is then used anywhere a feed ID is expected. A composite is only as fresh as its stalest leg, and both legs are confidence-checked. Register the composite before proposing it: an unregistered composite ID is rejected at submission, since Pyth holds no price under it.
 
 ## The only governance: swapping the UMA identifier
 

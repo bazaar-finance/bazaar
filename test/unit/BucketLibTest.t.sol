@@ -102,7 +102,7 @@ contract BucketLibTest is Test {
             })
         );
         BazaarTypes.MarginRequirements memory mr =
-            BazaarTypes.MarginRequirements({imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0});
+            BazaarTypes.MarginRequirements({imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0, laggedMmrTs: 0});
         bytes32 pid = bytes32("PID");
         address user = address(0xABCD);
 

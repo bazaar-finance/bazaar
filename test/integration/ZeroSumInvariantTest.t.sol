@@ -8,9 +8,11 @@ import {BazaarFactory} from "../../src/BazaarFactory.sol";
 import {BazaarPair} from "../../src/BazaarPair.sol";
 import {BazaarOracle} from "../../src/BazaarOracle.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
+import {OrderView} from "../OrderView.sol";
 import {MockUSDC} from "../mocks/MockUSDC.sol";
 import {MockArbSys} from "../mocks/MockArbSys.sol";
 import {MockPyth} from "@pythnetwork/pyth-sdk-solidity/MockPyth.sol";
+import {PythSeed} from "../PythSeed.sol";
 
 /// @title ZeroSumInvariantTest
 /// @notice Books-conservation invariants asserted at every step of realistic trading lifecycles.
@@ -101,6 +103,7 @@ contract ZeroSumInvariantTest is Test {
         usdc = MockUSDC(usdcAddr);
         oracle = factory.oracle();
         mockPyth = MockPyth(address(oracle.pyth()));
+        PythSeed.seed(address(mockPyth), BTC_USD_FEED_ID);
 
         usdc.mint(deployer, INITIAL_USER_BALANCE);
         usdc.mint(alice, INITIAL_USER_BALANCE);
@@ -127,6 +130,13 @@ contract ZeroSumInvariantTest is Test {
     // ║                    THE INVARIANT                             ║
     // ╚══════════════════════════════════════════════════════════════╝
 
+    /// @dev The fee escrow's total liability: fees earned by integrators, the bug-bounty
+    ///      recipient and keepers that nobody has claimed yet. Cash the contract still holds
+    ///      against a third-party claim, so the invariants count it on the claims side.
+    function _escrowTotal() internal view returns (uint256 total) {
+        (, total) = pair.claimableFees(address(0));
+    }
+
     /// @dev Trader equity marked at (price P, funding index F): collateral + price PnL + funding PnL.
     function _equityAt(address u, uint256 p, int256 f) internal view returns (int256 equity) {
         (bool isLong, uint256 size, uint256 entryValue, uint256 collateral, int256 entryFundingIdx,,,,) =
@@ -146,7 +156,7 @@ contract ZeroSumInvariantTest is Test {
     ///      bases the unload walk settles against, so realizing inventory moves value to
     ///      insurance 1:1.
     function _vaultInventoryAt(uint256 p, int256 f) internal view returns (int256 value) {
-        (,,,,,, uint256 plSize, uint256 plEntry,, int256 plFundIdx, bool plIsLong,) = pair.pairVault();
+        (,,,,,, uint256 plSize, uint256 plEntry,, int256 plFundIdx, bool plIsLong,,,) = pair.pairVault();
         if (plSize == 0) return 0;
 
         int256 notional = int256(plSize * p / BAZAAR_SCALE);
@@ -166,12 +176,14 @@ contract ZeroSumInvariantTest is Test {
     ///      `priceUsd` is only a marking price — conservation is price-independent because long
     ///      and short sizes (traders + vault inventory) always balance.
     function _assertZeroSum(uint256 priceUsd, string memory label) internal view {
-        (,,,,, uint256 I,,,,,, uint256 deficit) = pair.pairVault();
+        (,,,,, uint256 I,,,,,, uint256 deficit,,) = pair.pairVault();
         assertEq(deficit, 0, string.concat(label, ": no realized bad debt expected in this scenario"));
 
         uint256 p = priceUsd * BAZAAR_SCALE;
         int256 f = pair.currentFundingIndex();
-        int256 claims = int256(I);
+        // Earned-but-unclaimed fees are a third-party claim on cash the contract still holds,
+        // so they count as claims until someone calls claimFees.
+        int256 claims = int256(I) + int256(_escrowTotal());
         for (uint256 i = 0; i < traders.length; i++) {
             claims += _equityAt(traders[i], p, f);
         }
@@ -216,8 +228,7 @@ contract ZeroSumInvariantTest is Test {
     function _lastCreatedOrderId() internal returns (uint256) {
         uint256 w = idProbe == 0 ? 1 : idProbe;
         while (true) {
-            (address creator,,,,,,,,,,,,,,,,,) = pair.orders(w);
-            if (creator == address(0)) break;
+            if (OrderView.order(pair, w).creator == address(0)) break;
             ++w;
         }
         idProbe = w;
@@ -226,7 +237,7 @@ contract ZeroSumInvariantTest is Test {
     }
 
     function _filledOf(uint256 orderId) internal view returns (uint256 filled) {
-        (,,,,,, filled,,,,,,,,,,,) = pair.orders(orderId);
+        return OrderView.order(pair, orderId).filledSize;
     }
 
     function _placeLimit(address user, bool isLong, uint256 size, uint256 limitPrice) internal returns (uint256) {
@@ -249,7 +260,7 @@ contract ZeroSumInvariantTest is Test {
         spec.expirationBlock = uint64(block.number + 500_000);
         BazaarTypes.MatchHints memory hints;
         vm.prank(user);
-        pair.createOrder(spec, hints, pu, 0, 0, 0, "");
+        pair.createOrder(spec, hints, pu, 0, 0, 0, "", "");
         return _lastCreatedOrderId();
     }
 
@@ -395,7 +406,7 @@ contract ZeroSumInvariantTest is Test {
         _deposit(carol, 12_000 * BAZAAR_SCALE);
         _placeLimit(carol, true, 1 * BAZAAR_SCALE, 41_400 * BAZAAR_SCALE);
         assertEq(_unloadAt(41_000), 1 * BAZAAR_SCALE, "vault inventory closed");
-        (,,,,,, uint256 plSize,,,,,) = pair.pairVault();
+        (,,,,,, uint256 plSize,,,,,,,) = pair.pairVault();
         assertEq(plSize, 0, "vault fully unwound");
         _assertZeroSum(41_000, "after vault close");
 
@@ -443,7 +454,7 @@ contract ZeroSumInvariantTest is Test {
         _deposit(carol, 12_000 * BAZAAR_SCALE);
         _placeLimitAt(carol, false, 1 * BAZAAR_SCALE, 48_200 * BAZAAR_SCALE, 48_000);
         assertEq(_unloadAt(48_000), 1 * BAZAAR_SCALE, "vault inventory closed at a profit");
-        (,,,,,, uint256 plSize,,,,,) = pair.pairVault();
+        (,,,,,, uint256 plSize,,,,,,,) = pair.pairVault();
         assertEq(plSize, 0, "vault fully unwound");
         _assertZeroSum(48_000, "after profitable vault close");
 
@@ -458,12 +469,12 @@ contract ZeroSumInvariantTest is Test {
     }
 
     /// @dev Total claims marked at `priceUsd` (same computation as _assertZeroSum, without the
-    ///      equality assertion): insurance + Σ trader equity + vault inventory.
+    ///      equality assertion): insurance + unclaimed fee escrow + Σ trader equity + vault inventory.
     function _claimsAt(uint256 priceUsd) internal view returns (int256 claims) {
-        (,,,,, uint256 I,,,,,,) = pair.pairVault();
+        (,,,,, uint256 I,,,,,,,,) = pair.pairVault();
         uint256 p = priceUsd * BAZAAR_SCALE;
         int256 f = pair.currentFundingIndex();
-        claims = int256(I);
+        claims = int256(I) + int256(_escrowTotal());
         for (uint256 i = 0; i < traders.length; i++) {
             claims += _equityAt(traders[i], p, f);
         }
@@ -502,7 +513,7 @@ contract ZeroSumInvariantTest is Test {
         // Precondition of the whole scenario: bob's book collateral now exceeds the entire
         // deposits ledger, while bob's EQUITY is only just below zero (solvent boundary).
         (,,, uint256 bobBook,,,,,) = pair.positionBuckets(bob);
-        (,,,, uint256 dBefore, uint256 iBefore,,,,,,) = pair.pairVault();
+        (,,,, uint256 dBefore, uint256 iBefore,,,,,,,,) = pair.pairVault();
         assertGt(bobBook, dBefore, "bob's book must exceed the deposits ledger");
 
         int256 gapBefore = int256(usdc.balanceOf(address(pair)) * 1e12) - _claimsAt(68_500);
@@ -516,11 +527,11 @@ contract ZeroSumInvariantTest is Test {
         assertEq(pair.liquidate(users, _pu(68_500)), 1, "liquidation must survive the thin ledger");
 
         {
-            (,,,, uint256 dAfter, uint256 iAfter,,,,,, uint256 deficit) = pair.pairVault();
+            (,,,, uint256 dAfter, uint256 iAfter,,,,,, uint256 deficit,,) = pair.pairVault();
             assertEq(dAfter, 0, "ledger seized to exactly zero");
             assertEq(deficit, 0, "no deficit: solvency is decided at estate settlement");
-            // Insurance received the capped amount (liquidator reward nets out of I and cash
-            // symmetrically, so bound rather than pin it).
+            // Insurance received the capped amount (the liquidator reward moves out of I into the
+            // fee escrow, so bound rather than pin it).
             assertGe(iAfter + 20e18, iBefore + dBefore, "insurance credited the capped seizure");
             assertLe(iAfter, iBefore + dBefore, "insurance never credited above the ledger");
         }
@@ -535,13 +546,13 @@ contract ZeroSumInvariantTest is Test {
         // Insurance funds the estate's entry-basis loss into the ledger, which re-covers carol's
         // claim, and separately pays the caller's unload reward as cash.
         (,, uint256 carolEntry, uint256 carolCollBefore, int256 carolFundIdx,,,,) = pair.positionBuckets(carol);
-        (,,,,, uint256 iPreClose,,,, int256 plFundIdx,,) = pair.pairVault();
+        (,,,,, uint256 iPreClose,,,, int256 plFundIdx,,,,) = pair.pairVault();
 
         _placeLimitAt(carol, false, 1 * BAZAAR_SCALE, 68_500 * BAZAAR_SCALE, 68_500);
         assertEq(_unloadAt(68_500), 1 * BAZAAR_SCALE, "estate closed against carol");
 
         {
-            (,,,,,, uint256 plSize,,,,,) = pair.pairVault();
+            (,,,,,, uint256 plSize,,,,,,,) = pair.pairVault();
             assertEq(plSize, 0, "vault fully unwound");
         }
         {
@@ -559,10 +570,9 @@ contract ZeroSumInvariantTest is Test {
             // the deposits ledger, paid the caller's unload reward (2 bp of the $68.5k unloaded
             // notional — above the $0.10 floor), and received nothing else — no insurance fee
             // was collected in the waived walk, so any fee credit would break these equalities.
-            uint256 expectedLoss =
-                uint256(int256(17_500 * BAZAAR_SCALE) - (pair.currentFundingIndex() - plFundIdx));
+            uint256 expectedLoss = uint256(int256(17_500 * BAZAAR_SCALE) - (pair.currentFundingIndex() - plFundIdx));
             uint256 unloadReward = 68_500 * BAZAAR_SCALE * BazaarTypes.LIQUIDATION_FEE_EBP / BazaarTypes.EBP_SCALE;
-            (,,,, uint256 dPost, uint256 iPost,,,,,, uint256 deficit) = pair.pairVault();
+            (,,,, uint256 dPost, uint256 iPost,,,,,, uint256 deficit,,) = pair.pairVault();
             assertEq(deficit, 0, "estate loss fully funded by insurance");
             assertApproxEqAbs(
                 iPreClose - iPost, expectedLoss + unloadReward, 1e12, "insurance funded the loss + unload reward"
@@ -577,7 +587,7 @@ contract ZeroSumInvariantTest is Test {
         {
             (,,, uint256 carolCollFinal,,,,,) = pair.positionBuckets(carol);
             assertLt(carolCollFinal, 1e12, "carol withdrew her entire claim");
-            (,,,,,,,,,,, uint256 deficit) = pair.pairVault();
+            (,,,,,,,,,,, uint256 deficit,,) = pair.pairVault();
             assertEq(deficit, 0, "pair ends live and solvent");
         }
     }
@@ -625,7 +635,7 @@ contract ZeroSumInvariantTest is Test {
         users[0] = carol;
         vm.prank(bob);
         assertEq(pair.liquidate(users, _pu(liqPriceUsd)), 1, "carol liquidated");
-        (,,,,,, uint256 plSize,,,,,) = pair.pairVault();
+        (,,,,,, uint256 plSize,,,,,,,) = pair.pairVault();
         assertEq(plSize, 0, "1-vs-1 netting fully cleared the vault");
         _assertZeroSum(49_000, "after opposing netting");
 

@@ -1,22 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 pragma solidity 0.8.34;
 
-import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {BazaarTypes} from "./BazaarTypes.sol";
+import {RiskParamsLib} from "./RiskParamsLib.sol";
 
 /// @title VaultHealthLib
-/// @notice Internal library for vault health checks (Check 1: liquidation exposure vs insurance fund).
-///         Compiled inline into callers — both BazaarPair and AdlLib can use it without DELEGATECALL.
+/// @notice Internal library for the ADL gate: whether the insurance fund's free capital above
+///         its reserve carries the vault's inherited inventory. Compiled inline into BazaarPair.
 library VaultHealthLib {
     // -------------------- Constants --------------------
-
-    uint256 internal constant BAZAAR_SCALE = BazaarTypes.BAZAAR_SCALE;
-    uint256 internal constant BP_SCALE = BazaarTypes.BP_SCALE;
-
-    /// @notice ADL trigger threshold: freeze trading and trigger ADL when expected losses exceed this % of insurance fund
-    uint256 internal constant ADL_TRIGGER_THRESHOLD_BP = 8_000; // 80% of insurance fund
-    /// @notice ADL cancel threshold: ADL ends when expected losses drop below this % of insurance fund (hysteresis)
-    uint256 internal constant ADL_CANCEL_THRESHOLD_BP = 6_000; // 60% of insurance fund
 
     /// @notice Maximum duration ADL can remain pending before triggering emergency termination
     uint256 internal constant ADL_TIMEOUT_DURATION = 24 hours;
@@ -25,7 +17,7 @@ library VaultHealthLib {
 
     /// @notice Result of Check 1: liquidation exposure vs insurance fund
     struct LiqExposureResult {
-        bool healthy; // True if expected loss <= ADL threshold
+        bool healthy; // True when the fund above its reserve carries the inventory (see checkLiqExposure)
         bool adlTimeoutExpired; // True if ADL has been pending longer than ADL_TIMEOUT_DURATION
         // New ADL state — caller should apply these to storage
         bool newIsAdlPending;
@@ -37,9 +29,27 @@ library VaultHealthLib {
 
     // -------------------- Functions --------------------
 
-    /// @notice Check 1: actual real-time gap on pending liquidations vs insurance fund
-    /// @dev Returns a result struct with new ADL state values for the caller to apply.
-    ///      Now uses single-direction aggregate (pendingLiqSize, pendingLiqBankruptcyNotional, pendingLiqIsLong).
+    /// @notice Check 1: the vault's inherited inventory against the insurance fund's free capital
+    ///         above its reserve.
+    /// @dev Returns a result struct with new ADL state values for the caller to apply. The
+    ///      figures come from RiskParamsLib.vaultAdlExposure, which values the single-direction
+    ///      pendingLiq aggregate against the collateral seized alongside it and nets the reserve
+    ///      out of the fund. The window opens when that capital cannot carry the inventory at
+    ///      the mark. While open it stays open until the capital could finish the remaining
+    ///      inventory at the unload band's edge — the figure the auction sizes its batches to —
+    ///      so the walk that resumes afterwards can sell the remainder inside the band without
+    ///      reopening the window. The gap between the two conditions is one band of the
+    ///      remaining inventory, so the boundary cannot flap on a tick.
+    /// @param pairVault The pair's vault aggregates
+    /// @param currentPrice Price to value the inventory at (BAZAAR_SCALE precision)
+    /// @param isAdlPending Whether a window is open
+    /// @param adlPendingSince When the open window opened; 0 when none is open
+    /// @param adlSnapshotPrice The open window's frozen ranking price
+    /// @param adlLongs Whether the open window deleverages longs
+    /// @param currentFundingIndex The pair's live cumulative funding index
+    /// @param adlSnapshotFundingIndex The open window's frozen funding index
+    /// @param mmrBp The maintenance margin the unload band is derived from
+    /// @return r The verdict and the ADL state the caller should store
     function checkLiqExposure(
         BazaarTypes.Vault storage pairVault,
         uint256 currentPrice,
@@ -48,7 +58,8 @@ library VaultHealthLib {
         uint256 adlSnapshotPrice,
         bool adlLongs,
         int256 currentFundingIndex,
-        int256 adlSnapshotFundingIndex
+        int256 adlSnapshotFundingIndex,
+        uint256 mmrBp
     ) internal view returns (LiqExposureResult memory r) {
         r.healthy = true;
         // Preserve existing state as defaults
@@ -58,26 +69,10 @@ library VaultHealthLib {
         r.newAdlSnapshotFundingIndex = adlSnapshotFundingIndex;
         r.newAdlLongs = adlLongs;
 
-        uint256 expectedLoss = 0;
+        (uint256 expectedLoss, uint256 base, uint256 worstFinish,) =
+            RiskParamsLib.vaultAdlExposure(pairVault, currentPrice, currentFundingIndex, mmrBp);
 
-        if (pairVault.pendingLiqSize > 0) {
-            // Loss = (bankruptcy notional) − (current notional). The vault inherited the
-            // position at bankruptcy price and will close it at current; the difference
-            // is what the insurance fund has to cover. Sign depends on direction.
-            uint256 currentLiqNotional = Math.mulDiv(pairVault.pendingLiqSize, currentPrice, BAZAAR_SCALE);
-            uint256 bkNotional = pairVault.pendingLiqBankruptcyNotional;
-
-            if (pairVault.pendingLiqIsLong) {
-                expectedLoss = bkNotional > currentLiqNotional ? bkNotional - currentLiqNotional : 0;
-            } else {
-                expectedLoss = currentLiqNotional > bkNotional ? currentLiqNotional - bkNotional : 0;
-            }
-        }
-
-        uint256 adlThresholdBp = isAdlPending ? ADL_CANCEL_THRESHOLD_BP : ADL_TRIGGER_THRESHOLD_BP;
-        uint256 adlThreshold = Math.mulDiv(pairVault.insuranceFundBalance, adlThresholdBp, BP_SCALE);
-
-        if (expectedLoss > adlThreshold) {
+        if (isAdlPending ? worstFinish > base : expectedLoss > base) {
             r.healthy = false;
             if (!isAdlPending) {
                 // First time triggering ADL
@@ -90,20 +85,29 @@ library VaultHealthLib {
                 // Deleverage the profitable counterparties — the side OPPOSITE the
                 // liquidated positions the vault inherited.
                 r.newAdlLongs = !pairVault.pendingLiqIsLong;
-            } else if (adlPendingSince > 0 && block.timestamp - adlPendingSince > ADL_TIMEOUT_DURATION) {
-                // ADL timeout exceeded — caller should trigger emergency termination
-                r.adlTimeoutExpired = true;
-                r.newIsAdlPending = true;
             } else {
-                // ADL still pending, within timeout
                 r.newIsAdlPending = true;
+
+                // The timeout verdict and the re-target are independent, and both must be able
+                // to run in the same evaluation. Reporting the expiry alone would leave a
+                // flipped auction aimed at the side the vault itself holds, which BazaarPair
+                // refuses to execute — so the runway the caller grants before terminating would
+                // be dead time on exactly the pairs that need it most. Gating the expiry behind
+                // the flip instead would be worse: an auction that keeps flipping would never
+                // report expiry at all, and could never be terminated.
+                if (adlPendingSince > 0 && block.timestamp - adlPendingSince > ADL_TIMEOUT_DURATION) {
+                    // ADL timeout exceeded — caller should trigger emergency termination
+                    r.adlTimeoutExpired = true;
+                }
+
                 if (adlLongs == pairVault.pendingLiqIsLong) {
                     // Vault side flipped mid-auction: opposing liquidations overwhelmed the
                     // old aggregate via netting, so the frozen target side now matches the
                     // side the vault holds. Re-target the new winners and re-snapshot the
                     // price so they rank as profitable. adlPendingSince is deliberately NOT
                     // reset — the 24h termination clock stays monotone so repeated flips
-                    // can never stall emergency termination.
+                    // can never stall emergency termination, and neither the clock nor the
+                    // runway BazaarPair arms off it is re-armed by a re-target.
                     r.newAdlLongs = !pairVault.pendingLiqIsLong;
                     r.newAdlSnapshotPrice = currentPrice;
                     // Re-freeze funding with the re-snapshotted price so the re-targeted

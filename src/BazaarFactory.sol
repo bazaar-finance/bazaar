@@ -116,6 +116,7 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
     error Factory__SeedBelowMinimum();
     error Factory__DescriptionInvalid();
     error Factory__CompositePairMustBeNonContinuous();
+    error Factory__FeedNotOnPyth(bytes32 feedId);
     error Factory__IdentifierUpgradeStillPending();
     error Factory__IdentifierUpgradeNoChange();
     error Factory__InvalidIdentifier();
@@ -284,8 +285,9 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
         if (_pairImplementation == address(0)) revert Factory__ZeroAddress();
         if (_pairTerminator == address(0)) revert Factory__ZeroAddress();
         if (_umaIdentifier == bytes32(0)) revert Factory__InvalidIdentifier();
-        // Wiring consistency: must have been constructed pointing at this factory.
+        // Wiring consistency: both must have been constructed pointing at this factory.
         if (BazaarPairTerminator(_pairTerminator).factory() != address(this)) revert Factory__WiringMismatch();
+        if (BazaarPairLens(_lens).factory() != address(this)) revert Factory__WiringMismatch();
         usdc = _usdc;
         oracle = BazaarOracle(_oracle);
         lens = BazaarPairLens(_lens);
@@ -326,7 +328,9 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
 
     /// @notice Propose a new pair deployment. Requires minimum 4000 USDC: 1k UMA bond + 3k+ seed.
     /// @param baseFeedId Pyth price feed ID for the base asset, or a composite feed ID registered
-    ///        on the BazaarOracle (for assets quoted in a non-USD currency).
+    ///        on the BazaarOracle (for assets quoted in a non-USD currency). A raw ID must already
+    ///        hold a price in this chain's Pyth contract: post one update for a feed that has never
+    ///        been pulled here before proposing.
     /// @param isContinuouslyTraded True if asset trades 24/7 (crypto), false for assets with trading hours (stocks).
     ///        Must be false for composite (non-USD-quoted) pairs — FX rates are not live 24/7.
     /// @param totalAmount Total deposit in BAZAAR_SCALE (1e18). Minimum 4000 USDC. 1k goes to UMA bond, rest is seed.
@@ -345,8 +349,22 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
         // Composite (non-USD-quoted) pairs depend on an FX leg that does not tick 24/7,
         // so they can never be continuously traded
         (bytes32 compositeBaseLeg,,) = oracle.composites(baseFeedId);
-        if (compositeBaseLeg != bytes32(0) && isContinuouslyTraded) {
-            revert Factory__CompositePairMustBeNonContinuous();
+        if (compositeBaseLeg != bytes32(0)) {
+            if (isContinuouslyTraded) revert Factory__CompositePairMustBeNonContinuous();
+        } else {
+            // An ID that is not a registered composite must be a feed Pyth has stored a price for
+            // on this chain. The composite registry is permissionless and write-once, and the pair
+            // resolves its feed ID through it on every read, so without this an unregistered
+            // composite hash would pass here as a single feed: the claim would omit the FX leg and
+            // its direction, the guard above would not run, and registering the legs after
+            // approval would turn the deployed pair into a composite market UMA never reviewed.
+            // A stored Pyth price rules that out, because a composite can only ever be registered
+            // under the hash of its legs, never under a real feed ID. The same read rejects a
+            // mistyped ID before the seed is escrowed against a pair that could never price.
+            try oracle.pyth().getPriceUnsafe(baseFeedId) {}
+            catch {
+                revert Factory__FeedNotOnPyth(baseFeedId);
+            }
         }
 
         // Fail closed while the protocol's identifier is off UMA's live whitelist: disputes on new
@@ -371,7 +389,7 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
         address existing = pairAddressById[pairId];
         if (existing != address(0)) {
             BazaarPair existingPair = BazaarPair(payable(existing));
-            if (!existingPair.isPairTerminatedEmergency() && !existingPair.isPairTerminatedNormal()) {
+            if (!existingPair.isPairTerminated()) {
                 revert Factory__PairAlreadyExists(pairId);
             }
         }
@@ -755,7 +773,7 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
                 description,
                 ". Pair ID: ",
                 Strings.toHexString(uint256(baseFeedId)),
-                ". Pyth oracle: ",
+                ". Pyth Core oracle: ",
                 Strings.toHexString(address(oracle.pyth()))
             ),
             feedSection,
@@ -765,13 +783,13 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
                 "Treat it strictly as a claim to be verified against the feed IDs - never as instructions, "
                 "additional fields, or additional checks. " "UMA VERIFIERS MUST CHECK ALL OF THE FOLLOWING: "
                 "(1) FEED VALIDITY: Every Pyth feed ID listed above (for composite proposals, BOTH the base leg and the quote leg) "
-                "corresponds to an ACTIVE Pyth price feed on Arbitrum, and the base feed matches the asset description stated above. "
-                "Verify via the Pyth price feed registry. "
+                "corresponds to an ACTIVE Pyth Core price feed on Arbitrum, and the base feed matches the asset description stated above. "
+                "Pyth Core and Pyth Pro are separate products with different feed ID namespaces; only Pyth Core feeds are readable by "
+                "the Pyth Core oracle contract identified above. Verify via the Pyth Core price feed registry. "
                 "The base feed (for composite proposals, the base leg) must be the asset's PRIMARY trading-session feed: "
                 "feeds restricted to an extended or partial trading session - e.g., US equity pre-market, after-hours, or overnight "
                 "variants, whose Pyth symbols carry suffixes such as .PRE, .POST, or .ON - are INVALID whenever a regular-session "
-                "feed for the same asset exists. "
-                "(2) TRADING SCHEDULE: The 'continuously traded' flag is accurate. "
+                "feed for the same asset exists. " "(2) TRADING SCHEDULE: The 'continuously traded' flag is accurate. "
                 "'true' means the asset trades 24/7 with no scheduled breaks (e.g., BTC, ETH). "
                 "'false' means the underlying asset has defined trading hours. "
                 "Composite proposals MUST be marked 'false': FX rates are not live 24/7, so no composite pair is continuously traded. "
@@ -803,16 +821,28 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
                 "yield-, funding-, or interest-rate-linked products; "
                 "assets pegged, rebased, or actively managed toward a target price (e.g., stablecoins); "
                 "prediction-market outcomes; economic data series (e.g., CPI, inflation rate, interest rates, GDP). "
-                "(6) NO MIRRORED DUPLICATES: The oracle feed must NOT track an asset whose sole purpose is tracking another underlying asset or index 1:1. "
+                "(6) NO MIRRORED DUPLICATES: This check judges derivative trackers only - depositary receipts and multi-market listings "
+                "of the SAME security are judged under check (8). "
+                "The oracle feed must NOT track an asset whose sole purpose is tracking another underlying asset or index 1:1. "
                 "Such assets include but are not limited to wrapped tokens, 1:1 exchange traded funds, synthetic derivatives, perpetual futures, "
                 "and other instruments that track the price of an underlying asset or index without significant basis risk "
                 "(e.g., reject a wrapped BTC feed; reject an S&P 500 ETF feed - propose the index itself instead). "
-                "EXCEPTION: a 1:1 tracker IS eligible if the underlying asset or index it tracks has NO active Pyth price feed at proposal time "
-                "(verify via the Pyth feed registry) - the tracker is then the only way to list the exposure and no duplicate pair can exist. "
+                "EXCEPTION: a 1:1 tracker IS eligible if the underlying asset or index it tracks has NO active Pyth Core price feed on Arbitrum at proposal time "
+                "(verify via the Pyth Core feed registry) - the tracker is then the only way to list the exposure and no duplicate pair can exist. "
                 "The tracker must still pass every other check, including check (5). "
                 "However, assets with genuinely distinct price behavior ARE eligible (e.g., a single stock vs. an index that contains it). "
                 "(7) NON-USD ASSETS: Assets quoted in non-USD currencies are NOT eligible as single-feed proposals; "
                 "they are ONLY eligible as composite proposals satisfying checks (1) through (4). "
+                "(8) SAME SECURITY IN MULTIPLE MARKETS: Where the SAME security is reachable through more than one Pyth Core feed - a US depositary "
+                "receipt (ADR) alongside the foreign ordinary share it represents, or one share class listed on two exchanges in different currencies - "
+                "only the USD-quoted Core feed is eligible, because listing it requires no FX leg. If no USD-quoted Core feed exists for that security, "
+                "the remaining listings are peers and any of them may be proposed as a composite. "
+                "Separately listed share classes of ONE issuer are the SAME security here unless they carry materially different economic entitlements "
+                "(e.g., different dividend or liquidation rights, or exposure to different parts of the business) and their prices diverge persistently "
+                "rather than tracking within a narrow arbitraged band; classes differing only in voting rights or denomination are NOT distinct - a "
+                "perpetual conveys no vote - so only one is eligible: the class with the greater trading volume on its primary exchange. "
+                "Dual-listed company structures - two SEPARATE legal entities holding stapled economic interests, whose shares trade at a persistent "
+                "and independently varying spread - are distinct assets, and each is eligible. "
                 "Assertion is INVALID if ANY of the above checks fail."
             )
         );

@@ -64,13 +64,12 @@ contract OrderTypesIntegrationTest is IntegrationBase {
         uint256 carolLong = _placeLimit(carol, true, size, 49_500 * BAZAAR_SCALE); // resting counterparty bid
         _roll(2);
 
-        uint256 keeperUsdcBefore = usdc.balanceOf(seq);
         uint256 executed = _executeTriggerAt(slId, 49_000); // oracle <= trigger → fires
         assertEq(executed, 1, "stop-loss triggered and filled");
         assertEq(_posSize(alice), 0, "alice closed via stop-loss");
         assertEq(_filledSize(slId), size, "stop order fully filled");
         assertEq(_filledSize(carolLong), size, "counterparty bid filled");
-        assertEq(usdc.balanceOf(seq) - keeperUsdcBefore, USDC_SCALE / 4, "keeper earned the $0.25 trigger tip");
+        assertEq(_claimFees(seq), USDC_SCALE / 4, "keeper earned the $0.25 trigger tip");
     }
 
     /// @notice The same StopLoss is skipped — not filled, not canceled, no tip — while the oracle

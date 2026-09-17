@@ -15,8 +15,14 @@ A practical guide to trading on Bazaar. Plain language first; every section link
 | Fill now at market | `Market` | fills immediately against resting limits at up to your slippage cap (max 10%); never rests — whatever can't fill in your own transaction is canceled |
 | Rest at your price | `Limit` | sits on the book until filled, canceled, or expired (up to ~1 year); `postOnly` guarantees you're the maker |
 | Enter on a breakout | `StopLimit` | arms when price crosses your trigger, then acts as a limit |
-| Lock in profit | `TakeProfit` | reduce-only; fires at market once the price reaches your target, one per position |
-| Cap your loss | `StopLoss` | reduce-only market-style close when price crosses your trigger; one per position |
+| Lock in profit | `TakeProfit` | reduce-only; fires at market once the price reaches your target, one per position; pass the max uint size to close the whole position, whatever it is when it fires |
+| Cap your loss | `StopLoss` | reduce-only market-style close when price crosses your trigger; one per position; pass the max uint size to close the whole position |
+
+A TP/SL never closes more than you actually hold — it is capped at your live position when it
+fires — so one you set for a bigger position keeps protecting the smaller one you are left with
+after a partial close, liquidation, or deleverage. It is not re-armed automatically, though: if
+the book is too thin to absorb the whole close, the unfilled part is canceled and the position
+that survives has no target until you set a new one.
 
 Minimum order: **$5** notional (closing your whole position is always allowed). Stops are fired by permissionless keepers, but only against a *proven, fresh oracle* price — a keeper cannot choose the price that triggers you, only prove the one Pyth published. The keeper who fires your stop earns a flat **$0.25** tip from your collateral, like a trading fee.
 
@@ -25,7 +31,7 @@ Minimum order: **$5** notional (closing your whole position is always allowed). 
 - Your maximum leverage is dynamic — up to **25×** in calm, well-capitalized markets, less in volatile ones, at most 2.5× in a stock/FX market's first days, and half on stocks/FX generally (non-24/7 markets post 2× the larger of the vol requirement and the market's own observed overnight-gap size). The current requirement is on-chain (`BazaarPairLens.checkBucketSolvency`).
 - **Initial margin** gates new orders and withdrawals, counted against your worst case (position + everything resting). **Maintenance margin is half of initial** — below it, anyone may liquidate you.
 - Rising margin requirements give existing positions a **24-hour grace**; falling ones help you immediately. See [Margin & Leverage](../protocol/margin.md).
-- **Funding** accrues continuously, capped at ±0.5%/hour: longs pay shorts when the market trades above index, and vice versa. It settles when you close. See [Funding](../protocol/funding.md).
+- **Funding** accrues continuously, capped at ±0.1%/hour on 24/7 markets and ±0.5%/hour on ones with trading hours (which only accrue while their venue is open, so they need more per accruing hour for the same weekly pull): longs pay shorts when the market trades above index, and vice versa. It settles when you close. See [Funding](../protocol/funding.md).
 
 ## What can happen to you
 
@@ -38,12 +44,12 @@ Honest list, in increasing order of severity:
 
 ## Fees you'll pay
 
-Roughly: **a fraction of a basis point per side in a calm, well-capitalized market**. Makers pay a flat 0.5 bp insurance fee; takers pay a dynamic insurance fee (0.5–2 bp base) that rises when the market's backstop is thin and discounts to zero when it's overfull — and *closing* risk is always cheaper than opening it. Orders placed through a frontend may add 0.25 bp per side for its [integrator](integrators.md). Exact table: [Fees](../protocol/fees.md).
+Roughly: **a fraction of a basis point per side in a calm, well-capitalized market**. Makers pay a flat 0.5 bp insurance fee; takers pay a dynamic insurance fee (0.5–2 bp base) that rises when the market's backstop is thin and settles back to that base once it's funded — and *closing* risk is always cheaper than opening it. Orders placed through a frontend may add 0.25 bp per side for its [integrator](integrators.md). Exact table: [Fees](../protocol/fees.md).
 
 ## Stocks & FX after hours
 
-Non-24/7 markets keep trading on the last price when their venue closes: prices are boxed to ±10% of the last print and market orders are disabled until the venue reopens. Margin is unchanged — closure-gap risk is already priced into these markets' always-on requirement (the 2× multiplier and the reopen-gap floor) — but **position collateral cannot be withdrawn while the venue's price is frozen**: deposits stay open, flat accounts are unaffected, and withdrawals resume with the first fresh print at the reopen. Plan position-collateral withdrawals during market hours. See [Price Oracle](../protocol/oracle.md#the-stale-price-regime-market-hours).
+Non-24/7 markets keep trading on the last price when their venue closes: prices are boxed to ±10% of the last print and market orders are disabled until the venue reopens. Margin is unchanged — closure-gap risk is already priced into these markets' always-on requirement, which doubles the larger of the vol curve and the market's own observed reopen gap — but **position collateral cannot be withdrawn while the venue's price is frozen**: deposits stay open, flat accounts are unaffected, and withdrawals resume with the first fresh print at the reopen. Plan position-collateral withdrawals during market hours. See [Price Oracle](../protocol/oracle.md#the-stale-price-regime-market-hours).
 
 ## Getting out
 
-`withdrawCollateral` any time your equity covers initial margin on what remains — valued conservatively at the pessimistic edge of the oracle's confidence band. Flat (no position, no orders)? Withdraw everything, any time. Two freezes to know about: if you hold a position, withdrawals are blocked for as long as ADL remains *pending* (until the crisis clears or the 24-hour ADL timeout winds the market down — the 10-minute clock is only the auction's score decay); and *all* withdrawals pause during the 48-hour settlement window just before a dying market settles (that pause is what guarantees everyone is paid from the same, fully-tallied pot).
+`withdrawCollateral` any time your equity covers initial margin on what remains — valued conservatively at the pessimistic edge of the oracle's confidence band. Flat (no position, no orders)? Withdraw everything, any time. Two freezes to know about: if you hold a position, withdrawals are blocked for as long as ADL remains *pending* (until the crisis clears or the ADL timeout winds the market down — 24 hours, plus a 30-minute grace once prices are flowing again; the 10-minute clock is only the auction's score decay, and it restarts after a market closure); and *all* withdrawals pause while a dying market's settlement window is open — until every position is settled at the fixed price, or 14 days at most (that pause is what guarantees everyone is paid from the same, fully-tallied pot).

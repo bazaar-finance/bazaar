@@ -13,6 +13,7 @@ contract BookkeepingHarness {
     BazaarTypes.OrderBook internal book;
     mapping(address => BazaarTypes.PositionBucket) public positionBuckets;
     BazaarTypes.Vault public vault;
+    BazaarTypes.FeeEscrow internal feeEscrow;
 
     function setBucket(
         address user,
@@ -24,9 +25,9 @@ contract BookkeepingHarness {
     ) external {
         BazaarTypes.PositionBucket storage b = positionBuckets[user];
         b.isLong = isLong;
-        b.size = size;
-        b.entryValue = entryValue;
-        b.collateral = collateral;
+        b.size = uint128(size);
+        b.entryValue = uint128(entryValue);
+        b.collateral = uint128(collateral);
         b.entryFundingIndex = entryFundingIndex;
     }
 
@@ -55,6 +56,10 @@ contract BookkeepingHarness {
         vault.pendingLiqSize = size;
         vault.pendingLiqEntryNotional = entryNotional;
         vault.pendingLiqBankruptcyNotional = bankruptcyNotional;
+        // The gap between the two notionals is staged as the collateral seized with the inventory.
+        vault.pendingLiqSeized = entryNotional > bankruptcyNotional
+            ? entryNotional - bankruptcyNotional
+            : bankruptcyNotional - entryNotional;
         vault.pendingLiqEntryFundingIndex = entryFundingIndex;
         vault.pendingLiqIsLong = isLong;
     }
@@ -69,18 +74,24 @@ contract BookkeepingHarness {
             book,
             positionBuckets,
             vault,
+            feeEscrow,
             BazaarTypes.LiquidateParams({
                 currentPrice: price,
                 currentFundingIndex: fundingIndex,
-                marginReqs: BazaarTypes.MarginRequirements({imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0}),
+                marginReqs: BazaarTypes.MarginRequirements({
+                    imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0, laggedMmrTs: 0
+                }),
                 pairId: bytes32("TEST"),
-                currentBlock: 1,
-                usdc: address(0) // reward payment no-ops (soft-fail restores the debit)
+                currentBlock: 1
             })
         );
     }
 
     // read-backs
+    function claimable(address who) external view returns (uint256) {
+        return feeEscrow.claimable[who];
+    }
+
     function pendingSize() external view returns (uint256) {
         return vault.pendingLiqSize;
     }
@@ -154,14 +165,16 @@ contract LiquidationBookkeepingTest is Test {
         // Opposing short 1 unit entered $49k, $10 collateral -> insolvent at $50k.
         h.setBucket(victim, false, 1 * SCALE, 49_000e18, 10e18, 0);
 
-        h.liquidate(_arr(victim), PRICE, 0);
+        BazaarTypes.LiquidateResult memory r = h.liquidate(_arr(victim), PRICE, 0);
 
         assertEq(h.pendingSize(), 1 * SCALE, "half the aggregate remains");
         assertTrue(h.pendingIsLong(), "side unchanged");
         assertEq(h.pendingEntry(), 50_000e18, "entry notional halved");
         assertEq(h.pendingBankruptcy(), 48_000e18, "bankruptcy notional halved");
-        // netPnl = newEntryPortion(49k) - existingPortion(50k) = -1k; seizure +10.
-        assertEq(h.insurance(), 5_000e18 + 10e18 - 1_000e18, "net loss absorbed, collateral seized");
+        // netPnl = newEntryPortion(49k) - existingPortion(50k) = -1k; seizure +10; reward out.
+        assertEq(
+            h.insurance(), 5_000e18 + 10e18 - 1_000e18 - r.totalUpfrontReward, "net loss absorbed, collateral seized"
+        );
         // The loss is an I -> D TRANSFER (backing for the survivors' offsetting realized gains),
         // net of the -10 seizure transfer in the other direction.
         assertEq(h.depositsLedger(), 1_000_000e18 - 10e18 + 1_000e18, "deposits ledger credited by the netting loss");
@@ -178,7 +191,7 @@ contract LiquidationBookkeepingTest is Test {
         int256 currentIdx = 7e18;
         h.setBucket(victim, false, 3 * SCALE, 147_000e18, 10e18, currentIdx);
 
-        h.liquidate(_arr(victim), PRICE, currentIdx);
+        BazaarTypes.LiquidateResult memory r = h.liquidate(_arr(victim), PRICE, currentIdx);
 
         assertEq(h.pendingSize(), 2 * SCALE, "remainder after netting 1 against 1");
         assertFalse(h.pendingIsLong(), "side flipped to the new position's side");
@@ -188,8 +201,11 @@ contract LiquidationBookkeepingTest is Test {
         uint256 expectedBk = uint256(147_010e18) * 2 / 3;
         assertEq(h.pendingBankruptcy(), expectedBk, "remainder bankruptcy prorated");
         assertEq(h.pendingFundingIdx(), currentIdx, "flip stamps the new funding index");
-        // Insurance: +10 seizure, -1,000 net entry PnL, -7 realized vault funding on the netted unit.
-        assertEq(h.insurance(), 5_000e18 + 10e18 - 1_000e18 - 7e18, "netting PnL + funding realized");
+        // Insurance: +10 seizure, -1,000 net entry PnL, -7 realized vault funding on the netted
+        // unit, minus the liquidator's reward.
+        assertEq(
+            h.insurance(), 5_000e18 + 10e18 - 1_000e18 - 7e18 - r.totalUpfrontReward, "netting PnL + funding realized"
+        );
         // Mirror transfer into the deposits ledger (loss = 1,007), net of the -10 seizure.
         assertEq(h.depositsLedger(), 1_000_000e18 - 10e18 + 1_007e18, "deposits ledger credited by the netting loss");
     }
@@ -230,12 +246,12 @@ contract LiquidationBookkeepingTest is Test {
         // entry $50,500, collateral $600: equity 100 < minRequired (1.5% of 50k = 750) -> insolvent.
         h.setBucket(victim, true, 1 * SCALE, 50_500e18, 600e18, 0);
 
-        h.liquidate(_arr(victim), PRICE, 0);
+        BazaarTypes.LiquidateResult memory r = h.liquidate(_arr(victim), PRICE, 0);
 
         assertEq(h.pendingBankruptcy(), 49_900e18, "bk = entry - seized collateral");
         assertEq(h.pendingSize(), 1 * SCALE);
         assertTrue(h.pendingIsLong());
-        assertEq(h.insurance(), 5_000e18 + 600e18, "full collateral seized to insurance");
+        assertEq(h.insurance(), 5_000e18 + 600e18 - r.totalUpfrontReward, "full collateral seized to insurance");
     }
 
     /// @notice The funding term enters the long bankruptcy formula with a negative sign.
@@ -277,7 +293,8 @@ contract LiquidationBookkeepingTest is Test {
     }
 
     /// @notice A zero-collateral insolvent victim still liquidates: nothing seized, and the
-    ///         unconditional liquidator reward accrues at the bps rate (above the $0.10 floor).
+    ///         unconditional liquidator reward accrues at the bps rate (above the $0.10 floor),
+    ///         funded by insurance alone.
     function test_zeroCollateralVictim_liquidatesWithBpsReward() public {
         h.setBucket(victim, true, 1 * SCALE, 55_000e18, 0, 0);
 
@@ -285,11 +302,12 @@ contract LiquidationBookkeepingTest is Test {
         BazaarTypes.LiquidateResult memory r = h.liquidate(_arr(victim), PRICE, 0);
 
         assertEq(r.liquidatedCount, 1);
-        assertEq(h.insurance(), insBefore, "nothing to seize");
         // notional 50k x 200 EBP / 1e6 = $10 > $0.10 floor
         uint256 expected = 50_000e18 * BazaarTypes.LIQUIDATION_FEE_EBP / BazaarTypes.EBP_SCALE;
         assertEq(r.totalUpfrontReward, expected, "bps reward on notional");
         assertGt(expected, BazaarTypes.MIN_LIQUIDATOR_REWARD, "sanity: above the floor");
+        assertEq(h.insurance(), insBefore - expected, "nothing to seize; only the reward leaves the fund");
+        assertEq(h.claimable(address(this)), expected, "reward accrued to the liquidator");
     }
 
     // ---------------- OI decrement floors ----------------

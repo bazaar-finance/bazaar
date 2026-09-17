@@ -47,7 +47,7 @@ contract TerminatorDisputeUpheldTest is IntegrationBase {
 
         // The upheld assertion schedules the pair — the branch the false case never reaches.
         assertEq(pair.scheduledTerminationTs(), lastTradingTs, "upheld assertion schedules termination");
-        assertFalse(pair.isPairTerminatedNormal(), "scheduled, not yet executed");
+        assertFalse(pair.isPairTerminated(), "scheduled, not yet executed");
 
         // Asserter (alice) recovers her bond AND nets bob's forfeited bond (plus the tiny proposer
         // reward paid on scheduling), so her gain is at least 2× the bond.

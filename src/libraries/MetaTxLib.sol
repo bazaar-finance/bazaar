@@ -27,7 +27,8 @@ library MetaTxLib {
     bytes32 internal constant NAME_HASH = keccak256("BazaarPair");
     bytes32 internal constant VERSION_HASH = keccak256("1");
 
-    // ---- Type hashes: functions WITH relayer fee ----
+    // ---- Type hashes: the fee rides the function's own USDC transfer (added to a deposit
+    //      pull, netted from a withdrawal payout) ----
 
     bytes32 internal constant DEPOSIT_COLLATERAL_TYPEHASH =
         keccak256("DepositCollateral(uint256 amount,uint256 nonce,uint256 deadline,uint256 relayerFee)");
@@ -41,10 +42,11 @@ library MetaTxLib {
     bytes32 internal constant EXECUTE_INSURANCE_WITHDRAWAL_TYPEHASH =
         keccak256("ExecuteInsuranceWithdrawal(uint256 nonce,uint256 deadline,uint256 relayerFee)");
 
-    // ---- Type hashes: functions with relayer fee pulled from user's wallet ----
+    // ---- Type hashes: the fee is a standalone pull from the signer's wallet (the function
+    //      moves no USDC of its own, and never touches bucket collateral) ----
 
     bytes32 internal constant CREATE_ORDER_TYPEHASH = keccak256(
-        "CreateOrder(uint8 orderType,uint256 triggerPrice,uint256 limitPrice,uint256 maxSlippageBp,uint256 size,bool isLong,bool isPostOnly,bool isIoc,uint256 expirationBlock,address integrator,uint256 nonce,uint256 deadline,uint256 relayerFee)"
+        "CreateOrder(uint8 orderType,uint256 triggerPrice,uint256 limitPrice,uint256 maxSlippageBp,uint256 size,bool isLong,bool isPostOnly,uint8 tif,uint256 expirationBlock,address integrator,uint256 nonce,uint256 deadline,uint256 relayerFee)"
     );
 
     bytes32 internal constant CANCEL_ORDERS_TYPEHASH =

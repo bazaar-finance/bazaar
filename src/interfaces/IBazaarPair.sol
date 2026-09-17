@@ -6,8 +6,7 @@ interface IBazaarPair {
     function pairId() external view returns (bytes32);
     function baseFeedId() external view returns (bytes32);
     function oracle() external view returns (address);
-    function isPairTerminatedEmergency() external view returns (bool);
-    function isPairTerminatedNormal() external view returns (bool);
+    function isPairTerminated() external view returns (bool);
     function scheduledTerminationTs() external view returns (uint256);
     function settlementPriceFixedTs() external view returns (uint256);
 
@@ -24,9 +23,10 @@ interface IBazaarPair {
 
     // ---- Setters called by BazaarPairTerminator ----
     function setScheduledTermination(uint256 lastTradingTs, address proposer) external;
-    /// @notice Stage 1 of normal termination: pins the settlement price and opens the terminal
-    ///         sweep window. Stage 2 (BazaarPair.finalizeTermination) is public and settles the
-    ///         book at this price once the window elapses.
+    /// @notice Stage 1 of termination: pins the settlement price and opens the settlement
+    ///         window. Stage 2 (BazaarPair.finalizeTermination) is public and freezes the payout
+    ///         ratios once every position is settled at this price, or once the escape hatch
+    ///         has elapsed.
     function fixSettlementPrice(uint256 settlementPrice) external;
 
     /// @notice Credits already-transferred USDC into the insurance fund bookkeeping.

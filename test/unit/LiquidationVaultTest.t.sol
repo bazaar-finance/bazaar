@@ -14,6 +14,7 @@ import {DeployBazaar} from "../../script/DeployBazaar.s.sol";
 import {HelperConfig} from "../../script/HelperConfig.s.sol";
 import {MockArbSys} from "../mocks/MockArbSys.sol";
 import {MockUSDC} from "../mocks/MockUSDC.sol";
+import {PythSeed} from "../PythSeed.sol";
 
 // ==================== liquidator reward ====================
 
@@ -24,13 +25,19 @@ contract LiqRewardHarness {
     BazaarTypes.OrderBook internal book;
     mapping(address => BazaarTypes.PositionBucket) public positionBuckets;
     BazaarTypes.Vault public vault;
+    BazaarTypes.FeeEscrow internal feeEscrow;
+
+    /// @dev The liquidator's accrued reward (the lib credits msg.sender, i.e. the test contract).
+    function claimable(address who) external view returns (uint256) {
+        return feeEscrow.claimable[who];
+    }
 
     function setBucket(address user, bool isLong, uint256 size, uint256 entryValue, uint256 collateral) external {
         BazaarTypes.PositionBucket storage b = positionBuckets[user];
         b.isLong = isLong;
-        b.size = size;
-        b.entryValue = entryValue;
-        b.collateral = collateral;
+        b.size = uint128(size);
+        b.entryValue = uint128(entryValue);
+        b.collateral = uint128(collateral);
     }
 
     /// @dev Seed totalCollateralDeposited. The seizure is capped at the deposits ledger, so
@@ -42,6 +49,12 @@ contract LiqRewardHarness {
 
     function deposits() external view returns (uint256) {
         return vault.totalCollateralDeposited;
+    }
+
+    /// @dev Seed free capital. The seizure a liquidation credits is earmarked against the
+    ///      inventory it arrives with, so only what is seeded here can pay the reward.
+    function seedInsurance(uint256 amount) external {
+        vault.insuranceFundBalance = amount;
     }
 
     function insurance() external view returns (uint256) {
@@ -59,13 +72,15 @@ contract LiqRewardHarness {
             book,
             positionBuckets,
             vault,
+            feeEscrow,
             BazaarTypes.LiquidateParams({
                 currentPrice: price,
                 currentFundingIndex: 0,
-                marginReqs: BazaarTypes.MarginRequirements({imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0}),
+                marginReqs: BazaarTypes.MarginRequirements({
+                    imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0, laggedMmrTs: 0
+                }),
                 pairId: bytes32("TEST"),
-                currentBlock: 1,
-                usdc: address(0) // reward payment no-ops (soft-fail restores the debit)
+                currentBlock: 1
             })
         );
     }
@@ -75,9 +90,11 @@ contract LiqRewardHarness {
     }
 }
 
-/// @notice Unit tests for the unconditional liquidator reward:
+/// @notice Unit tests for the liquidator reward:
 ///         reward per position = max($0.10 floor, 2bps × notional), summed across the batch,
-///         paid at liquidation time with no profit-contingent (secondary) component.
+///         capped at the fund's free capital, debited from insurance and accrued to the
+///         liquidator's claimable balance at liquidation time, with no profit-contingent
+///         (secondary) component.
 contract LiquidatorRewardTest is Test {
     uint256 internal constant FLOOR = 1e17; // 0.10 USDC
     uint256 internal constant PRICE = 50_000e18; // $50,000
@@ -87,6 +104,7 @@ contract LiquidatorRewardTest is Test {
     function setUp() public {
         harness = new LiqRewardHarness();
         harness.seedCollateral(1_000_000e18);
+        harness.seedInsurance(1_000e18); // free capital the reward is paid from
     }
 
     /// @dev A long position of `size` BTC, entered `cushionBp` above PRICE with `collateral`,
@@ -110,6 +128,7 @@ contract LiquidatorRewardTest is Test {
 
         assertEq(r.liquidatedCount, 1);
         assertEq(r.totalUpfrontReward, 1e18, "2bps of $5,000 = $1.00");
+        assertEq(harness.claimable(address(this)), 1e18, "reward accrued to the liquidator's claimable balance");
     }
 
     /// @notice $50 notional → 2bps = $0.01 < $0.10 floor → reward is the floor.
@@ -142,6 +161,7 @@ contract LiquidatorRewardTest is Test {
 
         assertEq(r.liquidatedCount, 2);
         assertEq(r.totalUpfrontReward, 1e18 + FLOOR, "reward is summed per position");
+        assertEq(harness.claimable(address(this)), 1e18 + FLOOR, "the batch total accrues in one credit");
     }
 
     // -------------------- Reward is independent of how the position nets --------------------
@@ -161,6 +181,36 @@ contract LiquidatorRewardTest is Test {
         assertEq(harness.pendingLiqSize(), 0, "equal opposite sizes fully net");
         // Both $5,000 notional → $1.00 each, paid despite the aggregate netting to zero.
         assertEq(r.totalUpfrontReward, 2e18, "netting does not suppress the per-position reward");
+    }
+
+    // -------------------- Capped at free capital --------------------
+
+    /// @notice The seizure just credited is earmarked against the inventory it arrived with, so
+    ///         it is not free capital: a fund holding nothing else pays no reward, and the earmark
+    ///         reaches the books whole.
+    function test_noFreeCapital_paysNothing_earmarkStaysWhole() public {
+        harness = new LiqRewardHarness();
+        harness.seedCollateral(1_000_000e18);
+        _long(alice(), 0.1e18, 50_050e18, 10e18); // earns $1.00; seizes $10 into an empty fund
+        BazaarTypes.LiquidateResult memory r = _liq(alice(), PRICE);
+
+        assertEq(r.liquidatedCount, 1);
+        assertEq(r.totalUpfrontReward, 0, "nothing accrued: the fund holds only the earmark");
+        assertEq(harness.claimable(address(this)), 0, "nothing claimable");
+        assertEq(harness.insurance(), 10e18, "the seizure sits in the fund untouched");
+    }
+
+    /// @notice Free capital short of the reward pays what it has, never more.
+    function test_partialFreeCapital_paysTheCappedReward() public {
+        harness = new LiqRewardHarness();
+        harness.seedCollateral(1_000_000e18);
+        harness.seedInsurance(0.4e18);
+        _long(alice(), 0.1e18, 50_050e18, 10e18); // earns $1.00 against $0.40 of free capital
+        BazaarTypes.LiquidateResult memory r = _liq(alice(), PRICE);
+
+        assertEq(r.totalUpfrontReward, 0.4e18, "capped at free capital");
+        assertEq(harness.claimable(address(this)), 0.4e18, "the capped amount accrued");
+        assertEq(harness.insurance(), 10e18, "the earmark is whole: only the free $0.40 left the fund");
     }
 
     // -------------------- Helpers --------------------
@@ -220,7 +270,11 @@ contract SeizureLedgerClampTest is Test {
         BazaarTypes.LiquidateResult memory r = _liq(loser);
 
         assertEq(r.liquidatedCount, 1, "liquidation must not revert on a thin ledger");
-        assertEq(harness.insurance(), 9_200e18, "insurance receives the capped amount");
+        assertEq(
+            harness.insurance(),
+            9_200e18 - r.totalUpfrontReward,
+            "insurance receives the capped amount, less the reward"
+        );
         assertEq(harness.deposits(), 0, "ledger floors at zero");
         assertEq(harness.deficit(), 0, "no deficit at seizure time");
         assertEq(harness.pendingLiqSize(), 1e18, "estate carries the full position");
@@ -232,9 +286,9 @@ contract SeizureLedgerClampTest is Test {
         _underwaterLong(loser, 10_000e18);
         harness.seedCollateral(30_000e18);
 
-        _liq(loser);
+        BazaarTypes.LiquidateResult memory r = _liq(loser);
 
-        assertEq(harness.insurance(), 10_000e18, "full book value seized");
+        assertEq(harness.insurance(), 10_000e18 - r.totalUpfrontReward, "full book value seized, less the reward");
         assertEq(harness.deposits(), 20_000e18);
         assertEq(harness.deficit(), 0);
     }
@@ -253,7 +307,7 @@ contract SeizureLedgerClampTest is Test {
         BazaarTypes.LiquidateResult memory r = harness.liquidate(users, PRICE);
 
         assertEq(r.liquidatedCount, 2, "the aggregate cap must not revert the batch");
-        assertEq(harness.insurance(), 9_000e18, "6,000 full + 3,000 capped");
+        assertEq(harness.insurance(), 9_000e18 - r.totalUpfrontReward, "6,000 full + 3,000 capped, less the rewards");
         assertEq(harness.deposits(), 0);
         assertEq(harness.pendingLiqSize(), 2e18, "both estates on the books");
     }
@@ -268,6 +322,7 @@ contract SeizureLedgerClampTest is Test {
 
         assertEq(r.liquidatedCount, 1);
         assertEq(harness.insurance(), 0, "nothing attributable, nothing credited");
+        assertEq(harness.claimable(address(this)), 0, "a reward the fund cannot cover is skipped, never partial");
         assertEq(harness.pendingLiqSize(), 1e18);
     }
 }
@@ -283,6 +338,7 @@ contract NettingHarness {
     BazaarTypes.OrderBook internal book;
     mapping(address => BazaarTypes.PositionBucket) public positionBuckets;
     BazaarTypes.Vault public vault;
+    BazaarTypes.FeeEscrow internal feeEscrow;
 
     function setBucket(
         address user,
@@ -294,9 +350,9 @@ contract NettingHarness {
     ) external {
         BazaarTypes.PositionBucket storage b = positionBuckets[user];
         b.isLong = isLong;
-        b.size = size;
-        b.entryValue = entryValue;
-        b.collateral = collateral;
+        b.size = uint128(size);
+        b.entryValue = uint128(entryValue);
+        b.collateral = uint128(collateral);
         b.entryFundingIndex = entryFundingIndex;
     }
 
@@ -320,6 +376,10 @@ contract NettingHarness {
         vault.pendingLiqSize = size;
         vault.pendingLiqEntryNotional = entryNotional;
         vault.pendingLiqBankruptcyNotional = bankruptcyNotional;
+        // The gap between the two notionals is staged as the collateral seized with the inventory.
+        vault.pendingLiqSeized = entryNotional > bankruptcyNotional
+            ? entryNotional - bankruptcyNotional
+            : bankruptcyNotional - entryNotional;
         vault.pendingLiqEntryFundingIndex = entryFundingIndex;
         vault.pendingLiqIsLong = isLong;
     }
@@ -336,19 +396,25 @@ contract NettingHarness {
             book,
             positionBuckets,
             vault,
+            feeEscrow,
             BazaarTypes.LiquidateParams({
                 currentPrice: price,
                 currentFundingIndex: fundingIndex,
-                marginReqs: BazaarTypes.MarginRequirements({imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0}),
+                marginReqs: BazaarTypes.MarginRequirements({
+                    imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0, laggedMmrTs: 0
+                }),
                 pairId: bytes32("TEST"),
-                currentBlock: 1,
-                usdc: address(0) // reward payment no-ops (soft-fail restores the debit)
+                currentBlock: 1
             })
         );
     }
 
     function insuranceFundBalance() external view returns (uint256) {
         return vault.insuranceFundBalance;
+    }
+
+    function claimable(address who) external view returns (uint256) {
+        return feeEscrow.claimable[who];
     }
 
     function pendingLiqSize() external view returns (uint256) {
@@ -402,13 +468,13 @@ contract VaultFundingNettingTest is Test {
         // the vault-inventory funding under test.
         h.setBucket(dave(), false, SIZE, entryNotional, SEIZED_COLLATERAL, currentIdx);
 
-        h.liquidate(dave(), PRICE, currentIdx);
+        BazaarTypes.LiquidateResult memory r = h.liquidate(dave(), PRICE, currentIdx);
 
         assertEq(h.pendingLiqSize(), 0, "equal opposite sizes fully net");
 
         uint256 nettedFunding = uint256(currentIdx - entryIdx) * SIZE / SCALE; // 100e18
-        // base + seized - funding (long pays when funding rises); price netPnl == 0
-        uint256 expected = BASE_INSURANCE + SEIZED_COLLATERAL - nettedFunding;
+        // base + seized - funding (long pays when funding rises) - liquidator reward; price netPnl == 0
+        uint256 expected = BASE_INSURANCE + SEIZED_COLLATERAL - nettedFunding - r.totalUpfrontReward;
         assertEq(h.insuranceFundBalance(), expected, "long-inventory funding realized as outflow");
     }
 
@@ -423,13 +489,13 @@ contract VaultFundingNettingTest is Test {
         h.seedPending(false, SIZE, entryNotional, _mulDiv(SIZE, 52_000e18, SCALE), entryIdx);
         h.setBucket(dave(), true, SIZE, entryNotional, SEIZED_COLLATERAL, currentIdx);
 
-        h.liquidate(dave(), PRICE, currentIdx);
+        BazaarTypes.LiquidateResult memory r = h.liquidate(dave(), PRICE, currentIdx);
 
         assertEq(h.pendingLiqSize(), 0, "equal opposite sizes fully net");
 
         uint256 nettedFunding = uint256(currentIdx - entryIdx) * SIZE / SCALE; // 100e18
-        // base + seized + funding (short receives when funding rises); price netPnl == 0
-        uint256 expected = BASE_INSURANCE + SEIZED_COLLATERAL + nettedFunding;
+        // base + seized + funding (short receives when funding rises) - liquidator reward; price netPnl == 0
+        uint256 expected = BASE_INSURANCE + SEIZED_COLLATERAL + nettedFunding - r.totalUpfrontReward;
         assertEq(h.insuranceFundBalance(), expected, "short-inventory funding realized as inflow");
     }
 
@@ -442,11 +508,15 @@ contract VaultFundingNettingTest is Test {
         h.seedPending(true, SIZE, entryNotional, _mulDiv(SIZE, 48_000e18, SCALE), idx);
         h.setBucket(dave(), false, SIZE, entryNotional, SEIZED_COLLATERAL, idx);
 
-        h.liquidate(dave(), PRICE, idx);
+        BazaarTypes.LiquidateResult memory r = h.liquidate(dave(), PRICE, idx);
 
         assertEq(h.pendingLiqSize(), 0, "equal opposite sizes fully net");
-        // base + seized only; price netPnl == 0 and funding delta == 0
-        assertEq(h.insuranceFundBalance(), BASE_INSURANCE + SEIZED_COLLATERAL, "no funding term when delta is zero");
+        // base + seized - liquidator reward only; price netPnl == 0 and funding delta == 0
+        assertEq(
+            h.insuranceFundBalance(),
+            BASE_INSURANCE + SEIZED_COLLATERAL - r.totalUpfrontReward,
+            "no funding term when delta is zero"
+        );
     }
 
     function dave() internal returns (address) {
@@ -474,6 +544,8 @@ contract VaultFundingNettingTest is Test {
         // Short's $1k collateral is seized into insurance first (4k -> 5k), then the $12k netting
         // loss (60k entry vs 48k) overruns it: deficit = 12k - 5k = 7k.
         assertEq(h.deficit(), 7_000 * SCALE, "overrun recorded as realized deficit");
+        // The reward is judged after the netting: an emptied fund cannot pay it, so it is skipped.
+        assertEq(h.claimable(address(this)), 0, "no reward from a wiped fund");
     }
 }
 
@@ -491,9 +563,9 @@ contract AdlHarness {
     function setBucket(address user, bool isLong, uint256 size, uint256 entryValue, uint256 collateral) external {
         BazaarTypes.PositionBucket storage b = positionBuckets[user];
         b.isLong = isLong;
-        b.size = size;
-        b.entryValue = entryValue;
-        b.collateral = collateral;
+        b.size = uint128(size);
+        b.entryValue = uint128(entryValue);
+        b.collateral = uint128(collateral);
     }
 
     function setPendingLiq(uint256 size, uint256 bankruptcyNotional, bool isLong) external {
@@ -501,6 +573,19 @@ contract AdlHarness {
         vault.pendingLiqBankruptcyNotional = bankruptcyNotional;
         vault.pendingLiqIsLong = isLong;
         vault.pendingLiqEntryNotional = bankruptcyNotional;
+        vault.pendingLiqSeized = 0;
+    }
+
+    /// @dev Stage an entry basis away from the bankruptcy notional: the gap is staged as the
+    ///      collateral seized with the inventory.
+    function setPendingLiqEntryNotional(uint256 x) external {
+        vault.pendingLiqEntryNotional = x;
+        uint256 bk = vault.pendingLiqBankruptcyNotional;
+        vault.pendingLiqSeized = x > bk ? x - bk : bk - x;
+    }
+
+    function vaultDeficit() external view returns (uint256) {
+        return vault.deficit;
     }
 
     function setVaultInsurance(uint256 insuranceFundBalance) external {
@@ -522,6 +607,10 @@ contract AdlHarness {
 
     function bucketCollateral(address u) external view returns (uint256) {
         return positionBuckets[u].collateral;
+    }
+
+    function bucketSize(address u) external view returns (uint256) {
+        return positionBuckets[u].size;
     }
 
     /// @dev Seed OI fields so the ADL close-path doesn't underflow when decrementing them.
@@ -577,11 +666,11 @@ contract Phase3AdlGuardTest is Test {
             adlLongs: false,
             adlSnapshotPrice: 100 * SCALE,
             adlSnapshotFundingIndex: 0,
-            adlPendingSince: block.timestamp - 15 minutes, // ADL_AUCTION_DURATION → threshold = 1
+            adlAuctionStartTs: block.timestamp - 15 minutes, // ADL_AUCTION_DURATION → threshold = 1
             currentPrice: 100 * SCALE,
             currentFundingIndex: 0,
             marginRequirements: BazaarTypes.MarginRequirements({
-                imrBp: 2_000, mmrBp: 1_000, lastUpdateTs: 0, laggedMmrBp: 0
+                imrBp: 2_000, mmrBp: 1_000, lastUpdateTs: 0, laggedMmrBp: 0, laggedMmrTs: 0
             }),
             pairId: bytes32(uint256(0xBAB)),
             adlId: 0,
@@ -593,11 +682,14 @@ contract Phase3AdlGuardTest is Test {
     ///         1-wei floor (effectively infinite), is closed, and its credit is its PnL on
     ///         its real (zero) collateral.
     function test_ZeroCollateral_WinnerClosedNotSkipped() public {
-        harness.setPendingLiq({size: 1 * SCALE, bankruptcyNotional: 100 * SCALE, isLong: true});
+        // Vault holds 2 units at bankruptcy $100/u, marked at $90 against a $10 fund: the size
+        // that restores health exceeds the single unit this winner can cover, so the close is
+        // bounded by the winner and not by the batch cap.
+        harness.setPendingLiq({size: 2 * SCALE, bankruptcyNotional: 200 * SCALE, isLong: true});
         harness.setOI({
             totalLongOI: 0, totalShortOI: 1 * SCALE, longWeightedEntrySum: 0, shortWeightedEntrySum: 150 * SCALE
         });
-        harness.setVaultInsurance(1_000 * SCALE);
+        harness.setVaultInsurance(10 * SCALE);
         harness.setVaultCollateral(1_000 * SCALE);
 
         // Short winner: size = 1, entry = $150, collateral = 0 (everything withdrawn on
@@ -607,11 +699,14 @@ contract Phase3AdlGuardTest is Test {
         address[] memory winners = new address[](1);
         winners[0] = BAD_USER;
 
-        BazaarTypes.AdlResult memory r = harness.execAdl(winners, _params());
+        BazaarTypes.AdlParams memory p = _params();
+        p.currentPrice = 90 * SCALE; // below the bankruptcy price: the vault is in real loss
+
+        BazaarTypes.AdlResult memory r = harness.execAdl(winners, p);
         assertEq(r.eligibleCount, 1, "pure-profit winner is eligible, not skipped");
         assertEq(r.totalLiqSize, 1 * SCALE, "closed in full");
         assertEq(harness.bucketCollateral(BAD_USER), 50 * SCALE, "credit = PnL on real (zero) collateral");
-        assertEq(harness.vaultInsurance(), 1_000 * SCALE - 50 * SCALE, "credit funded from insurance");
+        assertEq(harness.vaultInsurance(), 10 * SCALE, "inventory closed at its own basis: insurance untouched");
     }
 
     /// @notice Zero-collateral winner ranks FIRST (descending-score order) ahead of a normal
@@ -624,12 +719,9 @@ contract Phase3AdlGuardTest is Test {
         harness.setOI({
             totalLongOI: 0, totalShortOI: 2 * SCALE, longWeightedEntrySum: 0, shortWeightedEntrySum: 300 * SCALE
         });
-        // Sized so the vault stays unhealthy through BOTH closes (the mid-batch health check runs
-        // before every close after the first): at currentPrice $20 the per-unit exposure is
-        // $100 bk − $20 = $80, and the 60% cancel threshold on $120 insurance is $72 < $80, so
-        // the check before winner 2 still reads unhealthy. Insurance still covers both $50
-        // credits in full.
-        harness.setVaultInsurance(120 * SCALE);
+        // An empty fund can finish nothing inside the band, so the size that restores health is
+        // the whole $160 exposure: the batch cap leaves room for both closes.
+        harness.setVaultInsurance(0);
         harness.setVaultCollateral(1_000 * SCALE);
 
         // Pure-profit winner (short): size > 0, collateral = 0 → floored score (max).
@@ -654,12 +746,12 @@ contract Phase3AdlGuardTest is Test {
         assertEq(harness.bucketCollateral(validUser), 60 * SCALE, "normal credit = collateral + pnl");
     }
 
-    /// @notice The mid-batch health check must actually break the loop: when closing a subset of
-    ///         winners restores vault health, the early-break fires and the remaining winners are
-    ///         spared rather than deleveraged for nothing. Setup: 6 winners, all with positive PnL.
-    ///         The insurance fund is sized so that closing 3 brings exposure below the 60% cancel
-    ///         threshold.
-    function test_EarlyBreak_SparesRemainingWinnersWhenHealthRestored() public {
+    /// @notice The batch cap spares the winners the exposure does not need, and it stops at a
+    ///         size rather than at a winner boundary: with 6 eligible units and the fund $85
+    ///         short of what finishing them at the band edge would cost, 1.48 units close — the
+    ///         second winner partially, the last four not at all. Rounding the stop up to whole
+    ///         winners would deleverage the rest of the second for nothing.
+    function test_BatchCap_SparesRemainingWinnersOnceTheFundIsRestored() public {
         // Long-side liq: vault inherited longs at bankruptcy $200; current price = $150 →
         // per-unit exposure = $50. Six total units of pending liq. Winners are shorts.
         harness.setPendingLiq({size: 6 * SCALE, bankruptcyNotional: 1_200 * SCALE, isLong: true});
@@ -667,14 +759,10 @@ contract Phase3AdlGuardTest is Test {
             totalLongOI: 0, totalShortOI: 6 * SCALE, longWeightedEntrySum: 0, shortWeightedEntrySum: 1_200 * SCALE
         });
 
-        // Insurance: needs to be just large enough that closing 3 units (= $150 exposure
-        // remaining = 3 × ($200 - $150)) drops the running expectedLoss below 60% cancel threshold.
-        // Initial exposure = 6 × $50 = $300. After closing 3 units = $150. We want
-        // cancel threshold = 60% × insurance >= $150 → insurance >= $250.
-        // Pick insurance = $260 so we're comfortably past the threshold after 3 closes.
-        BazaarTypes.Vault memory _v;
-        _v.insuranceFundBalance = 260 * SCALE;
-        // Apply via setOI which doesn't touch insurance; use raw write via inline:
+        // Finishing the 6 units at the band edge ($142.50, the $150 mark less the 5% band) would
+        // cost 6 × $57.50 = $345 against a $260 fund, none of it earmarked, so $85 must come off.
+        // Each unit closed removes $57.50 of that and hands $0.05 of it to the executor, so the
+        // cap lands at 85 / 57.45 = 1.48 units.
         harness.setVaultInsurance(260 * SCALE);
 
         // Six valid short winners, each with 1-unit position, $200 entry, $10 collateral —
@@ -697,25 +785,30 @@ contract Phase3AdlGuardTest is Test {
 
         BazaarTypes.AdlResult memory r = harness.execAdl(winners, p);
 
-        // Six winners eligible, but only 3 should have actually closed via the early-break.
-        // (The health check runs before every close after the first; exposure only drops below
-        // the cancel threshold once 3 units are closed, so the break fires before winner 4.)
-        // r.eligibleSize reflects Pass 1's read of all six.
-        // r.totalLiqSize reflects the actual loop closed amount, which must be < 6 if early-break fired.
+        // All six pre-qualify in the scan; the cap decides how much of that eligible size the
+        // close pass actually consumes.
         assertEq(r.eligibleSize, 6 * SCALE, "all six pre-qualified");
-        assertLt(r.totalLiqSize, 6 * SCALE, "early break spared some winners");
-        assertEq(r.totalLiqSize, 3 * SCALE, "exactly 3 closed: the break fires as soon as health is restored");
+        assertApproxEqRel(r.totalLiqSize, 1.479547e18, 0.0001e18, "$85 excess / $57.45 per unit");
+
+        assertEq(harness.bucketSize(winners[0]), 0, "first winner closed in full");
+        assertEq(harness.bucketSize(winners[1]), 2 * SCALE - r.totalLiqSize, "second closed only to the cap");
+        assertEq(harness.bucketSize(winners[2]), 1 * SCALE, "third untouched");
+        assertEq(harness.bucketSize(winners[3]), 1 * SCALE, "fourth untouched");
+        assertEq(harness.bucketSize(winners[4]), 1 * SCALE, "fifth untouched");
+        assertEq(harness.bucketSize(winners[5]), 1 * SCALE, "sixth untouched");
     }
 
     // ╔══════════════════════════════════════════════════════════════╗
-    // ║   ADL ACCOUNTING CONSERVATION — winner PnL funded by insurance ║
+    // ║   ADL ACCOUNTING CONSERVATION — inventory settled by insurance ║
     // ╚══════════════════════════════════════════════════════════════╝
 
-    /// @dev Canonical funded-winner scenario: vault inherited longs at bankruptcy $200
-    ///      (settlement price), one short winner entered at $250 (so +$50 PnL when settled
-    ///      at $200), profitable at the $150 snapshot. Returns the winner address.
+    /// @dev Canonical scenario: the vault inherited 1 unit of longs, estate entry $250 and
+    ///      bankruptcy $200 (a $50 seizure sitting in the fund), one short winner entered at
+    ///      $250 with $10 collateral (+$50 at the $200 settlement), profitable at the $150
+    ///      snapshot. Returns the winner address.
     function _setupFundedWinner(uint256 insurance, uint256 collateralTracked) internal returns (address winner) {
         harness.setPendingLiq({size: 1 * SCALE, bankruptcyNotional: 200 * SCALE, isLong: true});
+        harness.setPendingLiqEntryNotional(250 * SCALE);
         harness.setOI({
             totalLongOI: 0, totalShortOI: 1 * SCALE, longWeightedEntrySum: 0, shortWeightedEntrySum: 250 * SCALE
         });
@@ -734,11 +827,14 @@ contract Phase3AdlGuardTest is Test {
         p.currentPrice = 150 * SCALE;
     }
 
-    /// @notice The winner's realized PnL ($50, settled at the $200 bankruptcy price) is debited
-    ///         from insurance and credited to totalCollateralDeposited, so the winner's bucket
-    ///         can be withdrawn and `insurance + totalCollateralDeposited` is conserved.
-    function test_Conservation_WinnerPnlFundedFromInsurance() public {
-        address winner = _setupFundedWinner({insurance: 1_000 * SCALE, collateralTracked: 1_000 * SCALE});
+    /// @notice The inventory slice realizes its loss from the estate's entry to the settlement
+    ///         price ($200 − $250 = −$50, exactly the seizure) as an I → D transfer, and the
+    ///         winner is credited their full $50 PnL. The two coincide here because the winner
+    ///         entered at the estate's entry; `insurance + totalCollateralDeposited` is conserved.
+    function test_Conservation_VaultLossReturnsSeizureToLedger() public {
+        // The fund holds exactly the $50 it seized off the estate and no free capital, so the
+        // size that restores health is the whole unit and the winner closes in full.
+        address winner = _setupFundedWinner({insurance: 50 * SCALE, collateralTracked: 1_000 * SCALE});
         BazaarTypes.AdlParams memory p = _fundedWinnerParams();
 
         uint256 iBefore = harness.vaultInsurance();
@@ -748,9 +844,10 @@ contract Phase3AdlGuardTest is Test {
         winners[0] = winner;
         harness.execAdl(winners, p);
 
-        assertEq(iBefore - harness.vaultInsurance(), 50 * SCALE, "insurance funded the winner PnL");
-        assertEq(harness.vaultCollateral() - tBefore, 50 * SCALE, "collateral tracking grew by the PnL");
+        assertEq(iBefore - harness.vaultInsurance(), 50 * SCALE, "insurance returned the seizure to the ledger");
+        assertEq(harness.vaultCollateral() - tBefore, 50 * SCALE, "deposits ledger grew by the vault's loss");
         assertEq(harness.bucketCollateral(winner), 60 * SCALE, "winner credited entry collateral + PnL");
+        assertEq(harness.vaultDeficit(), 0, "no bad debt");
         assertEq(
             harness.vaultInsurance() + harness.vaultCollateral(),
             iBefore + tBefore,
@@ -758,29 +855,53 @@ contract Phase3AdlGuardTest is Test {
         );
     }
 
-    /// @notice Insolvency tail: insurance ($20) can't cover the winner PnL ($50). The credit is
-    ///         CAPPED at available insurance — the winner is haircut to $20, the position is still
-    ///         fully closed, and `insurance + totalCollateralDeposited` stays conserved so the
-    ///         pair remains solvent (no emergency termination).
-    function test_Conservation_InsuranceShortfall_CapsWinnerKeepsSolvent() public {
-        address winner = _setupFundedWinner({insurance: 20 * SCALE, collateralTracked: 1_000 * SCALE});
+    /// @notice No free capital: the fund holds exactly the $50 seizure and the live index charges
+    ///         the long inventory $5 more, so the vault's loss is $55. The seizure is returned to
+    ///         the ledger, the $5 the fund cannot back is withheld from the winner's own $5 of
+    ///         funding income, nothing is booked as deficit, and the pair stays solvent.
+    function test_Conservation_CarryShortfall_WithheldFromWinnerFunding() public {
+        address winner = _setupFundedWinner({insurance: 50 * SCALE, collateralTracked: 1_000 * SCALE});
         BazaarTypes.AdlParams memory p = _fundedWinnerParams();
+        p.currentFundingIndex = int256(5 * SCALE); // shorts receive $5/unit; the vault's long pays it
 
         uint256 sumBefore = harness.vaultInsurance() + harness.vaultCollateral();
 
         address[] memory winners = new address[](1);
         winners[0] = winner;
-        harness.execAdl(winners, p); // must not revert; no termination needed
+        harness.execAdl(winners, p);
 
-        assertEq(harness.vaultInsurance(), 0, "insurance fully drawn to fund what it can");
-        assertEq(
-            harness.vaultCollateral() - 1_000 * SCALE, 20 * SCALE, "collateral tracking grew only by the funded amount"
-        );
-        assertEq(harness.bucketCollateral(winner), 30 * SCALE, "winner capped at entry collateral $10 + funded $20");
+        assertEq(harness.vaultInsurance(), 0, "seizure fully returned to the ledger");
+        assertEq(harness.vaultCollateral() - 1_000 * SCALE, 50 * SCALE, "ledger grew by what the fund could pay");
+        assertEq(harness.bucketCollateral(winner), 60 * SCALE, "price PnL $50 paid in full, $5 funding withheld");
+        assertEq(harness.vaultDeficit(), 0, "a withheld carry is not bad debt");
         assertEq(
             harness.vaultInsurance() + harness.vaultCollateral(),
             sumBefore,
-            "insurance + totalCollateralDeposited conserved - books stay solvent, no termination"
+            "insurance + totalCollateralDeposited conserved"
+        );
+    }
+
+    /// @notice The fund holds less than the seizure it earmarked ($20 against $50) and the
+    ///         inventory owes $5 of funding: the $35 shortfall exceeds the winner's $5 funding
+    ///         income, so that income is withheld and the remaining $30 is recorded as deficit.
+    ///         The winner's $50 price PnL is never touched.
+    function test_Conservation_EarmarkBreach_RecordsDeficitBeyondWinnerFunding() public {
+        address winner = _setupFundedWinner({insurance: 20 * SCALE, collateralTracked: 1_000 * SCALE});
+        BazaarTypes.AdlParams memory p = _fundedWinnerParams();
+        p.currentFundingIndex = int256(5 * SCALE);
+
+        uint256 sumBefore = harness.vaultInsurance() + harness.vaultCollateral();
+
+        address[] memory winners = new address[](1);
+        winners[0] = winner;
+        harness.execAdl(winners, p);
+
+        assertEq(harness.vaultInsurance(), 0, "insurance fully drawn");
+        assertEq(harness.vaultCollateral() - 1_000 * SCALE, 20 * SCALE, "ledger grew only by the funded amount");
+        assertEq(harness.bucketCollateral(winner), 60 * SCALE, "price PnL intact, funding income withheld");
+        assertEq(harness.vaultDeficit(), 30 * SCALE, "unbacked remainder recorded as deficit");
+        assertEq(
+            harness.vaultInsurance() + harness.vaultCollateral(), sumBefore, "the deficit is bookkeeping: I + D unmoved"
         );
     }
 
@@ -810,16 +931,35 @@ contract Phase3AdlGuardTest is Test {
 contract VaultHealthHarness {
     BazaarTypes.Vault public vault;
 
+    /// @dev `seizedCollateral` reconstructs the entry basis the loss is measured from: a long's
+    ///      equity reaches zero that far BELOW entry, a short's that far above. The two must stay
+    ///      consistent because insuranceFundBalance is expected to already hold that collateral —
+    ///      a fixture with a large gap and a tiny fund is not a state the protocol can reach.
     function setVault(
         uint256 insuranceFundBalance,
         uint256 pendingLiqSize,
         uint256 pendingLiqBankruptcyNotional,
-        bool pendingLiqIsLong
+        bool pendingLiqIsLong,
+        uint256 seizedCollateral
     ) external {
         vault.insuranceFundBalance = insuranceFundBalance;
         vault.pendingLiqSize = pendingLiqSize;
         vault.pendingLiqBankruptcyNotional = pendingLiqBankruptcyNotional;
         vault.pendingLiqIsLong = pendingLiqIsLong;
+        vault.pendingLiqEntryNotional = pendingLiqIsLong
+            ? pendingLiqBankruptcyNotional + seizedCollateral
+            : pendingLiqBankruptcyNotional - seizedCollateral;
+        vault.pendingLiqSeized = seizedCollateral;
+    }
+
+    function setEntryFundingIndex(int256 i) external {
+        vault.pendingLiqEntryFundingIndex = i;
+    }
+
+    /// @dev Stage the entry basis independently of the bankruptcy notional, for fixtures where
+    ///      the bankruptcy price also carries funding the estate accrued before liquidation.
+    function setEntryNotional(uint256 x) external {
+        vault.pendingLiqEntryNotional = x;
     }
 
     function check(
@@ -830,13 +970,26 @@ contract VaultHealthHarness {
         bool adlLongs
     ) external view returns (VaultHealthLib.LiqExposureResult memory) {
         return VaultHealthLib.checkLiqExposure(
-            vault, currentPrice, isAdlPending, adlPendingSince, adlSnapshotPrice, adlLongs, int256(0), int256(0)
+            vault, currentPrice, isAdlPending, adlPendingSince, adlSnapshotPrice, adlLongs, int256(0), int256(0), MMR_BP
         );
     }
+
+    function checkWithFunding(uint256 currentPrice, int256 currentFundingIndex)
+        external
+        view
+        returns (VaultHealthLib.LiqExposureResult memory)
+    {
+        return VaultHealthLib.checkLiqExposure(
+            vault, currentPrice, false, 0, 0, false, currentFundingIndex, int256(0), MMR_BP
+        );
+    }
+
+    /// @dev Warmup MMR; the unload band it derives is capped at 5% of the price.
+    uint256 constant MMR_BP = 1_000;
 }
 
-/// @notice Tests for the simplified vault expected-loss calculation: direct subtraction
-///         of currentNotional from bankruptcyNotional, no 3% floor.
+/// @notice Tests for the vault expected-loss calculation: what closing the inherited inventory
+///         would take out of the fund, measured on the liquidatees' entry basis.
 contract Phase3VaultHealthTest is Test {
     VaultHealthHarness h;
     uint256 constant SCALE = 1e18;
@@ -845,72 +998,145 @@ contract Phase3VaultHealthTest is Test {
         h = new VaultHealthHarness();
     }
 
-    /// @notice Long-side loss: B = $200, P = $100, size = 1 → loss = $100.
+    /// @notice Long-side loss: entry $250, P = $100, size = 1 → loss = $150.
     function test_LongLiq_LossAtBelowBankruptcy() public {
-        // size 1, bankruptcyNotional = 1 × $200 = $200
+        // size 1, bankruptcy $200 with $50 of collateral seized → entry basis $250
         h.setVault({
             insuranceFundBalance: 1_000_000 * SCALE, // huge so threshold not tripped
             pendingLiqSize: 1 * SCALE,
             pendingLiqBankruptcyNotional: 200 * SCALE,
-            pendingLiqIsLong: true
+            pendingLiqIsLong: true,
+            seizedCollateral: 50 * SCALE
         });
-        // current price $100 → currentNotional = $100, loss = $200 - $100 = $100
-        // ADL trigger threshold = 80% × 1M = $800k; $100 nowhere near, healthy=true.
+        // current price $100 → loss = $250 - $100 = $150
+        // Free capital is $1M with nothing cached as a target; $150 nowhere near, healthy=true.
         VaultHealthLib.LiqExposureResult memory r = h.check(100 * SCALE, false, 0, 0, false);
         assertTrue(r.healthy);
         assertFalse(r.newIsAdlPending);
     }
 
-    /// @notice Short-side loss: B = $100, P = $200, size = 1 → loss = $100.
+    /// @notice Short-side loss: entry $50, P = $200, size = 1 → loss = $150.
     function test_ShortLiq_LossAtAboveBankruptcy() public {
         h.setVault({
             insuranceFundBalance: 1_000_000 * SCALE,
             pendingLiqSize: 1 * SCALE,
-            pendingLiqBankruptcyNotional: 100 * SCALE, // bankruptcy $100
-            pendingLiqIsLong: false
+            pendingLiqBankruptcyNotional: 100 * SCALE, // bankruptcy $100, above a short's entry
+            pendingLiqIsLong: false,
+            seizedCollateral: 50 * SCALE // → entry basis $50
         });
-        // current price $200 → currentNotional = $200; short loses when current > bankruptcy.
-        // loss = $200 - $100 = $100.
+        // current price $200; a short loses as price rises → loss = $200 - $50 = $150.
         VaultHealthLib.LiqExposureResult memory r = h.check(200 * SCALE, false, 0, 0, false);
         assertTrue(r.healthy);
     }
 
-    /// @notice Vault long position in PROFIT (current > bankruptcy) → no loss, ADL not triggered.
-    ///         A floor under expectedLoss would inflate it to 3% × bankruptcyNotional even though
-    ///         the vault is up money; computed from the real gap it is exactly 0.
-    function test_LongLiq_AboveBankruptcy_NoExposure() public {
-        // bankruptcy $100, current $150 — vault is in profit
+    /// @notice Vault long position in PROFIT against the entry basis → no loss, no ADL. The
+    ///         inventory closes for more than it was inherited at, so nothing leaves the fund.
+    function test_LongLiq_AboveEntry_NoExposure() public {
+        // entry $1,200 (bankruptcy $1,000 + $200 seized), current $1,500 — vault is up money
         h.setVault({
-            insuranceFundBalance: 1 * SCALE, // tiny — anything would trigger ADL
+            insuranceFundBalance: 200 * SCALE, // holds the seizure and nothing more
             pendingLiqSize: 10 * SCALE,
             pendingLiqBankruptcyNotional: 1_000 * SCALE, // 10 × $100
-            pendingLiqIsLong: true
+            pendingLiqIsLong: true,
+            seizedCollateral: 200 * SCALE
         });
-        // A 3% floor would compute: 3% × bankruptcyNotional × currentNotional/bankruptcyNotional
-        //   = currentNotional × 3% = $1500 × 3% = $45 → exceeds 80% × $1 = $0.80 → ADL!
-        // From the real gap: expectedLoss = 0 since current > bankruptcy → healthy.
         VaultHealthLib.LiqExposureResult memory r = h.check(150 * SCALE, false, 0, 0, false);
         assertTrue(r.healthy, "vault in profit, no exposure");
         assertFalse(r.newIsAdlPending, "ADL must not trigger");
     }
 
-    /// @notice The loss must be the FULL bankruptcy-to-current gap so ADL triggers in stressed
-    ///         markets. Scaling that gap by currentNotional instead UNDER-reports it precisely
-    ///         when current is far below bankruptcy — the case that matters most.
+    /// @notice Inventory still inside the collateral taken in costs the fund nothing on net,
+    ///         however thin the fund is. The seizure covers exactly this stretch, so a gate that
+    ///         counted the loss without also discounting the seizure would fire on every fresh
+    ///         liquidation — a position liquidated at its margin boundary has lost its collateral
+    ///         by construction.
+    function test_LongLiq_WithinSeizedCollateral_NoTrigger() public {
+        // entry $1,200, bankruptcy $1,000 ($200 seized), current $1,100 — between the two
+        h.setVault({
+            insuranceFundBalance: 200 * SCALE, // the seizure and nothing more
+            pendingLiqSize: 10 * SCALE,
+            pendingLiqBankruptcyNotional: 1_000 * SCALE,
+            pendingLiqIsLong: true,
+            seizedCollateral: 200 * SCALE
+        });
+        // $100 of inventory loss against $200 of collateral → episode is $100 ahead.
+        VaultHealthLib.LiqExposureResult memory r = h.check(110 * SCALE, false, 0, 0, false);
+        assertTrue(r.healthy, "loss inside the collateral is not an exposure");
+        assertFalse(r.newIsAdlPending);
+    }
+
+    /// @notice Past the collateral, the gate must fire against the capital that existed BEFORE
+    ///         the seizure. Comparing the overrun to the raw balance instead scales the trigger
+    ///         with the position taken on, so the larger the liquidation the harder it becomes
+    ///         to fire — and the fund drains to nothing without the auction ever opening.
+    function test_LongLiq_BeyondCollateral_FiresAgainstPreSeizureCapital() public {
+        // $10 fund before, $100 seized → balance $110. Entry $1,000, bankruptcy $900.
+        // Current $850 is $50 past the collateral: closing here leaves the fund at −$40.
+        h.setVault({
+            insuranceFundBalance: 110 * SCALE,
+            pendingLiqSize: 1 * SCALE,
+            pendingLiqBankruptcyNotional: 900 * SCALE,
+            pendingLiqIsLong: true,
+            seizedCollateral: 100 * SCALE
+        });
+        // Overrun $50 vs the $10 of free capital above the seizure.
+        VaultHealthLib.LiqExposureResult memory r = h.check(850 * SCALE, false, 0, 0, false);
+        assertFalse(r.healthy, "overrun past the collateral must open the auction");
+        assertTrue(r.newIsAdlPending);
+    }
+
+    /// @notice Funding accrued on the inventory is part of the claim: a vault holding longs
+    ///         while the index rises owes that leg on unload, and a price-only gate would miss it.
+    function test_LongLiq_FundingLegCountedInTrigger() public {
+        // entry $110, current $110 — flat on price alone
+        h.setVault({
+            insuranceFundBalance: 100 * SCALE,
+            pendingLiqSize: 1 * SCALE,
+            pendingLiqBankruptcyNotional: 100 * SCALE,
+            pendingLiqIsLong: true,
+            seizedCollateral: 10 * SCALE
+        });
+        VaultHealthLib.LiqExposureResult memory flat = h.checkWithFunding(110 * SCALE, 0);
+        assertTrue(flat.healthy, "no price gap and no funding -> nothing owed");
+
+        // $101/unit of funding accrued against the vault's longs: $91 owed beyond the $10 seizure,
+        // against $90 of free capital above it.
+        VaultHealthLib.LiqExposureResult memory owed = h.checkWithFunding(110 * SCALE, 101 * int256(SCALE));
+        assertFalse(owed.healthy, "funding owed on the inventory triggers ADL on its own");
+    }
+
+    /// @notice The funding an estate accrued before liquidation is counted once. It sits inside
+    ///         the bankruptcy price and inside the funding leg the vault realizes from the estate's
+    ///         entry, so the seizure has to be the collateral the fund actually received rather
+    ///         than the gap between the two notionals: with $10 of pre-liquidation funding on a
+    ///         $50 seizure, the inventory is whole exactly at its $220 bankruptcy price.
+    function test_LongLiq_PreLiquidationFundingCountedOnce() public {
+        // entry $260, $50 seized, $10/unit paid before liquidation → bankruptcy $220 (= 260 − 50 + 10).
+        h.setVault({
+            insuranceFundBalance: 50 * SCALE, // the seizure and nothing more: any loss trips the gate
+            pendingLiqSize: 1 * SCALE,
+            pendingLiqBankruptcyNotional: 220 * SCALE,
+            pendingLiqIsLong: true,
+            seizedCollateral: 50 * SCALE
+        });
+        h.setEntryNotional(260 * SCALE);
+        h.setEntryFundingIndex(-10 * int256(SCALE)); // live index 0: $10/unit accrued since entry
+
+        assertTrue(h.checkWithFunding(220 * SCALE, 0).healthy, "whole at the bankruptcy price");
+        assertFalse(h.checkWithFunding(219 * SCALE, 0).healthy, "a dollar under it is a loss the fund cannot carry");
+    }
+
+    /// @notice Deep underwater must trigger: entry $250, current $50 → $200 claim against a
+    ///         $100 fund.
     function test_LongLiq_DeepUnderwater_TriggersAdl() public {
-        // bankruptcy $200, current $50 — vault deeply underwater
-        // Real loss: 1 × ($200 - $50) = $150.
-        // Scaled by currentNotional: $50 × 75% = $37.50 (off by P/B = 50/200 = 0.25)
-        // Full gap: $200 - $50 = $150
         h.setVault({
             insuranceFundBalance: 100 * SCALE, // small fund
             pendingLiqSize: 1 * SCALE,
             pendingLiqBankruptcyNotional: 200 * SCALE,
-            pendingLiqIsLong: true
+            pendingLiqIsLong: true,
+            seizedCollateral: 50 * SCALE
         });
-        // ADL trigger = 80% × $100 = $80.
-        // A scaled loss ($37.50) < $80 → ADL would NOT trigger: a false negative.
-        // The full-gap loss ($150) > $80 → ADL DOES trigger.
+        // Free capital above the $50 seizure is $50; the $200 claim clears it.
         VaultHealthLib.LiqExposureResult memory r = h.check(50 * SCALE, false, 0, 0, false);
         assertFalse(r.healthy, "deep underwater must trigger ADL");
         assertTrue(r.newIsAdlPending);
@@ -922,32 +1148,52 @@ contract Phase3VaultHealthTest is Test {
     ///         LOSING side, so executeAdl would always revert "No eligible winners" and every
     ///         ADL event would time out into emergency termination.
     function test_AdlTrigger_DeleverageSideOppositeLiquidatedSide() public {
-        // Shorts liquidated (price spiked): bankruptcy $100, current $200, loss = $100
-        // vs trigger threshold 80% × $50 = $40 → ADL triggers.
+        // Shorts liquidated (price spiked): entry $50, current $200, loss = $150 against no free
+        // capital beyond the seizure → ADL triggers.
         h.setVault({
             insuranceFundBalance: 50 * SCALE,
             pendingLiqSize: 1 * SCALE,
             pendingLiqBankruptcyNotional: 100 * SCALE,
-            pendingLiqIsLong: false
+            pendingLiqIsLong: false,
+            seizedCollateral: 50 * SCALE
         });
         VaultHealthLib.LiqExposureResult memory r = h.check(200 * SCALE, false, 0, 0, false);
         assertTrue(r.newIsAdlPending);
         assertTrue(r.newAdlLongs, "shorts liquidated -> deleverage the winning longs");
     }
 
-    /// @notice A vault at break-even (current ≈ bankruptcy) with a tiny insurance fund must NOT
-    ///         trigger ADL. A 3% floor under expectedLoss would trip it on the fund's size alone;
-    ///         the real gap is 0 → healthy.
+    /// @notice A vault whose inventory sits at its entry basis owes nothing, so no ADL — there
+    ///         is no floor under expectedLoss that would trip on the fund's size alone.
     function test_NoFloor_BreakEven_NoFalseAdl() public {
-        // bankruptcy = $100, current = $100 — exactly break-even
+        // entry = $100 (no collateral left to seize), current = $100 — exactly break-even
         h.setVault({
             insuranceFundBalance: 1 * SCALE,
             pendingLiqSize: 1 * SCALE,
             pendingLiqBankruptcyNotional: 100 * SCALE,
-            pendingLiqIsLong: true
+            pendingLiqIsLong: true,
+            seizedCollateral: 0
         });
         VaultHealthLib.LiqExposureResult memory r = h.check(100 * SCALE, false, 0, 0, false);
         assertTrue(r.healthy, "no floor: break-even is healthy regardless of fund size");
+        assertFalse(r.newIsAdlPending);
+    }
+
+    /// @notice A seizure that dwarfs the fund it lands in must not open an auction by itself.
+    ///         The inventory arrives having consumed its collateral, so charging that against a
+    ///         balance the same collateral just inflated would halt trading on essentially every
+    ///         liquidation into a thin fund.
+    function test_LargeSeizureIntoThinFund_NoSpuriousTrigger() public {
+        // $2 fund before the liquidation, $100 of collateral seized → balance $102.
+        // Inventory sits exactly at bankruptcy: closing it pays back the $100 and leaves $2.
+        h.setVault({
+            insuranceFundBalance: 102 * SCALE,
+            pendingLiqSize: 1 * SCALE,
+            pendingLiqBankruptcyNotional: 100 * SCALE,
+            pendingLiqIsLong: true,
+            seizedCollateral: 100 * SCALE
+        });
+        VaultHealthLib.LiqExposureResult memory r = h.check(100 * SCALE, false, 0, 0, false);
+        assertTrue(r.healthy, "episode is whole: the seizure covers the inventory exactly");
         assertFalse(r.newIsAdlPending);
     }
 
@@ -961,18 +1207,19 @@ contract Phase3VaultHealthTest is Test {
         uint256 since = block.timestamp - 1 hours;
         uint256 staleSnapshot = 50 * SCALE; // frozen at the original crash
 
-        // Post-flip aggregate: vault holds shorts, bankruptcy $100, current $200 →
-        // loss = $100 > cancel threshold 60% × $100 = $60 → ADL still necessary.
+        // Post-flip aggregate: vault holds shorts, bankruptcy $100, current $200 → finishing at
+        // the band edge ($210) would cost $110 against $50 of free capital → ADL still necessary.
         h.setVault({
             insuranceFundBalance: 100 * SCALE,
             pendingLiqSize: 1 * SCALE,
             pendingLiqBankruptcyNotional: 100 * SCALE,
-            pendingLiqIsLong: false
+            pendingLiqIsLong: false,
+            seizedCollateral: 50 * SCALE
         });
         // adlLongs = false == pendingLiqIsLong → direction conflict detected.
         VaultHealthLib.LiqExposureResult memory r = h.check(200 * SCALE, true, since, staleSnapshot, false);
         assertFalse(r.healthy);
-        assertTrue(r.newIsAdlPending, "still pending - exposure above cancel threshold");
+        assertTrue(r.newIsAdlPending, "still pending - the band edge does not fit under the free capital");
         assertTrue(r.newAdlLongs, "re-targeted: vault holds shorts -> deleverage longs");
         assertEq(r.newAdlSnapshotPrice, 200 * SCALE, "snapshot refreshed to current price");
         assertEq(r.newAdlPendingSince, since, "termination clock NOT reset");
@@ -990,7 +1237,8 @@ contract Phase3VaultHealthTest is Test {
             insuranceFundBalance: 100 * SCALE,
             pendingLiqSize: 1 * SCALE,
             pendingLiqBankruptcyNotional: 100 * SCALE,
-            pendingLiqIsLong: false
+            pendingLiqIsLong: false,
+            seizedCollateral: 50 * SCALE
         });
         VaultHealthLib.LiqExposureResult memory r = h.check(200 * SCALE, true, since, snapshot, true);
         assertTrue(r.newIsAdlPending);
@@ -1005,13 +1253,14 @@ contract Phase3VaultHealthTest is Test {
         vm.warp(1_700_000_000);
         uint256 since = block.timestamp - 1 hours;
 
-        // Vault holds shorts, bankruptcy $100, current $110 → loss = $10,
-        // well under cancel threshold 60% × $1000 = $600.
+        // Vault holds shorts, bankruptcy $100, current $110 → finishing at the band edge
+        // ($115.50) would cost $15.50, well under the $950 of free capital.
         h.setVault({
             insuranceFundBalance: 1_000 * SCALE,
             pendingLiqSize: 1 * SCALE,
             pendingLiqBankruptcyNotional: 100 * SCALE,
-            pendingLiqIsLong: false
+            pendingLiqIsLong: false,
+            seizedCollateral: 50 * SCALE
         });
         VaultHealthLib.LiqExposureResult memory r = h.check(110 * SCALE, true, since, 50 * SCALE, false);
         assertTrue(r.healthy);
@@ -1050,6 +1299,7 @@ contract Phase1TransferSafetyTest is Test {
         (, address usdcAddr,,) = helperConfig.activeNetworkConfig();
         usdc = MockUSDC(usdcAddr);
 
+        PythSeed.seed(address(factory.oracle().pyth()), BTC_USD_FEED_ID);
         address deployer = makeAddr("deployer");
         usdc.mint(deployer, PROPOSAL_TOTAL_USDC);
         vm.startPrank(deployer);

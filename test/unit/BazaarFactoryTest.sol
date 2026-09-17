@@ -13,10 +13,12 @@ import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 import {MockUSDC} from "../mocks/MockUSDC.sol";
 import {MockOptimisticOracleV3} from "../mocks/MockOptimisticOracleV3.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {PythSeed} from "../PythSeed.sol";
 
 contract BazaarFactoryTest is Test {
     // Pyth ETH/USD feed ID
     bytes32 constant ETH_USD_FEED_ID = 0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace;
+    bytes32 constant BTC_USD_FEED_ID = 0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43;
 
     // Scale constants
     uint256 constant BAZAAR_SCALE = 1e18;
@@ -72,6 +74,10 @@ contract BazaarFactoryTest is Test {
         oracle = factory.oracle();
         lens = factory.lens();
         pairTerminator = factory.pairTerminator();
+
+        // The factory lists a raw feed only once Pyth has stored a price for it.
+        PythSeed.seed(address(oracle.pyth()), ETH_USD_FEED_ID);
+        PythSeed.seed(address(oracle.pyth()), BTC_USD_FEED_ID);
 
         // Derive constants from factory
         bondUsdc = factory.DEPLOYMENT_BOND_USDC();
@@ -1127,8 +1133,6 @@ contract BazaarFactoryTest is Test {
     }
 
     function testExecutePairDeployment_MultiplePairsTracked() public {
-        bytes32 BTC_USD_FEED_ID = 0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43;
-
         // Deploy first pair (ETH/USD)
         vm.startPrank(user1);
         usdc.approve(address(factory), PROPOSAL_TOTAL_USDC);
@@ -1276,6 +1280,29 @@ contract BazaarFactoryTest is Test {
     ///         itself. Deployed system must be self-consistent.
     function test_wiring_DeployedSystemIsSelfConsistent() public view {
         assertEq(pairTerminator.factory(), address(factory), "terminator wired to factory");
+        assertEq(lens.factory(), address(factory), "lens wired to factory");
+    }
+
+    /// @notice The same check guards the lens: a correctly wired terminator does not excuse a lens
+    ///         that points at a different factory.
+    function test_wiring_RevertsOnMisWiredLens() public {
+        MockUSDC u = new MockUSDC();
+        // nonce+2: the lens and the terminator each consume a nonce before the factory CREATE.
+        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 2);
+        BazaarPairLens l = new BazaarPairLens(makeAddr("wrongFactory"));
+        BazaarPairTerminator t = new BazaarPairTerminator(predicted);
+
+        vm.expectRevert(BazaarFactory.Factory__WiringMismatch.selector);
+        new BazaarFactory(
+            address(u),
+            makeAddr("oracle"),
+            address(l),
+            makeAddr("bounty"),
+            makeAddr("oo"),
+            makeAddr("impl"),
+            address(t),
+            bytes32("ASSERT_TRUTH2")
+        );
     }
 
     /// @notice A factory constructed against a terminator that points at a DIFFERENT factory
@@ -1305,10 +1332,11 @@ contract BazaarFactoryTest is Test {
         MockOptimisticOracleV3 oo3 = new MockOptimisticOracleV3(address(u), 7200);
         oo3.setIdentifierSupported("DEAD_ID", false);
 
-        // Predict THIS test's next CREATE address the same way the script does: nonce+1 because
-        // the terminator deploy consumes one nonce first. The wiring check runs before the
-        // whitelist gate, so the terminator must be correctly wired for this test to reach it.
-        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
+        // Predict THIS test's next CREATE address the same way the script does: nonce+2 because
+        // the lens and the terminator each consume a nonce first. The wiring checks run before
+        // the whitelist gate, so both must be correctly wired for this test to reach it.
+        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 2);
+        BazaarPairLens l = new BazaarPairLens(predicted);
         BazaarPairTerminator t = new BazaarPairTerminator(predicted);
 
         vm.expectRevert(
@@ -1317,7 +1345,7 @@ contract BazaarFactoryTest is Test {
         new BazaarFactory(
             address(u),
             makeAddr("oracle"),
-            makeAddr("lens"),
+            address(l),
             makeAddr("bounty"),
             address(oo3),
             makeAddr("impl"),
@@ -1384,8 +1412,9 @@ contract BazaarFactoryTest is Test {
         MockOptimisticOracleV3 oo3 = new MockOptimisticOracleV3(address(u), 7200);
         // Deliberately left whitelisted: only the ASSERT_TRUTH rule can reject this.
 
-        // nonce+1: the terminator deploy consumes one nonce before the factory's CREATE.
-        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
+        // nonce+2: the lens and the terminator each consume a nonce before the factory CREATE.
+        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 2);
+        BazaarPairLens l = new BazaarPairLens(predicted);
         BazaarPairTerminator t = new BazaarPairTerminator(predicted);
 
         vm.expectRevert(
@@ -1394,7 +1423,7 @@ contract BazaarFactoryTest is Test {
         new BazaarFactory(
             address(u),
             makeAddr("oracle"),
-            makeAddr("lens"),
+            address(l),
             makeAddr("bounty"),
             address(oo3),
             makeAddr("impl"),

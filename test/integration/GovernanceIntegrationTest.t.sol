@@ -8,9 +8,9 @@ import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 import {MockOptimisticOracleV3} from "../mocks/MockOptimisticOracleV3.sol";
 
 /// @title GovernanceIntegrationTest
-/// @notice End-to-end UMA governance flows: scheduled and post-cessation pair termination through the
-///         real Terminator + OptimisticOracle assertion lifecycle, post-termination user settlement,
-///         the oracle-upgrade proposal, and composite-pair deployment/pricing/termination-claim.
+/// @notice End-to-end UMA governance flows: scheduled pair termination through the real Terminator
+///         + OptimisticOracle assertion lifecycle, post-termination user settlement, the
+///         oracle-upgrade proposal, and composite-pair deployment/pricing/termination-claim.
 contract GovernanceIntegrationTest is IntegrationBase {
     BazaarPairTerminator internal terminator;
     MockOptimisticOracleV3 internal mockOO;
@@ -28,7 +28,7 @@ contract GovernanceIntegrationTest is IntegrationBase {
         p.refreshPrice{value: fee}(pu);
     }
 
-    /// @dev Propose a (scheduled or post-cessation) termination as `proposer`, funding the $1000 bond.
+    /// @dev Fund `proposer` for a termination proposal's $1000 bond.
     ///      The bond is read into a local BEFORE the prank — the external getter call would consume it.
     function _bondProposer(address proposer) internal {
         uint256 bond = terminator.TERMINATION_PROPOSAL_BOND();
@@ -67,25 +67,24 @@ contract GovernanceIntegrationTest is IntegrationBase {
         vm.warp(vm.getBlockTimestamp() + terminator.TERMINATION_PROPOSAL_LIVENESS() + 1);
         terminator.settleTerminationProposal(aid);
         assertEq(pair.scheduledTerminationTs(), lastTradingTs, "termination scheduled");
-        assertFalse(pair.isPairTerminatedNormal(), "scheduling is not termination");
+        assertFalse(pair.isPairTerminated(), "scheduling is not termination");
 
-        // Past the cutoff + 3h grace, anyone fixes the price using the stored-price fallback,
-        // then finalizes after the 48h terminal sweep window.
-        vm.warp(lastTradingTs + 3 hours + 1);
+        // Past the cutoff + the precise-tick grace, anyone fixes the price using the stored-price
+        // fallback, then finalizes at once: no position is open.
+        vm.warp(lastTradingTs + 12 hours + 1);
         terminator.terminateScheduledPair(address(pair), new bytes[](0));
-        assertFalse(pair.isPairTerminatedNormal(), "price fixed, sweep window still open");
-        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
+        assertFalse(pair.isPairTerminated(), "price fixed, settlement window still open");
         pair.finalizeTermination();
-        assertTrue(pair.isPairTerminatedNormal(), "pair terminated after the trading window");
+        assertTrue(pair.isPairTerminated(), "pair terminated after the trading window");
     }
 
-    // ============================ post-cessation termination ============================
+    // ============================ settlement at the verified tick ============================
 
-    /// @notice Post-cessation termination: the proposer supplies only the cessation timestamp; UMA
-    ///         acceptance schedules it (halting trading), then anyone settles the pair at the
-    ///         on-chain-verified Pyth tick from that moment. Users with open positions can then
-    ///         withdraw their settled collateral.
-    function test_e2e_PostCessationTermination_UsersSettleAtVerifiedPrice() public {
+    /// @notice Scheduled termination settling at the verified tick: once the cutoff has passed,
+    ///         anyone posts the archived Pyth update from that moment and the pair settles at the
+    ///         price verified on-chain from it. Users with open positions can then withdraw their
+    ///         settled collateral.
+    function test_e2e_ScheduledTermination_UsersSettleAtVerifiedPrice() public {
         // Open a matched 0.1 BTC long/short at $50k so both sides hold positions at termination:
         // alice's $50k bid rests, bob's crossing short fills at her maker price.
         uint256 size = BAZAAR_SCALE / 10;
@@ -96,34 +95,35 @@ contract GovernanceIntegrationTest is IntegrationBase {
         _placeLimit(bob, false, size, 49_000 * BAZAAR_SCALE);
         assertEq(_posSize(alice), size, "0.1 BTC opened at $50k");
 
-        // The asset ceases trading: last valid print is $50k at cessationTs, noticed 2 days later.
-        uint64 cessationTs = uint64(vm.getBlockTimestamp());
-        vm.warp(vm.getBlockTimestamp() + 2 days);
-
+        // A delisting is announced for a day out; the feed's last print at the cutoff is $50k.
+        uint64 lastTradingTs = uint64(vm.getBlockTimestamp() + 1 days);
         _bondProposer(carol);
         vm.prank(carol);
-        bytes32 aid =
-            terminator.proposePostCessationTermination(address(pair), "BTC/USD", cessationTs, "Feed decommissioned.");
+        bytes32 aid = terminator.proposeTermination(address(pair), "BTC/USD", lastTradingTs, "Delisting announced.");
 
-        vm.warp(vm.getBlockTimestamp() + terminator.POST_CESSATION_PROPOSAL_LIVENESS() + 1);
+        vm.warp(vm.getBlockTimestamp() + terminator.TERMINATION_PROPOSAL_LIVENESS() + 1);
         terminator.settleTerminationProposal(aid);
 
-        // Acceptance schedules the (past) cutoff — it does NOT settle a price by itself.
-        assertFalse(pair.isPairTerminatedNormal(), "acceptance alone does not terminate");
-        assertEq(pair.scheduledTerminationTs(), cessationTs, "cessation timestamp scheduled");
+        // Acceptance schedules the cutoff — it does NOT settle a price by itself.
+        assertFalse(pair.isPairTerminated(), "acceptance alone does not terminate");
+        assertEq(pair.scheduledTerminationTs(), lastTradingTs, "cutoff scheduled");
 
-        // Anyone finalizes with the archived Pyth update from the cessation moment; the price is
-        // verified on-chain against that payload, not read from the proposal.
-        bytes[] memory tick = _priceUpdate(50_000, cessationTs);
+        // Past the cutoff, anyone fixes the price with the archived Pyth update from that moment;
+        // the price is verified on-chain against that payload, not read from the proposal.
+        vm.warp(uint256(lastTradingTs) + 1);
+        bytes[] memory tick = _priceUpdate(50_000, lastTradingTs);
         uint256 fee = oracle.getUpdateFee(tick);
         vm.deal(address(this), fee);
         terminator.terminateScheduledPair{value: fee}(address(pair), tick);
-        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
+        address[] memory both = new address[](2);
+        both[0] = alice;
+        both[1] = bob;
+        assertEq(pair.liquidate(both, new bytes[](0)), 2, "both positions settled at the fixed price");
         pair.finalizeTermination();
 
-        assertTrue(pair.isPairTerminatedNormal(), "pair terminated at the verified tick");
+        assertTrue(pair.isPairTerminated(), "pair terminated at the verified tick");
         BazaarTypes.AuxState memory aux = pair.auxState();
-        assertEq(aux.normalTerminationPrice, 50_000 * BAZAAR_SCALE, "termination price normalized to 1e18");
+        assertEq(aux.settlementPrice, 50_000 * BAZAAR_SCALE, "termination price normalized to 1e18");
 
         // Both traders settle at $50k (entry price → no PnL) and withdraw collateral.
         uint256 amount = 10_000 * BAZAAR_SCALE;
@@ -176,11 +176,11 @@ contract GovernanceIntegrationTest is IntegrationBase {
         assertEq(address(factory.oo()), oldOo, "oracle address immutable");
     }
 
-    /// @notice Fail closed: while the protocol's identifier is off UMA's live whitelist, both
-    ///         termination proposal paths revert — an assertion made in that state would be
+    /// @notice Fail closed: while the protocol's identifier is off UMA's live whitelist, the
+    ///         termination proposal reverts — an assertion made in that state would be
     ///         undisputable and termination assertions pin settlement semantics. The non-UMA
     ///         termination paths (insurer vote, stale price, insolvency) are unaffected.
-    function test_e2e_TerminationProposals_FailClosedWhileIdentifierDewhitelisted() public {
+    function test_e2e_TerminationProposal_FailClosedWhileIdentifierDewhitelisted() public {
         mockOO.setIdentifierSupported(factory.umaIdentifier(), false);
 
         _bondProposer(alice);
@@ -189,13 +189,6 @@ contract GovernanceIntegrationTest is IntegrationBase {
         terminator.proposeTermination(
             address(pair), "BTC/USD", vm.getBlockTimestamp() + 7 days, "Reverse split announced."
         );
-
-        uint64 cessationTs = uint64(vm.getBlockTimestamp());
-        vm.warp(vm.getBlockTimestamp() + 2 days);
-        _bondProposer(bob);
-        vm.prank(bob);
-        vm.expectRevert(BazaarPairTerminator.BazaarPairTerminator__UmaIdentifierNotLive.selector);
-        terminator.proposePostCessationTermination(address(pair), "BTC/USD", cessationTs, "Feed decommissioned.");
     }
 
     // ============================ disputed termination ============================
@@ -221,7 +214,7 @@ contract GovernanceIntegrationTest is IntegrationBase {
         terminator.settleTerminationProposal(aid);
 
         assertEq(pair.scheduledTerminationTs(), 0, "nothing scheduled on a false assertion");
-        assertFalse(pair.isPairTerminatedNormal(), "pair not terminated");
+        assertFalse(pair.isPairTerminated(), "pair not terminated");
         assertEq(usdc.balanceOf(bob), bobBefore + bond, "disputer nets the proposer's forfeited bond");
     }
 
@@ -257,10 +250,9 @@ contract GovernanceIntegrationTest is IntegrationBase {
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
         bytes[] memory pu = _freshPrice();
         terminator.executeInsurerTermination(address(pair), pu);
-        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
         pair.finalizeTermination();
 
-        assertTrue(pair.isPairTerminatedNormal(), "pair terminated by insurer consensus");
+        assertTrue(pair.isPairTerminated(), "pair terminated by insurer consensus");
         (,,,, uint256 yesShares, uint256 snapshot, bool resolved, bool executed) =
             terminator.insurerProposals(address(pair));
         assertEq(yesShares, 9_500 * BAZAAR_SCALE, "votes tallied");
@@ -269,12 +261,12 @@ contract GovernanceIntegrationTest is IntegrationBase {
         assertEq(usdc.balanceOf(carol), carolAfterPropose + bond, "successful consensus refunds the bond");
     }
 
-    // ============================ emergency termination ============================
+    // ============================ books-vs-balance shortfall ============================
 
-    /// @notice Emergency termination (vault-health Check 2): when the pair's actual USDC no longer
-    ///         backs its books, the next health check emergency-terminates — freezing deposits and
-    ///         setting a pro-rata collateral-withdrawal haircut.
-    function test_e2e_EmergencyTermination_OnBooksVsBalanceMismatch() public {
+    /// @notice Vault-health Check 2: when the pair's actual USDC no longer backs its books, the
+    ///         next health check fixes the settlement price at the live price; finalize then pays
+    ///         principal pro-rata on the cash that is actually there.
+    function test_e2e_BooksVsBalanceMismatch_OpensSettlementWindow() public {
         _deposit(alice, 20_000 * BAZAAR_SCALE);
 
         // Simulate the un-fakeable condition: USDC leaves the pair without the books moving.
@@ -287,10 +279,8 @@ contract GovernanceIntegrationTest is IntegrationBase {
         vm.prank(bob);
         pair.liquidate(_arr1(dave), _freshPrice());
 
-        assertTrue(pair.isPairTerminatedEmergency(), "emergency termination on unbacked books");
-        uint256 haircutBp = pair.auxState().emergencyTerminalCollateralWithdrawalRatioBp;
-        assertGt(haircutBp, 0, "haircut ratio set");
-        assertLt(haircutBp, 10_000, "haircut reflects the missing USDC");
+        assertGt(pair.settlementPriceFixedTs(), 0, "shortfall opened the settlement window");
+        assertFalse(pair.isPairTerminated(), "not terminated until finalize");
 
         // The pair is frozen: no further deposits.
         vm.startPrank(bob);
@@ -298,6 +288,12 @@ contract GovernanceIntegrationTest is IntegrationBase {
         vm.expectRevert();
         pair.depositCollateral(1 * BAZAAR_SCALE, 0, 0, 0, "", "");
         vm.stopPrank();
+
+        // Nothing is left open (dave was liquidated), so finalize runs at once.
+        pair.finalizeTermination();
+        uint256 ratioBp = pair.auxState().terminalPrincipalRatioBp;
+        assertGt(ratioBp, 0, "principal ratio set");
+        assertLt(ratioBp, 10_000, "ratio reflects the missing USDC");
     }
 
     // ============================ composite pairs ============================

@@ -34,6 +34,25 @@ contract HelperConfig is Script {
 
     // -------------------- Arbitrum Mainnet --------------------
 
+    /// @dev Every address here is a literal with no on-chain provenance of its own, and each one is
+    ///      consumed as an immutable: the factory keeps `usdc` and the OOv3, and BazaarOracle keeps
+    ///      the Pyth feed, none with a setter. A wrong entry is therefore not a misconfiguration to
+    ///      be corrected but a redeployment of the whole system, so what each slot must hold is
+    ///      recorded here and re-checked against its issuer's own published deployment list before a
+    ///      mainnet run. DeployBazaar._assertExternalDependencies probes all three at deploy time.
+    ///
+    ///      - `usdcContract` must be Circle's NATIVE USDC on Arbitrum One, not the bridged USDC.e
+    ///        (`0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8`). The two are separate ERC-20s with
+    ///        separate liquidity; picking the bridged one would denominate every pair in a token the
+    ///        protocol did not intend and could never migrate off. Both happen to carry 6 decimals,
+    ///        so the deploy-time decimals probe does not separate them — this is the one entry that
+    ///        has to be read character by character.
+    ///      - `pythFeed` must be the Pyth Core contract for Arbitrum One from Pyth's own EVM
+    ///        contract-address list. Pyth has cut over to a new deployment before; an address that
+    ///        was right for a prior release is not evidence about the current one.
+    ///      - `optimisticOracleV3` must be UMA's OptimisticOracleV3 for Arbitrum One. UMA's Finder
+    ///        is reached through it at runtime rather than configured here, so this address alone
+    ///        determines which UMA deployment adjudicates every listing and termination.
     function getArbitrumMainnetConfig() public pure returns (NetworkConfig memory) {
         return NetworkConfig({
             pythFeed: 0xe15357fB7ab31E091583b9c4b4135BB2f176f38e,
@@ -47,6 +66,11 @@ contract HelperConfig is Script {
     // Uses real USDC and Pyth on Arbitrum Sepolia, but mocks UMA OOv3
     // since UMA has no official testnet deployment on Arbitrum Sepolia.
 
+    /// @dev Same sourcing rule as the mainnet config: `usdcContract` is the Arbitrum Sepolia test
+    ///      USDC and `pythFeed` the Pyth Core contract for that chain, both read from the issuer's
+    ///      published list. The mock OOv3 is constructed against the same USDC it will price bonds
+    ///      in, so a wrong USDC here surfaces as a broken listing flow on the rehearsal rather than
+    ///      on mainnet.
     function getOrCreateArbitrumSepoliaConfig() public returns (NetworkConfig memory) {
         if (activeNetworkConfig.optimisticOracleV3 == address(0)) {
             vm.startBroadcast();

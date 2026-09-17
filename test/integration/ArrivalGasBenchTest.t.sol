@@ -49,7 +49,7 @@ contract ArrivalGasBenchTest is IntegrationBase {
             BazaarTypes.MatchHints memory hints;
             hints.pred = pred;
             vm.prank(m);
-            pair.createOrder(s, hints, pu, 0, 0, 0, "");
+            pair.createOrder(s, hints, pu, 0, 0, 0, "", "");
             uint256 id = _lastCreatedOrderId(pair);
             if (i == 0) firstId = id;
             pred = uint64(id);
@@ -67,7 +67,7 @@ contract ArrivalGasBenchTest is IntegrationBase {
 
         vm.prank(alice);
         uint256 g0 = gasleft();
-        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
         uint256 used = g0 - gasleft();
 
         emit log_named_uint("createOrder: rest on empty book", used);
@@ -92,7 +92,7 @@ contract ArrivalGasBenchTest is IntegrationBase {
 
         vm.prank(alice);
         uint256 g0 = gasleft();
-        pair.createOrder(s, hints, pu, 0, 0, 0, "");
+        pair.createOrder(s, hints, pu, 0, 0, 0, "", "");
         uint256 used = g0 - gasleft();
 
         emit log_named_uint("createOrder: hinted insert into deep book", used);
@@ -109,7 +109,7 @@ contract ArrivalGasBenchTest is IntegrationBase {
 
         vm.prank(alice);
         uint256 g0 = gasleft();
-        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
         uint256 used = g0 - gasleft();
 
         emit log_named_uint("createOrder: UNHINTED insert into deep book", used);
@@ -126,7 +126,7 @@ contract ArrivalGasBenchTest is IntegrationBase {
         BazaarTypes.OrderSpec memory s = _limitSpec(false, BTC / 100, 50_100 * BAZAAR_SCALE);
         vm.prank(alice);
         vm.expectRevert();
-        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
     }
 
     // ============================================================
@@ -143,7 +143,7 @@ contract ArrivalGasBenchTest is IntegrationBase {
 
         vm.prank(alice);
         uint256 g0 = gasleft();
-        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
         used = g0 - gasleft();
 
         assertEq(_posSize(alice), depth * BTC / 100, "sweep consumed the whole ladder");
@@ -170,9 +170,7 @@ contract ArrivalGasBenchTest is IntegrationBase {
         emit log_named_uint("Arbitrum block gas limit", ARBITRUM_BLOCK_GAS_LIMIT);
         emit log_named_uint("headroom vs block limit", ARBITRUM_BLOCK_GAS_LIMIT - used);
 
-        assertLt(
-            used, ARBITRUM_BLOCK_GAS_LIMIT / 2, "max-depth sweep must fit in well under half a block"
-        );
+        assertLt(used, ARBITRUM_BLOCK_GAS_LIMIT / 2, "max-depth sweep must fit in well under half a block");
     }
 
     // ============================================================
@@ -205,6 +203,7 @@ contract ArrivalGasBenchTest is IntegrationBase {
         _stdstore.target(address(pair)).sig("pairVault()").depth(7).checked_write((BTC / 10) * 50_000);
         _stdstore.target(address(pair)).sig("pairVault()").depth(8).checked_write((BTC / 10) * 48_000);
         _stdstore.target(address(pair)).sig("pairVault()").depth(10).checked_write(true);
+        _stdstore.target(address(pair)).sig("pairVault()").depth(13).checked_write((BTC / 10) * 2_000); // seized
 
         bytes[] memory pu = _freshPrice();
         vm.prank(seq);
@@ -223,10 +222,75 @@ contract ArrivalGasBenchTest is IntegrationBase {
         ids[0] = id;
         vm.prank(alice);
         uint256 g0 = gasleft();
-        pair.cancelOrders(ids, 0, 0, 0, "");
+        pair.cancelOrders(ids, 0, 0, 0, "", "");
         uint256 used = g0 - gasleft();
 
         emit log_named_uint("cancelOrders: 1 resting order (incl. unlink)", used);
+    }
+}
+
+/// @title UserOrderCountColdBench
+/// @notice The per-user exposure sweep measured with COLD storage — the production reading.
+///         A test body is one transaction, so a ladder built inside it leaves every order warm
+///         (~100 gas a slot) and makes the sweep look almost free. A real maker places an order
+///         in a fresh transaction and pays ~2,100 a slot to re-read the orders they placed
+///         earlier, so the ladder is built in setUp() instead.
+abstract contract UserOrderCountColdBench is IntegrationBase {
+    uint256 constant BTC = 1e18;
+
+    /// @dev How many orders the caller already holds when the measured create runs.
+    function _resting() internal pure virtual returns (uint256);
+
+    function setUp() public override {
+        super.setUp();
+        _deposit(alice, 900_000 * BAZAAR_SCALE);
+        uint64 pred;
+        for (uint256 i; i < _resting(); ++i) {
+            bytes[] memory pu = _freshPrice();
+            BazaarTypes.OrderSpec memory s = _limitSpec(true, BTC / 100, (49_000 - i) * BAZAAR_SCALE);
+            BazaarTypes.MatchHints memory hints;
+            hints.pred = pred;
+            vm.prank(alice);
+            pair.createOrder(s, hints, pu, 0, 0, 0, "", "");
+            pred = uint64(_lastCreatedOrderId(pair));
+        }
+    }
+
+    function test_gas_coldCreateWithOwnResting() public {
+        uint256 n = _resting();
+        bytes[] memory pu = _freshPrice();
+        BazaarTypes.OrderSpec memory s = _limitSpec(true, BTC / 100, (49_000 - n) * BAZAAR_SCALE);
+        BazaarTypes.MatchHints memory hints;
+        hints.pred = n == 0 ? uint64(0) : uint64(_lastCreatedOrderId(pair));
+
+        vm.prank(alice);
+        uint256 g0 = gasleft();
+        pair.createOrder(s, hints, pu, 0, 0, 0, "", "");
+        uint256 used = g0 - gasleft();
+
+        emit log_named_uint("COLD createOrder, own resting orders", n);
+        emit log_named_uint("COLD createOrder gas", used);
+    }
+}
+
+contract UserOrderCountCold1 is UserOrderCountColdBench {
+    function _resting() internal pure override returns (uint256) {
+        return 1;
+    }
+}
+
+contract UserOrderCountCold10 is UserOrderCountColdBench {
+    function _resting() internal pure override returns (uint256) {
+        return 10;
+    }
+}
+
+/// @notice The worst case a single caller can reach: placing an order while already holding a
+///         full set. Tracks MAX_ACTIVE_LIMIT_ORDERS_PER_USER, which is chosen against exactly
+///         this reading — the sweep is linear in the set size, so the cap sets its ceiling.
+contract UserOrderCountColdAtCap is UserOrderCountColdBench {
+    function _resting() internal pure override returns (uint256) {
+        return BazaarTypes.MAX_ACTIVE_LIMIT_ORDERS_PER_USER - 1;
     }
 }
 
@@ -253,7 +317,7 @@ contract ArrivalGasBenchColdTest is IntegrationBase {
             BazaarTypes.MatchHints memory hints;
             hints.pred = pred;
             vm.prank(m);
-            pair.createOrder(s, hints, pu, 0, 0, 0, "");
+            pair.createOrder(s, hints, pu, 0, 0, 0, "", "");
             pred = uint64(_lastCreatedOrderId(pair));
         }
         _deposit(alice, 900_000 * BAZAAR_SCALE);
@@ -265,7 +329,7 @@ contract ArrivalGasBenchColdTest is IntegrationBase {
 
         vm.prank(alice);
         uint256 g0 = gasleft();
-        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
         uint256 used = g0 - gasleft();
 
         assertEq(_posSize(alice), DEPTH * BTC / 100, "cold sweep consumed the whole ladder");

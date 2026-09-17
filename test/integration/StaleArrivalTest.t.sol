@@ -2,15 +2,17 @@
 pragma solidity 0.8.34;
 
 import {IntegrationBase} from "./IntegrationBase.sol";
+import {OrderView} from "../OrderView.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 import {MatchingEngineLib} from "../../src/libraries/MatchingEngineLib.sol";
 
 /// @title StaleArrivalTest
 /// @notice Arrival matching under the stale-oracle fallback (session-bound pairs overnight):
 ///         non-crossing arrivals insert; crossings against makers priced within
-///         ±MAX_STALE_DEVIATION_BP of the last stored price fill; a crossing against an
-///         out-of-band maker cancels the INCOMING order while the maker stays; market orders
-///         and trigger execution are rejected outright.
+///         ±MAX_STALE_DEVIATION_BP of the last stored price fill; a maker priced beyond the
+///         band away from the taker cancels the INCOMING order and stays; one priced beyond it
+///         toward the taker is itself canceled and the walk continues; market orders and
+///         trigger execution are rejected outright.
 contract StaleArrivalTest is IntegrationBase {
     uint256 constant SHARE = 1e18;
     uint256 constant PX = 200; // AAPL reference price in whole USD
@@ -39,25 +41,25 @@ contract StaleArrivalTest is IntegrationBase {
         BazaarTypes.OrderSpec memory s;
         s.orderType = BazaarTypes.OrderType.Limit;
         s.isLong = isLong;
-        s.isIoc = ioc;
+        s.tif = ioc ? BazaarTypes.TimeInForce.IOC : BazaarTypes.TimeInForce.GTC;
         s.size = size;
         s.limitPrice = limitPrice;
         s.expirationBlock = uint64(vm.getBlockNumber() + 500_000);
         vm.prank(user);
-        aaplPair.createOrder(s, _hintsNone(), new bytes[](0), 0, 0, 0, "");
+        aaplPair.createOrder(s, _hintsNone(), new bytes[](0), 0, 0, 0, "", "");
         return _lastCreatedOrderId(aaplPair);
     }
 
     function _aaplFilled(uint256 orderId) internal view returns (uint256 f) {
-        (,,,,,, f,,,,,,,,,,,) = aaplPair.orders(orderId);
+        return OrderView.order(aaplPair, orderId).filledSize;
     }
 
     function _aaplCanceled(uint256 orderId) internal view returns (uint64 cb) {
-        (,,,,,,,,,,,,,, cb,,,) = aaplPair.orders(orderId);
+        return OrderView.order(aaplPair, orderId).canceledBlock;
     }
 
     function _aaplInBook(uint256 orderId) internal view returns (bool b) {
-        (,,,,,,,,,,, b,,,,,,) = aaplPair.orders(orderId);
+        return OrderView.order(aaplPair, orderId).inBook;
     }
 
     function setUp() public override {
@@ -85,20 +87,37 @@ contract StaleArrivalTest is IntegrationBase {
         assertEq(entry, 2 * 202 * BAZAAR_SCALE, "filled at the maker's price");
     }
 
-    function test_stale_outOfBandCross_cancelsIncoming_makerStays() public {
-        // A maker resting 11% below the reference is legitimate gap positioning; it inserts
+    function test_stale_farSideCross_cancelsIncoming_makerStays() public {
+        // A maker resting 12.5% above the reference is legitimate gap positioning; it inserts
         // (only fills are banded)...
-        uint256 farAsk = _stalePlace(bob, false, 2 * SHARE, 178 * BAZAAR_SCALE, false);
+        uint256 farAsk = _stalePlace(bob, false, 2 * SHARE, 225 * BAZAAR_SCALE, false);
         assertTrue(_aaplInBook(farAsk), "out-of-band placement is allowed to rest");
 
-        // ...but an arrival that would cross it is canceled outright: filling at $178 under a
-        // $200 reference breaches the stale band, and nothing deeper could fill either.
-        uint256 bid = _stalePlace(alice, true, 2 * SHARE, 185 * BAZAAR_SCALE, false);
+        // ...but an arrival demanding execution out there is canceled outright: filling at $225
+        // over a $200 reference breaches the band away from the taker, and the ask list is
+        // price-sorted so nothing deeper could fill either.
+        uint256 bid = _stalePlace(alice, true, 2 * SHARE, 230 * BAZAAR_SCALE, false);
         assertEq(_aaplFilled(bid), 0, "no out-of-band fill");
         assertGt(_aaplCanceled(bid), 0, "incoming order canceled");
         assertFalse(_aaplInBook(bid), "canceled arrival does not rest");
         assertTrue(_aaplInBook(farAsk), "resting maker stays");
         assertEq(_aaplFilled(farAsk), 0);
+    }
+
+    function test_stale_nearSideMaker_canceled_arrivalRests() public {
+        // An ask resting below the band offers out-of-band execution to every arriving buyer.
+        // On contact the MAKER is the one canceled — canceling takers here instead would let
+        // this single order at the head execute every buy-side arrival for the whole closed
+        // session.
+        uint256 nearAsk = _stalePlace(bob, false, 2 * SHARE, 178 * BAZAAR_SCALE, false);
+        assertTrue(_aaplInBook(nearAsk), "rests until contact");
+
+        uint256 bid = _stalePlace(alice, true, 2 * SHARE, 185 * BAZAAR_SCALE, false);
+        assertGt(_aaplCanceled(nearAsk), 0, "near-side maker canceled on contact");
+        assertFalse(_aaplInBook(nearAsk));
+        assertEq(_aaplFilled(bid), 0, "no fill printed outside the band");
+        assertEq(_aaplCanceled(bid), 0, "arrival survives");
+        assertTrue(_aaplInBook(bid), "arrival rests once the book is clear");
     }
 
     function test_stale_marketOrder_reverts() public {
@@ -109,7 +128,7 @@ contract StaleArrivalTest is IntegrationBase {
         s.maxSlippageBp = 100;
         vm.prank(alice);
         vm.expectRevert(MatchingEngineLib.MatchingEngineLib__BlockedOracleStale.selector);
-        aaplPair.createOrder(s, _hintsNone(), new bytes[](0), 0, 0, 0, "");
+        aaplPair.createOrder(s, _hintsNone(), new bytes[](0), 0, 0, 0, "", "");
     }
 
     function test_stale_triggerExecution_reverts() public {
@@ -123,7 +142,7 @@ contract StaleArrivalTest is IntegrationBase {
         s.limitPrice = 212 * BAZAAR_SCALE;
         s.expirationBlock = uint64(vm.getBlockNumber() + 500_000);
         vm.prank(alice);
-        aaplPair.createOrder(s, _hintsNone(), new bytes[](0), 0, 0, 0, "");
+        aaplPair.createOrder(s, _hintsNone(), new bytes[](0), 0, 0, 0, "", "");
         uint256 stop = _lastCreatedOrderId(aaplPair);
         assertFalse(_aaplInBook(stop), "stop rests untriggered while stale");
 
@@ -144,7 +163,7 @@ contract StaleArrivalTest is IntegrationBase {
     }
 
     function test_freshResume_noBand() public {
-        // A maker 15% below the reference rests during the stale window...
+        // A maker 15% below the stale reference rests during the stale window...
         uint256 farAsk = _stalePlace(bob, false, 2 * SHARE, 170 * BAZAAR_SCALE, false);
 
         // ...and once a fresh print arrives, the band is gone: an arrival crosses it normally
@@ -158,7 +177,7 @@ contract StaleArrivalTest is IntegrationBase {
         s.limitPrice = 176 * BAZAAR_SCALE;
         s.expirationBlock = uint64(vm.getBlockNumber() + 500_000);
         vm.prank(alice);
-        aaplPair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        aaplPair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
         uint256 bid = _lastCreatedOrderId(aaplPair);
 
         assertEq(_aaplFilled(bid), 2 * SHARE, "fresh-price crossing fills without the stale band");

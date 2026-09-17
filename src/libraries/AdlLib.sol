@@ -2,15 +2,19 @@
 pragma solidity 0.8.34;
 
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import {BazaarMathLib} from "./BazaarMathLib.sol";
 import {BazaarTypes} from "./BazaarTypes.sol";
 import {BucketLib} from "./BucketLib.sol";
-import {VaultHealthLib} from "./VaultHealthLib.sol";
+import {RiskParamsLib} from "./RiskParamsLib.sol";
 import {OrderBookLib} from "./OrderBookLib.sol";
 
 /// @title AdlLib
 /// @notice External library for Auto-Deleveraging (ADL) logic. Runs via DELEGATECALL with BazaarPair storage.
 ///         Uses O(1) aggregate decrement instead of O(n) FIFO queue popping.
-///         Settlement price = avgBP = pendingLiqBankruptcyNotional / pendingLiqSize.
+///         Settlement price = the estates' average bankruptcy price,
+///         pendingLiqBankruptcyNotional / pendingLiqSize, or the mark when the mark sits on the
+///         fund's favorable side of it.
 library AdlLib {
     // -------------------- Constants --------------------
 
@@ -28,8 +32,33 @@ library AdlLib {
     error AdlLib__NoEligibleWinners();
     error AdlLib__NotDescendingAdlScoreOrder(uint256 adlScore, uint256 prevScore);
 
+    // -------------------- Structs --------------------
+
+    /// @notice What one close pays and releases.
+    /// @param credit The amount added to the winner's collateral
+    /// @param withheld Funding income the fund could not back, see _settleInventorySlice
+    /// @param sliceEntry The entry basis released from the winner's bucket and the OI aggregates
+    struct SliceSettlement {
+        uint256 credit;
+        uint256 withheld;
+        uint256 sliceEntry;
+    }
+
     // -------------------- Events --------------------
 
+    /// @notice Emitted for every winner an ADL batch closes, fully or in part.
+    /// @param pairId The pair
+    /// @param user The deleveraged winner
+    /// @param isLong The winner's side
+    /// @param closedSize The size closed against the vault's inventory
+    /// @param realizedPnl The amount credited to the winner's collateral: PnL at the settlement
+    ///        price with the live funding index, less `withheldFunding`
+    /// @param remainingCollateral The winner's collateral after the credit
+    /// @param adlScore The winner's score against the frozen snapshot
+    /// @param adlSettlementPrice The price the close settled at: the estates' average bankruptcy
+    ///        price, or the mark when the mark sat on the fund's favorable side of it
+    /// @param withheldFunding Funding income the insurance fund could not back and therefore did
+    ///        not pay; bounded by the winner's funding income on the closed size and by the credit
     event UserAdld(
         bytes32 indexed pairId,
         address indexed user,
@@ -38,7 +67,8 @@ library AdlLib {
         int256 realizedPnl,
         uint256 remainingCollateral,
         uint256 adlScore,
-        uint256 adlSettlementPrice
+        uint256 adlSettlementPrice,
+        uint256 withheldFunding
     );
 
     /// @dev Emitted here (via DELEGATECALL, so the log's emitter is the BazaarPair) rather than
@@ -59,7 +89,7 @@ library AdlLib {
 
     // -------------------- External Functions --------------------
 
-    /// @notice Core ADL execution: scan winners, close them at avg bankruptcy price, decrement aggregate
+    /// @notice Core ADL execution: scan winners, close them at the settlement price, decrement aggregate
     /// @dev Called via DELEGATECALL from BazaarPair.executeAdl. Does NOT call isVaultHealthy or _sendUsdc;
     ///      BazaarPair handles reward transfers and vault health re-evaluation after this returns.
     function executeAdlCore(
@@ -81,8 +111,19 @@ library AdlLib {
 
         uint256 pendingLiqSize = pairVault.pendingLiqSize;
 
-        // Compute settlement price from aggregate: avgBP = bankruptcyNotional / size
-        uint256 settlementPrice = Math.mulDiv(pairVault.pendingLiqBankruptcyNotional, BAZAAR_SCALE, pendingLiqSize);
+        // The estates' average bankruptcy price is where the inventory realizes exactly the
+        // collateral seized with it, so a close there is neutral to the fund whatever the
+        // winner's own entry was. The window can outlive a recovery past that price: it
+        // releases only once the fund could finish the remainder at the band edge, so a fund
+        // at its reserve stays pending with the mark up to a band above it. Settling there at
+        // the bankruptcy price would hand the winners a close better than the market at the
+        // fund's expense, and executeAdl is permissionless with a caller-chosen winner list,
+        // so the batch takes the mark whenever it sits on the fund's favorable side. The
+        // reward then pays nothing, since no loss is averted.
+        uint256 avgBankruptcyPrice = Math.mulDiv(pairVault.pendingLiqBankruptcyNotional, BAZAAR_SCALE, pendingLiqSize);
+        uint256 settlementPrice = pairVault.pendingLiqIsLong
+            ? Math.max(avgBankruptcyPrice, params.currentPrice)
+            : Math.min(avgBankruptcyPrice, params.currentPrice);
         r.settlementPrice = settlementPrice;
 
         // Pass 1: Scan eligible winners (read-only)
@@ -91,13 +132,18 @@ library AdlLib {
         );
         if (r.eligibleSize == 0) revert AdlLib__NoEligibleWinners();
 
-        // Cap how much we attempt to close at the smaller of eligible-winner size and
-        // pending liq. The actual closed amount may be less if the mid-batch health check
-        // breaks the loop early.
+        // Cap how much we attempt to close at the smaller of eligible-winner size and pending
+        // liq, then at the size that actually restores health: a deleverage takes what the
+        // exposure requires and no more. The cap holds for the whole batch, so the loop needs no
+        // per-winner health re-check — its own `totalClosed >= requiredSize` break enforces it.
         uint256 effectiveSize = r.eligibleSize < pendingLiqSize ? r.eligibleSize : pendingLiqSize;
+        uint256 restoringSize = _sizeToRestoreHealth(
+            pairVault, params.currentPrice, params.currentFundingIndex, params.marginRequirements.mmrBp
+        );
+        if (restoringSize < effectiveSize) effectiveSize = restoringSize;
 
         // Pass 2 decrements pairVault.pendingLiq* inside the loop and returns the actual
-        // total it closed (which equals effectiveSize unless the early-break fired).
+        // total it closed (which equals effectiveSize unless the deficit break fired).
         r.totalLiqSize = _closeAdlWinners(
             orders,
             book,
@@ -112,9 +158,10 @@ library AdlLib {
             adlWindowDeposits
         );
 
-        // Summary event. High/low bankruptcy price are the single avg settlement price (the vault
-        // closes the whole aggregate at avgBP). msg.sender/block.timestamp are the DELEGATECALL
-        // context — the keeper and the execution block, same as if BazaarPair emitted it.
+        // Summary event. High/low bankruptcy price are both the batch's single settlement price
+        // (the vault closes the whole aggregate at it). msg.sender/block.timestamp are the
+        // DELEGATECALL context — the keeper and the execution block, same as if BazaarPair
+        // emitted it.
         emit AdlExecuted(
             params.pairId,
             params.adlId,
@@ -129,12 +176,14 @@ library AdlLib {
         );
     }
 
-    /// @dev Collateral used for ADL RANKING only: deposits epoch-tagged to the CURRENT window
-    ///      are subtracted, so the score reflects the book as of the window's start — a
-    ///      mid-auction top-up cannot re-rank the queue. Settlement and liquidation protection
-    ///      use real collateral; only queue position is frozen. A tag from an older window fails
-    ///      the epoch check and subtracts nothing (lazy invalidation — those deposits are
-    ///      ordinary standing collateral by now).
+    /// @dev Collateral used for ADL RANKING only: deposits epoch-tagged to the CURRENT ranking
+    ///      epoch are subtracted, so the score reflects the book as of the moment this cohort came
+    ///      into range — a top-up made while already in range cannot re-rank the queue. Settlement
+    ///      and liquidation protection use real collateral; only queue position is frozen. A tag
+    ///      from a superseded epoch subtracts nothing (lazy invalidation — those deposits are
+    ///      ordinary standing collateral by now), which is also what keeps a mid-auction side flip
+    ///      from charging the newly targeted side for deposits it made while defending against
+    ///      liquidation instead.
     function _scoreCollateral(
         uint256 effectiveCollateral,
         address user,
@@ -164,13 +213,105 @@ library AdlLib {
     // -------------------- Internal Helpers --------------------
 
     /// @notice Computes the ADL auction score threshold (quadratic decay)
-    function _getAdlScoreThreshold(uint256 adlPendingSince) internal view returns (uint256) {
-        if (adlPendingSince == 0) return type(uint256).max;
-        uint256 elapsed = block.timestamp - adlPendingSince;
+    /// @dev Measured from the auction's current decay run rather than from the window's opening:
+    ///      a market discontinuity restarts the run, because a threshold that descended while ADL
+    ///      was unexecutable narrowed against attempts nobody could make.
+    /// @param auctionStartTs Start of the current decay run; 0 when no auction is running, which
+    ///        returns a threshold no score can reach
+    /// @return The minimum ADL score a winner must carry to be eligible right now
+    function _getAdlScoreThreshold(uint256 auctionStartTs) internal view returns (uint256) {
+        if (auctionStartTs == 0) return type(uint256).max;
+        uint256 elapsed = block.timestamp - auctionStartTs;
         uint256 maxScore = BazaarTypes.ADL_MAX_SCORE;
         if (elapsed >= ADL_AUCTION_DURATION) return 1;
         uint256 remaining = ADL_AUCTION_DURATION - elapsed;
         return 1 + maxScore * remaining * remaining / (ADL_AUCTION_DURATION * ADL_AUCTION_DURATION);
+    }
+
+    /// @notice The inventory size whose closure brings the vault back under the ADL cancel
+    ///         threshold, or `type(uint256).max` when no size does.
+    /// @dev Sizes the batch so a deleverage takes only what the exposure requires. Bounding by
+    ///      winner count instead would let one account large enough to cover the aggregate absorb
+    ///      all of it: every unit past this figure settles a solvent trader at the batch's
+    ///      settlement price for no protective gain, and the executor reward — linear in the size
+    ///      closed — pays for the excess.
+    ///
+    ///      The target is the gate's release condition: the fund's free capital above its reserve
+    ///      must be able to finish the remaining inventory at the unload band's edge, so the walk
+    ///      that resumes afterwards can sell it inside the band without reopening the window.
+    ///      Closing one unit moves both sides of that comparison. The finish cost falls by its
+    ///      per-unit share. Free capital above the reserve falls by two debits and rises by one
+    ///      release:
+    ///
+    ///      - the unit's holding-window funding. The seizure released from the earmark is exactly
+    ///        what funds the unit's settlement, so only the carry beyond it leaves the fund.
+    ///      - the executor's share of the bad debt the unit averts. `BazaarPair.executeAdl` debits
+    ///        it from the fund on this batch's own closed size, before the health re-evaluation
+    ///        that ends the auction. Averted loss is the expected loss at the mark less the carry
+    ///        — the same identity in both inventory directions.
+    ///      - the reserve on the unit itself. A close removes the unit from the vault's side and
+    ///        from the winner's, so per-side open interest falls by it and the reserve, a share
+    ///        of the target on that open interest, falls with it: capital that returns to the
+    ///        base without a dollar moving.
+    ///
+    ///      Progress per unit is the finish cost less both debits plus the release, and a batch
+    ///      sized against the finish cost alone stops short: it lands on the release line, the
+    ///      debits drop the line under it, and the auction is still pending when the batch that
+    ///      should have ended it returns. Every leg is linear in `pendingLiqSize` under the
+    ///      proportional decrement `_releaseSlice` applies, and none depends on which winner
+    ///      takes the other side, so one figure holds for the whole batch. Per-unit terms are
+    ///      multiplied out rather than divided, so the ratio rounds once.
+    ///
+    ///      A non-positive denominator means the two debits drain the fund at least as fast as
+    ///      deleveraging repairs it, so no batch restores health: the auction runs to its eligible
+    ///      size and the timeout or a recorded deficit resolves it.
+    /// @param pairVault The pair's vault aggregates
+    /// @param currentPrice The live mark the exposure is valued at
+    /// @param currentFundingIndex The pair's live cumulative funding index
+    /// @param mmrBp The maintenance margin the unload band is derived from
+    /// @return The size to close, 0 when the vault already meets the release condition
+    function _sizeToRestoreHealth(
+        BazaarTypes.Vault storage pairVault,
+        uint256 currentPrice,
+        int256 currentFundingIndex,
+        uint256 mmrBp
+    ) internal view returns (uint256) {
+        (uint256 expectedLoss, uint256 base, uint256 worstFinish, uint256 shortfall) = RiskParamsLib.vaultAdlExposure(
+            pairVault, currentPrice, currentFundingIndex, mmrBp
+        );
+        if (worstFinish <= base) return 0;
+
+        uint256 pendingSize = pairVault.pendingLiqSize;
+        int256 rawFunding = BazaarMathLib.signedMulDiv(
+            currentFundingIndex - pairVault.pendingLiqEntryFundingIndex, int256(pendingSize), int256(BAZAAR_SCALE)
+        );
+        // Sign convention matches _releaseSlice: positive is funding the fund pays out on the
+        // inventory it holds, which is the part of a slice's settlement the earmark cannot cover.
+        int256 carry = pairVault.pendingLiqIsLong ? rawFunding : -rawFunding;
+        int256 loss = SafeCast.toInt256(expectedLoss);
+        // Matches executeAdl's own averted-loss test, which pays nothing once the mark has passed
+        // the settlement price.
+        int256 averted = loss > carry ? loss - carry : int256(0);
+
+        // The reserve released with the inventory: ADL_RESERVE_BP of the cached target on the
+        // inventory's own notional, the same figure RiskParamsLib.vaultAdlExposure charges per
+        // unit of open interest.
+        uint256 reserveReleased = Math.mulDiv(
+            Math.mulDiv(pendingSize, currentPrice, BAZAAR_SCALE),
+            pairVault.targetInsuranceRatioBp * BazaarTypes.ADL_RESERVE_BP,
+            BP_SCALE * BP_SCALE
+        );
+        int256 denominator = SafeCast.toInt256(worstFinish) - carry
+            - BazaarMathLib.signedMulDiv(averted, int256(BazaarTypes.ADL_EXECUTOR_REWARD_BP), int256(BP_SCALE))
+            + SafeCast.toInt256(reserveReleased);
+        if (denominator <= 0) return type(uint256).max;
+
+        // With the fund below its reserve the base is floored at zero, and what the closed units
+        // release has to fill that shortfall before any of it reaches the base: the distance to
+        // cover is the finish cost plus the shortfall, not the finish cost alone. Round up:
+        // landing a fraction of a unit short leaves the auction pending for a second call that
+        // closes dust.
+        return Math.mulDiv(worstFinish - base + shortfall, pendingSize, uint256(denominator), Math.Rounding.Ceil);
     }
 
     /// @notice Pass 1: Read-only scan of winners to determine eligible size and scores
@@ -188,7 +329,7 @@ library AdlLib {
         returns (uint256 eligibleSize, uint256 eligibleCount, uint256 highestAdlScore, uint256 lowestAdlScore)
     {
         uint256 prevScore = type(uint256).max;
-        uint256 threshold = _getAdlScoreThreshold(params.adlPendingSince);
+        uint256 threshold = _getAdlScoreThreshold(params.adlAuctionStartTs);
 
         for (uint256 i = 0; i < winners.length; i++) {
             if (eligibleSize >= maxSize) break;
@@ -241,38 +382,19 @@ library AdlLib {
         mapping(address => uint64) storage adlDepositEpoch,
         mapping(address => uint256) storage adlWindowDeposits
     ) internal returns (uint256 totalClosed) {
-        uint256 threshold = _getAdlScoreThreshold(params.adlPendingSince);
-        uint256 closedCount = 0;
+        uint256 threshold = _getAdlScoreThreshold(params.adlAuctionStartTs);
 
         for (uint256 i = 0; i < winners.length; i++) {
             if (totalClosed >= requiredSize) break;
 
             // executeAdl's entry health check routes a pre-existing deficit into termination
             // and never reaches this loop, so a non-zero value here means an earlier close in
-            // THIS batch exhausted the fund and went partly unpaid. Every further close would
-            // seize a winner's position for zero credit; stop instead — the post-batch health
-            // check terminates the pair, and the settlement waterfall shares the recorded
-            // shortfall pro-rata rather than concentrating it on whoever the batch reached next.
+            // THIS batch found the fund unable to back the inventory's own settlement beyond
+            // what the winner's funding income could absorb. The post-batch health check
+            // terminates the pair; every further close would only turn more of the survivors'
+            // unrealized claims into realized ones the fund cannot back, so stop and let the
+            // settlement waterfall share the recorded shortfall pro-rata.
             if (pairVault.deficit > 0) break;
-
-            // Before every close after the first, stop if the book has already healed: each close
-            // shrinks the pendingLiq exposure (decremented at the bottom of this loop), so health
-            // can be restored mid-batch and any further close would deleverage a winner for
-            // nothing. The first close needs no check — executeAdl's entry health gate just
-            // confirmed the vault unhealthy at the live price.
-            if (closedCount > 0) {
-                VaultHealthLib.LiqExposureResult memory healthResult = VaultHealthLib.checkLiqExposure(
-                    pairVault,
-                    params.currentPrice,
-                    true,
-                    params.adlPendingSince,
-                    params.adlSnapshotPrice,
-                    params.adlLongs,
-                    params.currentFundingIndex,
-                    params.adlSnapshotFundingIndex
-                );
-                if (healthResult.healthy) break;
-            }
 
             address user = winners[i];
             BazaarTypes.PositionBucket storage bucket = positionBuckets[user];
@@ -294,123 +416,212 @@ library AdlLib {
             );
             if (adlScore < threshold) continue;
 
-            // Settlement realizes at the live funding index (and the bankruptcy settlement price),
-            // so the winner's credit reflects funding actually accrued up to execution.
+            // Settlement realizes at the live funding index and the batch's settlement price, so
+            // the winner's credit reflects funding actually accrued up to execution.
             BazaarTypes.BucketState memory state = BucketLib.calculateState(
                 bucket, settlementPrice, params.currentFundingIndex, params.marginRequirements
             );
 
             // Eligibility ranked PnL at the snapshot price; the credit realizes it at the
-            // settlement (bankruptcy) price. A winner deleveraged at/above their entry settles
-            // at zero PnL — a valid break-even close. Only skip a strictly-negative settlement
-            // PnL: don't force a market-profitable trader into a realized loss, and never feed
-            // a negative into the uint256 cast below.
+            // settlement price. A winner deleveraged at/above their entry settles at zero PnL —
+            // a valid break-even close. Only skip a strictly-negative settlement PnL: don't force
+            // a market-profitable trader into a realized loss, and never feed a negative into
+            // the uint256 cast below.
             if (state.totalPnl < 0) continue;
 
             uint256 remaining = requiredSize - totalClosed;
-            uint256 closedSize;
+            uint256 closedSize = state.adjustedSize <= remaining ? state.adjustedSize : remaining;
+            totalClosed += closedSize;
 
-            if (state.adjustedSize <= remaining) {
-                // Full close
-                closedSize = state.adjustedSize;
-                totalClosed += closedSize;
-                _applyAdlVaultUpdate(pairVault, params.adlLongs, closedSize, state.entryValue);
-                uint256 pnl = _fundWinnerPnl(pairVault, uint256(state.totalPnl));
-                bucket.collateral = state.effectiveCollateral + pnl;
+            // Settles the inventory slice through insurance (and releases it from the pending
+            // aggregates, so the next iteration's health check sees the reduced exposure), then
+            // sizes the winner's credit.
+            SliceSettlement memory s =
+                _settleSlice(pairVault, params.currentFundingIndex, state, closedSize, settlementPrice);
+
+            _applyAdlVaultUpdate(pairVault, params.adlLongs, closedSize, s.sliceEntry);
+            bucket.collateral = SafeCast.toUint128(state.effectiveCollateral + s.credit);
+
+            if (closedSize == state.adjustedSize) {
                 emit UserAdld(
                     params.pairId,
                     user,
                     params.adlLongs,
                     closedSize,
-                    int256(pnl),
+                    int256(s.credit),
                     bucket.collateral,
                     adlScore,
-                    settlementPrice
+                    settlementPrice,
+                    s.withheld
                 );
                 _resetBucket(orders, book, user, bucket, params);
             } else {
-                // Partial close
-                closedSize = remaining;
-                totalClosed += closedSize;
-                uint256 partialEntry = Math.mulDiv(state.entryValue, closedSize, state.adjustedSize);
-                _applyAdlVaultUpdate(pairVault, params.adlLongs, closedSize, partialEntry);
-                {
-                    uint256 partialPnl =
-                        _fundWinnerPnl(pairVault, Math.mulDiv(uint256(state.totalPnl), closedSize, state.adjustedSize));
-                    bucket.collateral = state.effectiveCollateral + partialPnl;
-                    bucket.size -= closedSize;
-                    bucket.entryValue -= partialEntry;
-                    // Shrinking the position can leave a TP/SL sized for the old one. Every
-                    // other shrink path cancels the oversized order; without the same fence
-                    // here, that TP could later fill past flat and open a fresh opposite
-                    // position for its owner, and a fired StopLoss could keep taking after its
-                    // position was gone.
-                    _fenceTpSl(orders, book, bucket, params.pairId, params.currentBlock);
-                    BucketLib.emitBucketUpdate(
-                        user, bucket, params.currentFundingIndex, params.marginRequirements, params.pairId
-                    );
-                    emit UserAdld(
-                        params.pairId,
-                        user,
-                        params.adlLongs,
-                        closedSize,
-                        int256(partialPnl),
-                        bucket.collateral,
-                        adlScore,
-                        settlementPrice
-                    );
-                }
+                // Both subtrahends are proportional slices of the current values.
+                bucket.size -= uint128(closedSize);
+                bucket.entryValue -= uint128(s.sliceEntry);
+                // A TP/SL sized for the pre-deleverage position needs no fence: it caps
+                // itself at the live position when it fires, so it closes what is left
+                // rather than filling past flat. The position keeps its side here and stays
+                // non-zero (a full close takes the branch above), so it is still reducible.
+                BucketLib.emitBucketUpdate(
+                    user, bucket, params.currentFundingIndex, params.marginRequirements, params.pairId
+                );
+                emit UserAdld(
+                    params.pairId,
+                    user,
+                    params.adlLongs,
+                    closedSize,
+                    int256(s.credit),
+                    bucket.collateral,
+                    adlScore,
+                    settlementPrice,
+                    s.withheld
+                );
             }
-
-            // NOTE: no explicit funding entry here, deliberately. ADL funding settles entirely
-            // through the two existing channels: the estates' pre-liquidation funding is embedded
-            // in the bankruptcy-derived settlement price (a funding-rich estate lowers avgBP,
-            // reaching the winner via the price leg), and the winner's own funding tab is netted
-            // inside their totalPnl credit — paying a tab means receiving less, which is
-            // insurance collecting it. Adding a separate insurance entry for the inventory's
-            // funding double-books a transfer these channels already settle. (Pass A is
-            // different: it settles vs entryNotional at a market price — neither channel exists
-            // there, so _settleVaultLiquidation's explicit funding term is required.)
-
-            // Decrement aggregate pendingLiq state proportionally so the next iteration's
-            // health check sees up-to-date exposure. Uses current pendingLiqSize as divisor
-            // so the bk-per-unit ratio is preserved across decrements.
-            {
-                uint256 entryPortion =
-                    Math.mulDiv(pairVault.pendingLiqEntryNotional, closedSize, pairVault.pendingLiqSize);
-                uint256 bkPortion =
-                    Math.mulDiv(pairVault.pendingLiqBankruptcyNotional, closedSize, pairVault.pendingLiqSize);
-                pairVault.pendingLiqSize -= closedSize;
-                pairVault.pendingLiqEntryNotional -= entryPortion;
-                pairVault.pendingLiqBankruptcyNotional -= bkPortion;
-            }
-            closedCount++;
         }
     }
 
-    /// @notice Funds an ADL'd winner's realized PnL from insurance and tracks it as collateral.
-    /// @dev The winner's counterparty is the vault, whose backing is the bankrupt side's seized
-    ///      collateral held in insuranceFundBalance. The credit is booked as an I → D transfer —
-    ///      debit `min(pnl, insurance)`, credit totalCollateralDeposited by the same amount — so
-    ///      `insurance + totalCollateralDeposited` and `totalCollateralDeposited ==
-    ///      Σ bucket.collateral` both stay exact for the funded portion. The winner's position is
-    ///      closed for its full size regardless, so any part of the credit the fund cannot cover
-    ///      is a realized claim with no backing left: it is recorded as deficit, the insolvency
-    ///      signal the post-batch isVaultHealthy in executeAdl terminates the pair on, routing
-    ///      the shortfall into the settlement waterfall's pro-rata sharing. Dropping it instead
-    ///      would erase a solvent trader's claim while every ledger check still balanced, leaving
-    ///      the pair trading on an empty fund.
+    /// @notice Sizes one close: the winner's credit at the settlement price and the vault's own
+    ///         realization on the same size of inventory.
+    /// @dev The winner realizes `totalPnl` at the settlement price with the live funding index
+    ///      into their bucket, exactly as a maker filled by the unload walk does, and the inventory
+    ///      slice settles against the liquidatees' entry through insurance. Those are different
+    ///      numbers: the winner's PnL runs from the WINNER's entry, and the part between that entry
+    ///      and the estate's entry was already settled by the winner's earlier counterparties, so
+    ///      it is backed by the deposits ledger and never by the fund. Charging the fund the
+    ///      winner's PnL instead would misstate insurance by (estate entry − winner entry) × size
+    ///      on every close: a false deficit and termination when the winner entered above the
+    ///      estate, a deposits ledger below the buckets when they entered below it.
+    ///
+    ///      A partial close takes every term pro-rata on closedSize / adjustedSize. Only funding
+    ///      income may be withheld, and never more than the net credit, so a winner whose price leg
+    ///      is negative at the settlement price still closes at no worse than break-even.
     /// @param pairVault The pair's vault accounting
-    /// @param pnl The winner's full realized PnL owed at the settlement price
-    /// @return funded The amount actually credited to the winner's bucket.collateral.
-    function _fundWinnerPnl(BazaarTypes.Vault storage pairVault, uint256 pnl) internal returns (uint256) {
-        uint256 funded = pnl < pairVault.insuranceFundBalance ? pnl : pairVault.insuranceFundBalance;
+    /// @param currentFundingIndex The pair's live cumulative funding index
+    /// @param state The winner's bucket state at the settlement price and the live index
+    /// @param closedSize The size closed, at most `state.adjustedSize`
+    /// @param settlementPrice The price the close settles at (BAZAAR_SCALE precision)
+    /// @return s The credit, the funding withheld from it, and the entry basis released
+    function _settleSlice(
+        BazaarTypes.Vault storage pairVault,
+        int256 currentFundingIndex,
+        BazaarTypes.BucketState memory state,
+        uint256 closedSize,
+        uint256 settlementPrice
+    ) internal returns (SliceSettlement memory s) {
+        uint256 slicePnl = uint256(state.totalPnl);
+        uint256 sliceFunding = state.fundingPnl > 0 ? uint256(state.fundingPnl) : 0;
+        s.sliceEntry = state.entryValue;
+        if (closedSize < state.adjustedSize) {
+            slicePnl = Math.mulDiv(slicePnl, closedSize, state.adjustedSize);
+            sliceFunding = Math.mulDiv(sliceFunding, closedSize, state.adjustedSize);
+            s.sliceEntry = Math.mulDiv(s.sliceEntry, closedSize, state.adjustedSize);
+        }
+        uint256 withholdCap = sliceFunding < slicePnl ? sliceFunding : slicePnl;
+        s.withheld = _settleInventorySlice(pairVault, currentFundingIndex, closedSize, settlementPrice, withholdCap);
+        s.credit = slicePnl - s.withheld;
+    }
+
+    /// @notice Values `closedSize` of inventory closed at `settlementPrice` from the liquidatees'
+    ///         entry, price and funding legs, and releases the slice from the pending-liquidation
+    ///         aggregates.
+    /// @dev The price leg runs to the closed size at the settlement price, the notional the
+    ///      winner's credit is measured against; the funding leg runs from the liquidatees' entry
+    ///      index to the live index, as on an unload fill. At the estates' average bankruptcy
+    ///      price the two legs net to the slice's earmark plus the funding accrued while the vault
+    ///      held it: the bankruptcy price is the entry basis displaced by the seized collateral and
+    ///      the estate's pre-liquidation funding, so that funding enters the price leg with one
+    ///      sign and the funding leg with the other, and nothing is booked twice. At a mark on the
+    ///      fund's favorable side the loss shrinks by the distance, or turns into a gain. The
+    ///      aggregates decrement pro rata, which leaves the remainder's average bankruptcy price
+    ///      and size-weighted entry index unchanged.
+    /// @param pairVault The pair's vault accounting
+    /// @param currentFundingIndex The pair's live cumulative funding index
+    /// @param closedSize The inventory closed against the winner
+    /// @param settlementPrice The price the close settles at (BAZAAR_SCALE precision)
+    /// @return vaultPnl The vault's realization on the slice, negative for a loss
+    /// @return earmark The slice's share of the collateral seized alongside the inventory
+    function _releaseSlice(
+        BazaarTypes.Vault storage pairVault,
+        int256 currentFundingIndex,
+        uint256 closedSize,
+        uint256 settlementPrice
+    ) internal returns (int256 vaultPnl, uint256 earmark) {
+        uint256 pendingSize = pairVault.pendingLiqSize;
+        uint256 entryPortion = Math.mulDiv(pairVault.pendingLiqEntryNotional, closedSize, pendingSize);
+        uint256 bkPortion = Math.mulDiv(pairVault.pendingLiqBankruptcyNotional, closedSize, pendingSize);
+        uint256 closedNotional = Math.mulDiv(closedSize, settlementPrice, BAZAAR_SCALE);
+        int256 rawFunding = BazaarMathLib.signedMulDiv(
+            currentFundingIndex - pairVault.pendingLiqEntryFundingIndex, int256(closedSize), int256(BAZAAR_SCALE)
+        );
+        earmark = Math.mulDiv(pairVault.pendingLiqSeized, closedSize, pendingSize);
+        if (pairVault.pendingLiqIsLong) {
+            vaultPnl = int256(closedNotional) - int256(entryPortion) - rawFunding;
+        } else {
+            vaultPnl = int256(entryPortion) - int256(closedNotional) + rawFunding;
+        }
+        pairVault.pendingLiqSize = pendingSize - closedSize;
+        pairVault.pendingLiqEntryNotional -= entryPortion;
+        pairVault.pendingLiqBankruptcyNotional -= bkPortion;
+        pairVault.pendingLiqSeized -= earmark;
+    }
+
+    /// @notice Books the vault's realization on a closed inventory slice as an insurance <->
+    ///         deposits-ledger transfer, and decides how much of an uncovered loss the winner
+    ///         absorbs.
+    /// @dev A gain is a D → I transfer capped at D; a loss is an I → D transfer. Both leave I + D
+    ///      unchanged, so the books-vs-cash health check is unmoved, and the deposits ledger keeps
+    ///      tracking the buckets: the winner's credit lands in a bucket and is withdrawn from the
+    ///      ledger later, so the ledger must gain exactly what the vault lost.
+    ///
+    ///      A loss is funded from the slice's own share of the seizure earmark plus the fund's
+    ///      free capital, never from the earmark of inventory still open, so one close's carry
+    ///      cannot consume the backing of the next and concentrate a whole batch's shortfall on
+    ///      whoever the batch reaches last. Free capital is read before the slice is released,
+    ///      while the aggregates still earmark it. Because the earmark sits in the fund by
+    ///      construction, the fund can only fall short by the holding-window funding, or when the
+    ///      seizure was capped at the deposits ledger. What it cannot pay is withheld from the
+    ///      winner's funding income up to `withholdCap`: that income accrued against this
+    ///      inventory, so refusing to pay what the fund cannot back keeps every remaining claim
+    ///      cash-backed without touching the winner's price PnL. Anything beyond the cap is a
+    ///      claim with no backing left, recorded as deficit so the post-batch health check
+    ///      terminates the pair and the settlement waterfall shares it pro-rata.
+    /// @param pairVault The pair's vault accounting
+    /// @param currentFundingIndex The pair's live cumulative funding index
+    /// @param closedSize The inventory closed against the winner
+    /// @param settlementPrice The price the close settles at (BAZAAR_SCALE precision)
+    /// @param withholdCap The most that may be withheld from the winner's credit
+    /// @return withheld The part of the vault's loss withheld from the winner's credit
+    function _settleInventorySlice(
+        BazaarTypes.Vault storage pairVault,
+        int256 currentFundingIndex,
+        uint256 closedSize,
+        uint256 settlementPrice,
+        uint256 withholdCap
+    ) internal returns (uint256 withheld) {
+        uint256 free = RiskParamsLib.insuranceFreeCapital(pairVault);
+        (int256 vaultPnl, uint256 earmark) = _releaseSlice(pairVault, currentFundingIndex, closedSize, settlementPrice);
+
+        if (vaultPnl >= 0) {
+            uint256 gain = uint256(vaultPnl);
+            uint256 take = gain < pairVault.totalCollateralDeposited ? gain : pairVault.totalCollateralDeposited;
+            pairVault.totalCollateralDeposited -= take;
+            pairVault.insuranceFundBalance += take;
+            return 0;
+        }
+
+        uint256 loss = uint256(-vaultPnl);
+        uint256 fundable = earmark + free;
+        if (fundable > pairVault.insuranceFundBalance) fundable = pairVault.insuranceFundBalance;
+        uint256 funded = loss < fundable ? loss : fundable;
         pairVault.insuranceFundBalance -= funded;
         pairVault.totalCollateralDeposited += funded;
-        if (pnl > funded) {
-            pairVault.deficit += pnl - funded;
+
+        uint256 shortfall = loss - funded;
+        withheld = shortfall < withholdCap ? shortfall : withholdCap;
+        if (shortfall > withheld) {
+            pairVault.deficit += shortfall - withheld;
         }
-        return funded;
     }
 
     /// @notice Updates vault OI tracking after closing an ADL'd position
@@ -450,35 +661,6 @@ library AdlLib {
         // Note: collateral is NOT reset (already updated by caller with PnL)
 
         BucketLib.emitBucketUpdate(user, bucket, params.currentFundingIndex, params.marginRequirements, params.pairId);
-    }
-
-    /// @dev Cancel any TP/SL whose remaining size exceeds the position left after a partial
-    ///      deleverage — the same invariant the matching engine's fill path maintains:
-    ///      a close-only order may never exceed the position it closes.
-    function _fenceTpSl(
-        mapping(uint256 => BazaarTypes.Order) storage orders,
-        BazaarTypes.OrderBook storage book,
-        BazaarTypes.PositionBucket storage bucket,
-        bytes32 pairId,
-        uint64 currentBlock
-    ) internal {
-        uint256 currentSize = bucket.size;
-        uint256 tpId = bucket.takeProfitOrderId;
-        if (tpId != 0) {
-            BazaarTypes.Order storage tp = orders[tpId];
-            if (tp.size - tp.filledSize > currentSize) {
-                _cancelBucketOrder(orders, book, tpId, pairId, currentBlock);
-                bucket.takeProfitOrderId = 0;
-            }
-        }
-        uint256 slId = bucket.stopLossOrderId;
-        if (slId != 0) {
-            BazaarTypes.Order storage sl = orders[slId];
-            if (sl.size - sl.filledSize > currentSize) {
-                _cancelBucketOrder(orders, book, slId, pairId, currentBlock);
-                bucket.stopLossOrderId = 0;
-            }
-        }
     }
 
     /// @dev Cancel one slot-anchored order (0 = none): stamp, unlink, emit. Already-terminal

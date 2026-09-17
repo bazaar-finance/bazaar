@@ -5,6 +5,7 @@ import {IntegrationBase} from "./IntegrationBase.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 import {MatchingEngineLib} from "../../src/libraries/MatchingEngineLib.sol";
 import {StdStorage, stdStorage} from "forge-std/Test.sol";
+import {BucketStore} from "../BucketStore.sol";
 
 /// @title TriggerExecutionTest
 /// @notice StopLimit/StopLoss lifecycle under keeper execution: untriggered stops rest outside
@@ -48,12 +49,10 @@ contract TriggerExecutionTest is IntegrationBase {
         _deposit(alice, 20_000 * BAZAAR_SCALE);
         uint256 id = _placeStopLimit(alice, true, BTC / 10, 51_500 * BAZAAR_SCALE, 52_000 * BAZAAR_SCALE);
         uint256 collBefore = _posCollateral(alice);
-        uint256 keeperBefore = usdc.balanceOf(seq);
-
         assertEq(_executeTriggerAt(id, 51_600), 1, "trigger met, stop fired");
         assertTrue(_inBook(id), "armed StopLimit rests in the book");
         assertEq(_posCollateral(alice), collBefore - TIP, "owner paid the tip");
-        assertEq(usdc.balanceOf(seq), keeperBefore + TIP_USDC, "keeper received the tip");
+        assertEq(_claimFees(seq), TIP_USDC, "keeper received the tip");
         _assertBooks("after stop-limit arming");
     }
 
@@ -72,13 +71,12 @@ contract TriggerExecutionTest is IntegrationBase {
         // A resting bid gives the fired stop its liquidity.
         _placeLimitAt(dave, true, BTC / 10, 47_600 * BAZAAR_SCALE, 47_500);
 
-        uint256 keeperBefore = usdc.balanceOf(seq);
         assertEq(_executeTriggerAt(sl, 47_500), 1, "sell stop fires below the trigger");
 
         assertEq(_filledSize(sl), BTC / 10, "stop filled against the resting bid");
         assertEq(_posSize(bob), 0, "position closed");
         assertEq(_stopLossOrderId(bob), 0, "SL slot cleared");
-        assertEq(usdc.balanceOf(seq), keeperBefore + TIP_USDC, "keeper tipped");
+        assertEq(_claimFees(seq), TIP_USDC, "keeper tipped");
         // The dave fill price is the resting maker's: dave's long entered at his own bid.
         (, uint256 daveSize, uint256 daveEntry,,,,,,) = pair.positionBuckets(dave);
         assertEq(daveSize, BTC / 10);
@@ -105,15 +103,12 @@ contract TriggerExecutionTest is IntegrationBase {
         uint256 id = _placeStopLimit(alice, true, BTC / 10, 51_500 * BAZAAR_SCALE, 52_000 * BAZAAR_SCALE);
 
         // Strip alice's collateral below the tip.
-        _stdstore.target(address(pair)).sig("positionBuckets(address)").with_key(alice).depth(3).checked_write(
-            uint256(1e17)
-        );
+        BucketStore.setCollateral(address(pair), alice, uint256(1e17));
 
-        uint256 keeperBefore = usdc.balanceOf(seq);
         assertEq(_executeTriggerAt(id, 51_600), 0, "uncoverable tip does not execute");
         assertGt(_canceledBlock(id), 0, "stop auto-canceled instead");
         assertFalse(_inBook(id));
-        assertEq(usdc.balanceOf(seq), keeperBefore, "no tip paid for a cancel");
+        assertEq(_escrowOwed(seq), 0, "no tip accrued for a cancel");
     }
 
     function test_immediateArm_atCreation_noTip() public {
@@ -154,9 +149,7 @@ contract TriggerExecutionTest is IntegrationBase {
             new BazaarTypes.TriggerExec[](BazaarTypes.MAX_TRIGGER_EXECS_PER_CALL + 1);
         vm.prank(seq);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                MatchingEngineLib.MatchingEngineLib__InvalidTriggerBatch.selector, tooMany.length
-            )
+            abi.encodeWithSelector(MatchingEngineLib.MatchingEngineLib__InvalidTriggerBatch.selector, tooMany.length)
         );
         pair.executeTriggeredOrders(tooMany, pu);
 
@@ -332,5 +325,136 @@ contract TriggerExecutionTest is IntegrationBase {
         uint256 tp2 = _placeTakeProfit(bob, false, remainder, 53_000 * BAZAAR_SCALE, 500);
         assertEq(_takeProfitOrderId(bob), tp2, "replacement armed");
         assertEq(_canceledBlock(tp2), 0, "replacement is live");
+    }
+
+    // ============================================================
+    // type(uint256).max: close the whole position, resolved when it fires
+    // ============================================================
+
+    /// @notice A max-sized take-profit closes whatever the position holds AT FIRE TIME, not at
+    ///         creation. Resolving at creation would have frozen this order at 0.1 and left the
+    ///         half it grew into uncovered.
+    function test_takeProfit_maxSize_closesPositionGrownAfterCreation() public {
+        _openPosition(bob, carol, true, BTC / 10);
+        uint256 tp = _placeTakeProfit(bob, false, type(uint256).max, 52_000 * BAZAAR_SCALE, 500);
+
+        _openPosition(bob, carol, true, BTC / 10); // grow to 0.2
+        assertEq(_posSize(bob), BTC / 5, "position doubled after the TP was written");
+
+        _deposit(dave, 120_000 * BAZAAR_SCALE);
+        _placeLimitAt(dave, true, BTC / 5, 51_900 * BAZAAR_SCALE, 52_000);
+        assertEq(_executeTriggerAt(tp, 52_000), 1, "fired");
+
+        assertEq(_filledSize(tp), BTC / 5, "closed the grown position in full");
+        assertEq(_posSize(bob), 0, "flat");
+    }
+
+    /// @notice The mirror: a position that shrank is closed at its smaller size, and the order is
+    ///         never cancelled for being oversized on the way there.
+    function test_takeProfit_maxSize_closesPositionShrunkAfterCreation() public {
+        _openPosition(bob, carol, true, BTC / 5);
+        uint256 tp = _placeTakeProfit(bob, false, type(uint256).max, 52_000 * BAZAAR_SCALE, 500);
+
+        // Shrink to 0.1 through an ordinary close.
+        _deposit(dave, 120_000 * BAZAAR_SCALE);
+        _placeLimit(bob, false, BTC / 10, 49_000 * BAZAAR_SCALE);
+        _roll(2);
+        _placeLimit(dave, true, BTC / 10, 51_000 * BAZAAR_SCALE);
+        assertEq(_posSize(bob), BTC / 10, "shrunk to 0.1");
+        assertEq(_canceledBlock(tp), 0, "TP survived the shrink");
+
+        _placeLimitAt(dave, true, BTC / 5, 51_900 * BAZAAR_SCALE, 52_000);
+        assertEq(_executeTriggerAt(tp, 52_000), 1, "fired");
+        assertEq(_filledSize(tp), BTC / 10, "closed only what was left");
+        assertEq(_posSize(bob), 0, "flat, not flipped short");
+    }
+
+    /// @notice Capping bounds the CLOSE, it does not make the order persistent. A book too thin
+    ///         to absorb the resolved size still cancels the remainder market-style, so the
+    ///         surviving position is left without a target. Sizing and re-arming are separate
+    ///         problems; this change fixes the first one only.
+    function test_takeProfit_maxSize_thinBookStillOrphansTheRemainder() public {
+        _openPosition(bob, carol, true, BTC / 10);
+        uint256 tp = _placeTakeProfit(bob, false, type(uint256).max, 52_000 * BAZAAR_SCALE, 500);
+
+        _deposit(dave, 60_000 * BAZAAR_SCALE);
+        _placeLimitAt(dave, true, BTC / 100, 51_900 * BAZAAR_SCALE, 52_000);
+        assertEq(_executeTriggerAt(tp, 52_000), 1, "fired");
+
+        assertEq(_filledSize(tp), BTC / 100, "filled only what the book offered");
+        assertEq(_posSize(bob), BTC / 10 - BTC / 100, "the rest of the position survives");
+        assertGt(_canceledBlock(tp), 0, "remainder canceled, order consumed");
+        assertEq(_takeProfitOrderId(bob), 0, "slot freed for a replacement");
+    }
+
+    /// @notice A stop whose position vanished before the keeper reached it is cancelled instead
+    ///         of filling: it has nothing to reduce, and taking here would OPEN a short.
+    function test_stopLoss_positionAlreadyFlat_cancelsInsteadOfOpening() public {
+        _openPosition(bob, carol, true, BTC / 10);
+        uint256 sl = _placeStopLoss(bob, false, BTC / 10, 49_000 * BAZAAR_SCALE, 500);
+
+        // Close the position by hand, which strands the stop.
+        _deposit(dave, 60_000 * BAZAAR_SCALE);
+        _placeLimit(bob, false, BTC / 10, 49_000 * BAZAAR_SCALE);
+        _roll(2);
+        _placeLimit(dave, true, BTC / 10, 51_000 * BAZAAR_SCALE);
+        assertEq(_posSize(bob), 0, "flat");
+
+        assertEq(_executeTriggerAt(sl, 49_000), 0, "stranded stop does not fire");
+        assertEq(_posSize(bob), 0, "no short opened");
+        assertGt(_canceledBlock(sl), 0, "stop canceled");
+    }
+
+    /// @notice The idiom works the same for a stop: it closes whatever the position holds when
+    ///         the stop fires, not what it held when the stop was written.
+    function test_stopLoss_maxSize_closesWholePositionAtFireTime() public {
+        _openPosition(bob, carol, true, BTC / 10);
+        uint256 sl = _placeStopLoss(bob, false, type(uint256).max, 48_000 * BAZAAR_SCALE, 500);
+
+        _openPosition(bob, carol, true, BTC / 10); // grow to 0.2 after the stop was written
+        assertEq(_posSize(bob), BTC / 5, "position doubled");
+
+        _deposit(dave, 60_000 * BAZAAR_SCALE);
+        _placeLimitAt(dave, true, BTC / 5, 47_600 * BAZAAR_SCALE, 47_500);
+        assertEq(_executeTriggerAt(sl, 47_500), 1, "stop fired");
+
+        assertEq(_filledSize(sl), BTC / 5, "closed the grown position in full");
+        assertEq(_posSize(bob), 0, "flat");
+    }
+
+    /// @notice An oversized TP is NOT clamped at creation — only when it fires. So a position
+    ///         grown after the order was written is covered by it, with no cancel-and-replace:
+    ///         0.15 written against a 0.1 position closes the 0.11 that exists at fire time.
+    function test_takeProfit_oversized_coversPositionGrownLater_withoutReplacing() public {
+        _openPosition(bob, carol, true, BTC / 10);
+        uint256 tp = _placeTakeProfit(bob, false, 15 * BTC / 100, 52_000 * BAZAAR_SCALE, 500);
+        assertEq(_orderSize(tp), 15 * BTC / 100, "stored as written, not clamped to the position");
+
+        _openPosition(bob, carol, true, BTC / 100); // grow 0.1 -> 0.11
+        assertEq(_posSize(bob), 11 * BTC / 100, "position grew after the TP was written");
+
+        _deposit(dave, 120_000 * BAZAAR_SCALE);
+        _placeLimitAt(dave, true, BTC / 5, 51_900 * BAZAAR_SCALE, 52_000);
+        assertEq(_executeTriggerAt(tp, 52_000), 1, "fired");
+
+        assertEq(_filledSize(tp), 11 * BTC / 100, "covered the grown position in full");
+        assertEq(_posSize(bob), 0, "flat");
+    }
+
+    /// @notice The written size is still the ceiling: growth beyond it is NOT covered, which is
+    ///         the whole reason type(uint256).max exists as the close-everything idiom.
+    function test_takeProfit_oversized_doesNotCoverGrowthBeyondItsOwnSize() public {
+        _openPosition(bob, carol, true, BTC / 10);
+        uint256 tp = _placeTakeProfit(bob, false, 15 * BTC / 100, 52_000 * BAZAAR_SCALE, 500);
+
+        _openPosition(bob, carol, true, BTC / 10); // grow 0.1 -> 0.2, past the TP's 0.15
+        assertEq(_posSize(bob), BTC / 5, "position now exceeds the order");
+
+        _deposit(dave, 120_000 * BAZAAR_SCALE);
+        _placeLimitAt(dave, true, BTC / 5, 51_900 * BAZAAR_SCALE, 52_000);
+        assertEq(_executeTriggerAt(tp, 52_000), 1, "fired");
+
+        assertEq(_filledSize(tp), 15 * BTC / 100, "closed only what the order asked for");
+        assertEq(_posSize(bob), 5 * BTC / 100, "0.05 left uncovered");
     }
 }

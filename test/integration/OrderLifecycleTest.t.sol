@@ -2,6 +2,7 @@
 pragma solidity 0.8.34;
 
 import {IntegrationBase} from "./IntegrationBase.sol";
+import {OrderView} from "../OrderView.sol";
 import {BazaarPair} from "../../src/BazaarPair.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 import {OrderManagementLib} from "../../src/libraries/OrderManagementLib.sol";
@@ -16,13 +17,13 @@ import {MetaTxLib} from "../../src/libraries/MetaTxLib.sol";
 contract OrderLifecycleTest is IntegrationBase {
     uint256 constant BTC = 1e18;
 
-    /// @dev Emergency-termination flag: packed at slot 28 byte 1 (`forge inspect BazaarPair
-    ///      storage-layout`), which stdstore cannot write.
-    function _setEmergencyTerminated() internal {
-        bytes32 slot = bytes32(uint256(28));
-        bytes32 cur = vm.load(address(pair), slot);
-        vm.store(address(pair), slot, cur | bytes32(uint256(1) << 8));
-        assertTrue(pair.isPairTerminatedEmergency(), "flag write landed");
+    /// @dev Terminate the pair for real: fix the price and finalize (no position is open, so
+    ///      finalize is allowed at once).
+    function _setTerminated() internal {
+        vm.prank(pair.umaContract());
+        pair.fixSettlementPrice(50_000 * BAZAAR_SCALE);
+        pair.finalizeTermination();
+        assertTrue(pair.isPairTerminated(), "pair terminated");
     }
 
     function _bookCounts() internal view returns (uint64 bidCount, uint64 askCount) {
@@ -39,15 +40,12 @@ contract OrderLifecycleTest is IntegrationBase {
     // ============================================================
 
     /// @dev Place a limit with the minimum lifetime so it can be expired by rolling forward.
-    function _placeShortLived(address user, bool isLong, uint256 size, uint256 price)
-        internal
-        returns (uint256)
-    {
+    function _placeShortLived(address user, bool isLong, uint256 size, uint256 price) internal returns (uint256) {
         bytes[] memory pu = _freshPrice();
         BazaarTypes.OrderSpec memory s = _limitSpec(isLong, size, price);
         s.expirationBlock = uint64(vm.getBlockNumber() + 12); // MIN_ORDER_LIFETIME_BLOCKS
         vm.prank(user);
-        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
         return _lastCreatedOrderId(pair);
     }
 
@@ -93,7 +91,7 @@ contract OrderLifecycleTest is IntegrationBase {
         uint256 live = _placeLimit(alice, true, BTC / 10, 49_000 * BAZAAR_SCALE);
         uint256 canceled = _placeLimit(alice, true, BTC / 10, 48_500 * BAZAAR_SCALE);
         vm.prank(alice);
-        pair.cancelOrders(_ids(canceled), 0, 0, 0, "");
+        pair.cancelOrders(_ids(canceled), 0, 0, 0, "", "");
         uint64 canceledAt = _canceledBlock(canceled);
 
         _roll(5); // `live` has a 500k-block lifetime, so it is still live
@@ -114,7 +112,7 @@ contract OrderLifecycleTest is IntegrationBase {
         _deposit(alice, 60_000 * BAZAAR_SCALE);
         uint256 id = _placeShortLived(alice, true, BTC / 10, 49_000 * BAZAAR_SCALE);
         _roll(20);
-        _setEmergencyTerminated();
+        _setTerminated();
 
         vm.prank(dave);
         vm.expectRevert(BazaarPair.BazaarPair__TradingHalted.selector);
@@ -144,7 +142,7 @@ contract OrderLifecycleTest is IntegrationBase {
         bytes[] memory pu = _freshPrice();
         vm.prank(alice);
         vm.expectRevert(OrderManagementLib.OrderManagementLib__InvalidTimeInForce.selector);
-        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "");
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
     }
 
     function test_ioc_rejectedOnMarket() public {
@@ -154,7 +152,7 @@ contract OrderLifecycleTest is IntegrationBase {
         s.isLong = true;
         s.size = BTC / 10;
         s.maxSlippageBp = 100;
-        s.isIoc = true;
+        s.tif = BazaarTypes.TimeInForce.IOC;
         _expectTifRevert(s);
     }
 
@@ -167,14 +165,14 @@ contract OrderLifecycleTest is IntegrationBase {
         s.triggerPrice = 55_000 * BAZAAR_SCALE;
         s.limitPrice = 56_000 * BAZAAR_SCALE;
         s.expirationBlock = uint64(block.number + 500_000);
-        s.isIoc = true;
+        s.tif = BazaarTypes.TimeInForce.IOC;
         _expectTifRevert(s);
     }
 
     function test_ioc_rejectedAlongsidePostOnly() public {
         _deposit(alice, 60_000 * BAZAAR_SCALE);
         BazaarTypes.OrderSpec memory s = _limitSpec(true, BTC / 10, 49_000 * BAZAAR_SCALE);
-        s.isIoc = true;
+        s.tif = BazaarTypes.TimeInForce.IOC;
         s.isPostOnly = true; // contradictory: one demands taking, the other forbids it
         _expectTifRevert(s);
     }
@@ -187,7 +185,7 @@ contract OrderLifecycleTest is IntegrationBase {
         s.size = BTC / 10;
         s.triggerPrice = 55_000 * BAZAAR_SCALE;
         s.maxSlippageBp = 500;
-        s.isIoc = true;
+        s.tif = BazaarTypes.TimeInForce.IOC;
         _expectTifRevert(s);
     }
 
@@ -199,7 +197,8 @@ contract OrderLifecycleTest is IntegrationBase {
         _deposit(alice, 60_000 * BAZAAR_SCALE);
 
         uint256 first = _placeMarket(alice, true, BTC / 100, 300);
-        (,,,,,,,,,,,, uint64 creation, uint64 expiry,,,,) = pair.orders(first);
+        BazaarTypes.Order memory fo = OrderView.order(pair, first);
+        (uint64 creation, uint64 expiry) = (fo.creationBlock, fo.expiryBlock);
         assertEq(expiry, creation, "market orders expire in their creation block");
         assertGt(_canceledBlock(first), 0, "unfilled market order is terminal immediately");
 
@@ -222,7 +221,7 @@ contract OrderLifecycleTest is IntegrationBase {
         assertEq(asksBefore, 1);
 
         vm.prank(alice);
-        pair.cancelOrders(_ids(resting), 0, 0, 0, "");
+        pair.cancelOrders(_ids(resting), 0, 0, 0, "", "");
         assertFalse(_inBook(resting), "canceled order unlinked in the same write");
         (, uint64 asksAfter) = _bookCounts();
         assertEq(asksAfter, 0, "ask side emptied");
@@ -251,7 +250,7 @@ contract OrderLifecycleTest is IntegrationBase {
             BazaarTypes.MatchHints memory h;
             h.pred = pred;
             vm.prank(m);
-            pair.createOrder(s, h, pu, 0, 0, 0, "");
+            pair.createOrder(s, h, pu, 0, 0, 0, "", "");
             pred = uint64(_lastCreatedOrderId(pair));
         }
 
@@ -261,7 +260,7 @@ contract OrderLifecycleTest is IntegrationBase {
         BazaarTypes.MatchHints memory hints;
         hints.maxSteps = 100; // above the ceiling
         vm.prank(alice);
-        pair.createOrder(taker, hints, pu2, 0, 0, 0, "");
+        pair.createOrder(taker, hints, pu2, 0, 0, 0, "", "");
         uint256 id = _lastCreatedOrderId(pair);
 
         assertEq(_posSize(alice), BazaarTypes.MAX_WALK_STEPS * BTC / 100, "filled exactly the ceiling's worth");
@@ -305,7 +304,7 @@ contract OrderLifecycleTest is IntegrationBase {
                 spec.size,
                 spec.isLong,
                 spec.isPostOnly,
-                spec.isIoc,
+                spec.tif,
                 spec.expirationBlock,
                 spec.integrator,
                 uint256(0), // nonce
@@ -319,7 +318,7 @@ contract OrderLifecycleTest is IntegrationBase {
         BazaarTypes.MatchHints memory hostile;
         hostile.maxSteps = 1; // relayer asking to fill one node only
         vm.prank(dave); // the relayer
-        pair.createOrder(spec, hostile, pu, 0, deadline, 0, sig);
+        pair.createOrder(spec, hostile, pu, 0, deadline, 0, sig, "");
 
         assertEq(_posSize(signer), BTC / 5, "signed order filled in full despite the relayer's budget");
     }

@@ -24,7 +24,7 @@ For each node, in order:
    `MAX_WALK_STEPS` = 32; 0 selects the default). The budget counts *nodes visited*, skips
    included, so expired dust cannot push a taker past their gas budget.
 4. **Expired maker** → canceled and unlinked on contact; walk continues.
-5. **Fill** `min(remaining, remaining)` at the **maker's** limit price. Both sides pass the margin
+5. **Fill** `min(taker remaining, maker remaining)` at the **maker's** limit price. Both sides pass the margin
    gate at the transaction's oracle price; a failing maker is auto-canceled (walk retries the next
    head), a failing taker has its remainder canceled. Fees, PnL, and funding settle per fill
    through the same bucket machinery as every other close.
@@ -35,6 +35,7 @@ For each node, in order:
 |---|---|
 | GTC limit / armed StopLimit, no longer crossing | rests in the book (positioned by insertion hints) |
 | Market, StopLoss/TakeProfit execution, or IOC | canceled |
+| any incomplete outcome for a FOK taker | **transaction reverts** — the walk's settled fills unwind with it |
 | post-only that crossed a live maker | canceled before any fill |
 | self-match (maker is the taker's own order) | incoming remainder canceled; the resting order stays |
 | step budget hit while still crossing | canceled — the book must never rest crossed |
@@ -72,8 +73,18 @@ stale:
 - Non-crossing arrivals **insert** normally — overnight gap positioning is the point of the
   always-on margin model.
 - A crossing fills only against makers priced within ±10% (`MAX_STALE_DEVIATION_BP`) of the last
-  stored price. An arrival that would cross an **out-of-band** maker is canceled outright (the
-  maker stays; the list is price-sorted, so nothing deeper could fill either).
+  stored price. The two violation directions get **opposite dispositions**:
+  - **Far side** — the maker is priced beyond the band *away* from the taker. The taker is the one
+    demanding out-of-band execution, so the **incoming order** is canceled and the maker stays
+    (resting far from an aged reference is legitimate gap positioning). The list is price-sorted,
+    so nothing deeper could have filled either.
+  - **Near side** — the maker is priced beyond the band *toward* the taker. Here the **maker** is
+    canceled and the walk retries the next head, exactly like an expired one. Cancelling takers
+    instead would let a single such order at the head kill every arrival on that side for the whole
+    closed session.
+
+  Both checks run before the post-only test, so a post-only arrival is judged against the first
+  maker it could actually fill with rather than against near-side garbage.
 - Market orders and trigger execution revert — both are priced off the oracle, and a stale
   reference can neither bound a fill nor arm a stop.
 
@@ -88,9 +99,10 @@ Two flows have no arriving order to piggyback on:
   against a fresh Pyth price for a flat tip charged to the stop's owner. See
   [Orders](orders.md).
 - **Liquidation inventory** — `liquidate()` crosses freshly seized inventory into the book
-  inline (bounded), and the permissionless `unloadVault` finishes the job for a reward. Both use
-  the liquidation price band min(`LIQ_MAX_SLIPPAGE_BP` = 5%, current MMR) around oracle. See
-  [Liquidations](liquidations.md).
+  inline (bounded), and the permissionless `unloadVault` finishes the job for a reward. Both fill
+  only inside the unload bound — the looser of the estates' fund-neutral price and the liquidation
+  band min(`LIQ_MAX_SLIPPAGE_BP` = 5%, current MMR) around oracle — and within the insurance
+  fund's headroom above its reserve. See [Liquidations](liquidations.md).
 
 ## After the walk
 
