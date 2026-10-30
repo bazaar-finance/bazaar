@@ -15,6 +15,33 @@ interface IERC20Minimal {
 }
 
 interface IOptimisticOracleV3 {
+    /// @dev Field order and types mirror OOv3's own struct: getAssertion encodes it positionally.
+    struct EscalationManagerSettings {
+        bool arbitrateViaEscalationManager;
+        bool discardOracle;
+        bool validateDisputers;
+        address assertingCaller;
+        address escalationManager;
+    }
+
+    /// @dev Field order and types mirror OOv3's own struct, with EscalationManagerSettings nested
+    ///      first: getAssertion encodes it positionally, so a reordered or flattened declaration
+    ///      would decode the wrong words without reverting.
+    struct Assertion {
+        EscalationManagerSettings escalationManagerSettings;
+        address asserter;
+        uint64 assertionTime;
+        bool settled;
+        IERC20Minimal currency;
+        uint64 expirationTime; // from this instant on OOv3 refuses disputes and allows settlement
+        bool settlementResolution; // false until settled
+        bytes32 domainId;
+        bytes32 identifier;
+        uint256 bond;
+        address callbackRecipient;
+        address disputer; // zero while undisputed
+    }
+
     function defaultIdentifier() external view returns (bytes32);
     function defaultCurrency() external view returns (IERC20Minimal);
     function finder() external view returns (address);
@@ -53,7 +80,9 @@ interface IOptimisticOracleV3 {
 
     function settleAndGetAssertionResult(bytes32 assertionId) external returns (bool);
 
-    // NOTE: real OOv3's getAssertion returns a single struct with nested EscalationManagerSettings
-    // — NOT a flat tuple. A flat-tuple declaration here would decode garbage on mainnet while
-    // passing against the mock, so it is deliberately omitted; nothing in src/ needs it.
+    /// @notice The stored record of an assertion; all-zero for an unknown id.
+    /// @dev A plain view: unlike assertTruth, disputeAssertion and settleAssertion it does not
+    ///      take OOv3's reentrancy lock, so it answers even from inside one of OOv3's own
+    ///      callbacks, where a settlement attempt reverts on the lock.
+    function getAssertion(bytes32 assertionId) external view returns (Assertion memory);
 }

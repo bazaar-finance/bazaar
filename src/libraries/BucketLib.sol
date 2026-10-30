@@ -26,8 +26,6 @@ library BucketLib {
         BazaarTypes.MarginRequirements memory marginReqs
     ) internal pure returns (BazaarTypes.BucketState memory result) {
         result.effectiveCollateral = bucket.collateral;
-        result.entryMmrBp = bucket.entryMmrBp;
-        result.mmrUpdateTs = bucket.mmrUpdateTs;
 
         uint256 size = bucket.size;
         uint256 entryValue = bucket.entryValue;
@@ -73,11 +71,9 @@ library BucketLib {
         int256 signedEquity = int256(result.effectiveCollateral) + result.totalPnl;
         result.availableEquity = signedEquity > 0 ? uint256(signedEquity) : 0;
 
-        // Min required collateral (using the 24h-lagged effective MMR)
-        uint256 effectiveMmrBp = effectiveMmr(
-            bucket.mmrUpdateTs, bucket.entryMmrBp, marginReqs.laggedMmrBp, marginReqs.laggedMmrTs, marginReqs.mmrBp
-        );
-        result.minRequiredCollateral = Math.mulDiv(effectiveMmrBp, result.currentNotional, BazaarTypes.BP_SCALE);
+        // Min required collateral, at the lower of the current and the 24h-lagged MMR
+        result.minRequiredCollateral =
+            Math.mulDiv(effectiveMmrBp(marginReqs), result.currentNotional, BazaarTypes.BP_SCALE);
 
         // Solvency
         result.isSolvent = result.availableEquity >= result.minRequiredCollateral && signedEquity > 0;
@@ -85,48 +81,36 @@ library BucketLib {
         return result;
     }
 
-    /// @notice Resolves the maintenance-margin rate a position is judged against, implementing
-    ///         the 24h-lagged grace: a rising MMR cannot liquidate an existing position for
-    ///         MMR_GRACE_PERIOD, while a falling MMR helps immediately.
-    /// @dev The lagged sample is adopted only when it was recorded at or after the position's own
-    ///      mmrUpdateTs. That single comparison also subsumes the age gate the grace needs:
-    ///      laggedMmr only ever returns a sample stamped a full MMR_GRACE_PERIOD before the mark
-    ///      being valued against, and that mark is never dated after the current block, so
-    ///      laggedMmrTs >= mmrUpdateTs already implies the position is at least MMR_GRACE_PERIOD
-    ///      old, and a younger position necessarily fails it and keeps its entry MMR.
+    /// @notice The maintenance rate every position is judged against: the lower of the current
+    ///         rate and the lagged minimum over the grace period. A rising MMR therefore cannot
+    ///         liquidate anyone until it has held for MMR_GRACE_PERIOD, while a falling one helps
+    ///         at once.
+    /// @dev The current rate follows live open interest, which two accounts trading against
+    ///      each other can inflate for as long as one recompute stands. The lagged minimum holds
+    ///      a rise back until every rate recorded across the grace period carries it, so a spike
+    ///      that short reaches no threshold, and it takes in a fall the moment the fall is
+    ///      recorded. The rule is the same for every position however recently it opened: a
+    ///      threshold stamped from the rate at the position's own fill would carry a spike that
+    ///      coincided with that fill for the whole grace period, and a second spike inside it
+    ///      could then seize a position solvent at every other rate in force. A position opened
+    ///      during a genuine rise still pays the current IMR to open; only its maintenance
+    ///      threshold waits for the rise to hold.
     ///
-    ///      The comparison is load-bearing, not a refinement. The sample grid is
-    ///      MMR_SAMPLE_INTERVAL-spaced while the rate moves on IMR_UPDATE_COOLDOWN, so a rate
-    ///      increase landing between two grid points is recorded under the *later* point's
-    ///      timestamp. A position opened in that shadow carries the raised entryMmrBp, and at the
-    ///      moment it crosses the grace period its cutoff equals its own mmrUpdateTs exactly —
-    ///      selecting the last sample taken before it existed. Without the check that pre-open
-    ///      rate would replace the entry rate, handing the position a requirement it never opened
-    ///      under until the cutoff walks past its first post-open sample.
+    ///      The unload walk, the ADL gate and the ADL batch sizing derive their band edge from
+    ///      the same rate. A wider band moves its edge toward the estates' bankruptcy price, where
+    ///      fills are immediate, so a spike in the band's rate would let the seizing transaction
+    ///      buy inventory the unload floor was holding for competing bids.
     ///
-    ///      Shared by calculateState and the partial-close margin check in MatchingEngineLib so
-    ///      the two stay consistent.
-    /// @param mmrUpdateTs  Timestamp the position's entry MMR was last set (0 when flat).
-    /// @param entryMmrBp   The position's entry MMR, i.e. the rate as of mmrUpdateTs.
-    /// @param laggedMmrBp  Newest sample a full MMR_GRACE_PERIOD before this batch's mark (0 if none).
-    /// @param laggedMmrTs  Timestamp that sample was recorded at (0 when there is none).
-    /// @param currentMmrBp The pair's current MMR.
-    /// @return The effective maintenance MMR in basis points.
-    function effectiveMmr(
-        uint256 mmrUpdateTs,
-        uint256 entryMmrBp,
-        uint256 laggedMmrBp,
-        uint256 laggedMmrTs,
-        uint256 currentMmrBp
-    ) internal pure returns (uint256) {
-        // Reference MMR: the lagged sample when it describes a rate this position actually opened
-        // under, otherwise the position's own entry MMR. The mmrUpdateTs != 0 guard keeps a bucket
-        // that was never stamped (flat, or reached before its first fill) out of the lagged branch,
-        // where a 0 stamp would compare true against any sample; it falls to entryMmrBp == 0 and
-        // then to the current rate below.
-        uint256 refMmr = (mmrUpdateTs != 0 && laggedMmrTs >= mmrUpdateTs) ? laggedMmrBp : entryMmrBp;
-        // Lower of reference vs current.
-        return (refMmr != 0 && refMmr < currentMmrBp) ? refMmr : currentMmrBp;
+    ///      Shared by calculateState, the partial-close margin check in MatchingEngineLib and
+    ///      every band reader, so every reader applies the same rule. liquidate's requirements
+    ///      carry the current rate its own price gives, capped by the stored one inside the
+    ///      cooldown (BazaarPair._liquidationMarginReqs); that only ever makes it the more
+    ///      lenient reader, since the lagged rate sits at or below the stored rate. With nothing
+    ///      recorded yet (BazaarPair._laggedMmr returns 0) the current rate stands.
+    /// @param mr The batch's margin requirements, lagged field filled by BazaarPair._marginReqsWithLag.
+    /// @return The maintenance rate in basis points.
+    function effectiveMmrBp(BazaarTypes.MarginRequirements memory mr) internal pure returns (uint256) {
+        return (mr.laggedMmrBp != 0 && mr.laggedMmrBp < mr.mmrBp) ? mr.laggedMmrBp : mr.mmrBp;
     }
 
     /// @notice Updates a position bucket's core fields in storage from a BucketState.
@@ -139,8 +123,6 @@ library BucketLib {
         bucket.entryValue = SafeCast.toUint128(newState.entryValue);
         bucket.collateral = SafeCast.toUint128(newState.effectiveCollateral);
         bucket.entryFundingIndex = newState.adjustedEntryFundingIndex;
-        bucket.entryMmrBp = SafeCast.toUint32(newState.entryMmrBp);
-        bucket.mmrUpdateTs = SafeCast.toUint64(newState.mmrUpdateTs);
     }
 
     /// @notice Memory twin of updateFromState, for a bucket image carried across a matching
@@ -157,8 +139,6 @@ library BucketLib {
         bucket.entryValue = SafeCast.toUint128(newState.entryValue);
         bucket.collateral = SafeCast.toUint128(newState.effectiveCollateral);
         bucket.entryFundingIndex = newState.adjustedEntryFundingIndex;
-        bucket.entryMmrBp = SafeCast.toUint32(newState.entryMmrBp);
-        bucket.mmrUpdateTs = SafeCast.toUint64(newState.mmrUpdateTs);
     }
 
     /// @notice Flush a walk-carried bucket image back to storage — the write half of the
@@ -175,8 +155,6 @@ library BucketLib {
         bucket.entryFundingIndex = image.entryFundingIndex;
         bucket.takeProfitOrderId = image.takeProfitOrderId;
         bucket.stopLossOrderId = image.stopLossOrderId;
-        bucket.entryMmrBp = image.entryMmrBp;
-        bucket.mmrUpdateTs = image.mmrUpdateTs;
     }
 
     /// @notice Emits the PositionBucketUpdated event for off-chain indexers.
@@ -200,8 +178,7 @@ library BucketLib {
             bucket.entryFundingIndex,
             currentFundingIndex,
             marginReqs.imrBp,
-            marginReqs.mmrBp,
-            bucket.entryMmrBp
+            marginReqs.mmrBp
         );
     }
 }

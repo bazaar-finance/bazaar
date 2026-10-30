@@ -26,6 +26,7 @@ contract LiqRewardHarness {
     mapping(address => BazaarTypes.PositionBucket) public positionBuckets;
     BazaarTypes.Vault public vault;
     BazaarTypes.FeeEscrow internal feeEscrow;
+    address[] internal deferred;
 
     /// @dev The liquidator's accrued reward (the lib credits msg.sender, i.e. the test contract).
     function claimable(address who) external view returns (uint256) {
@@ -65,6 +66,10 @@ contract LiqRewardHarness {
         return vault.deficit;
     }
 
+    function arrears() external view returns (uint256) {
+        return vault.ledgerArrears;
+    }
+
     function liquidate(address[] calldata users, uint256 price) external returns (BazaarTypes.LiquidateResult memory) {
         return LiquidationLib.processLiquidations(
             users,
@@ -73,11 +78,12 @@ contract LiqRewardHarness {
             positionBuckets,
             vault,
             feeEscrow,
+            deferred,
             BazaarTypes.LiquidateParams({
                 currentPrice: price,
                 currentFundingIndex: 0,
                 marginReqs: BazaarTypes.MarginRequirements({
-                    imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0, laggedMmrTs: 0
+                    imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0
                 }),
                 pairId: bytes32("TEST"),
                 currentBlock: 1
@@ -90,13 +96,14 @@ contract LiqRewardHarness {
     }
 }
 
-/// @notice Unit tests for the liquidator reward:
-///         reward per position = max($0.10 floor, 2bps × notional), summed across the batch,
-///         capped at the fund's free capital, debited from insurance and accrued to the
-///         liquidator's claimable balance at liquidation time, with no profit-contingent
-///         (secondary) component.
+/// @notice Unit tests for the liquidator reward's flat part: the floor for every position a
+///         call seizes, limited to the account's own equity when its position is worth less than
+///         MIN_ORDER_AMOUNT, summed across the call, capped at the fund's free capital, debited
+///         from insurance and accrued to the liquidator's claimable balance at liquidation time,
+///         with no profit-contingent (secondary) component. The rate on what the call sells is
+///         paid by the inline unload, which this harness does not run.
 contract LiquidatorRewardTest is Test {
-    uint256 internal constant FLOOR = 1e17; // 0.10 USDC
+    uint256 internal constant FLOOR = 0.05e18; // 0.05 USDC
     uint256 internal constant PRICE = 50_000e18; // $50,000
 
     LiqRewardHarness internal harness;
@@ -119,40 +126,35 @@ contract LiquidatorRewardTest is Test {
         return harness.liquidate(users, price);
     }
 
-    // -------------------- Floor vs bps --------------------
+    // -------------------- The flat reward --------------------
 
-    /// @notice $5,000 notional → 2bps = $1.00 > $0.10 floor → reward is the bps term.
-    function test_largePosition_paysBps() public {
+    /// @notice A seizure pays the flat $0.05 whatever the position's size. The rate is paid on
+    ///         what the call's inline unload sells into the book, which this harness does not run.
+    function test_largePosition_paysTheFlatReward() public {
         _long(alice(), 0.1e18, 50_050e18, 10e18); // 0.1 BTC, ~$5,005 entry, $10 collateral
         BazaarTypes.LiquidateResult memory r = _liq(alice(), PRICE);
 
         assertEq(r.liquidatedCount, 1);
-        assertEq(r.totalUpfrontReward, 1e18, "2bps of $5,000 = $1.00");
-        assertEq(harness.claimable(address(this)), 1e18, "reward accrued to the liquidator's claimable balance");
+        assertEq(harness.claimable(address(this)), FLOOR, "the flat reward, not a rate on the position");
+        assertEq(r.unloadPrepaid, FLOOR, "nothing netted: the walk is credited with the whole flat reward");
     }
 
-    /// @notice $50 notional → 2bps = $0.01 < $0.10 floor → reward is the floor.
-    function test_smallPosition_paysFloor() public {
+    function test_smallPosition_paysTheFlatReward() public {
         _long(alice(), 0.001e18, 50_050e18, 0.1e18); // 0.001 BTC, ~$50 notional
         BazaarTypes.LiquidateResult memory r = _liq(alice(), PRICE);
 
         assertEq(r.liquidatedCount, 1);
-        assertEq(r.totalUpfrontReward, FLOOR, "below breakeven pays the 0.10 floor");
+        assertEq(harness.claimable(address(this)), FLOOR, "the same flat reward");
     }
 
-    /// @notice $500 notional is the exact breakeven: 2bps × $500 = $0.10 = floor.
-    function test_breakevenPosition_floorEqualsBps() public {
-        _long(alice(), 0.01e18, 50_050e18, 1e18); // 0.01 BTC, $500 notional
-        BazaarTypes.LiquidateResult memory r = _liq(alice(), PRICE);
+    // -------------------- One reward per seizure --------------------
 
-        assertEq(r.totalUpfrontReward, FLOOR, "at $500 the floor and 2bps coincide");
-    }
-
-    // -------------------- Batch summation --------------------
-
-    function test_batchSumsPerPositionRewards() public {
-        _long(alice(), 0.1e18, 50_050e18, 10e18); // large → $1.00
-        _long(dave(), 0.001e18, 50_050e18, 0.1e18); // small → $0.10
+    /// @notice The flat reward is due for every position the call seizes, so one call naming
+    ///         several accounts earns what separate calls would and batching costs a keeper
+    ///         nothing.
+    function test_batchPaysTheFlatRewardPerSeizure() public {
+        _long(alice(), 0.1e18, 50_050e18, 10e18);
+        _long(dave(), 0.001e18, 50_050e18, 0.1e18);
 
         address[] memory users = new address[](2);
         users[0] = alice();
@@ -160,15 +162,41 @@ contract LiquidatorRewardTest is Test {
         BazaarTypes.LiquidateResult memory r = harness.liquidate(users, PRICE);
 
         assertEq(r.liquidatedCount, 2);
-        assertEq(r.totalUpfrontReward, 1e18 + FLOOR, "reward is summed per position");
-        assertEq(harness.claimable(address(this)), 1e18 + FLOOR, "the batch total accrues in one credit");
+        assertEq(harness.claimable(address(this)), 2 * FLOOR, "one flat reward per seizure, both accrued");
     }
 
-    // -------------------- Reward is independent of how the position nets --------------------
+    /// @notice An account named twice in one call is seized once and paid for once: the second
+    ///         entry finds an empty bucket.
+    function test_duplicateEntry_paysOnce() public {
+        _long(alice(), 0.1e18, 50_050e18, 10e18);
 
-    /// @notice Opposite-direction liquidations fully net the aggregate to zero, but each still
-    ///         earns its reward — the reward is for the act of liquidating, not the close.
-    function test_oppositeNetting_stillPaysBothRewards() public {
+        address[] memory users = new address[](2);
+        users[0] = alice();
+        users[1] = alice();
+        BazaarTypes.LiquidateResult memory r = harness.liquidate(users, PRICE);
+
+        assertEq(r.liquidatedCount, 1, "seized once");
+        assertEq(harness.claimable(address(this)), FLOOR, "paid once");
+    }
+
+    /// @notice A call that seizes nothing earns nothing: the reward is for work done, so naming
+    ///         a solvent account cannot farm it.
+    function test_nothingSeized_paysNothing() public {
+        _long(alice(), 0.1e18, 50_000e18, 5_000e18); // fully collateralized, solvent at the price
+        BazaarTypes.LiquidateResult memory r = _liq(alice(), PRICE);
+
+        assertEq(r.liquidatedCount, 0);
+        assertEq(harness.claimable(address(this)), 0, "no seizure, no reward");
+        assertEq(r.unloadPrepaid, 0, "and nothing credited against the walk");
+    }
+
+    // -------------------- A netting retires exposure --------------------
+
+    /// @notice Opposite-direction liquidations in one call: the first seeds the inventory and
+    ///         earns its flat reward, the second nets it to zero. The netting takes the 0.1 BTC
+    ///         off the fund, so its account earns 2 bp of the $5,000 at the liquidation price,
+    ///         $1, in place of its own flat reward.
+    function test_oppositeNetting_paysTheRateOnWhatItRetired() public {
         _long(alice(), 0.1e18, 55_000e18, 100e18); // long underwater at $50k
         harness.setBucket(dave(), false, 0.1e18, Math_mulDiv(0.1e18, 45_500e18, 1e18), 100e18); // short underwater
 
@@ -179,8 +207,8 @@ contract LiquidatorRewardTest is Test {
 
         assertEq(r.liquidatedCount, 2);
         assertEq(harness.pendingLiqSize(), 0, "equal opposite sizes fully net");
-        // Both $5,000 notional → $1.00 each, paid despite the aggregate netting to zero.
-        assertEq(r.totalUpfrontReward, 2e18, "netting does not suppress the per-position reward");
+        assertEq(harness.claimable(address(this)), FLOOR + 1e18, "alice's flat reward and 2 bp of the $5,000 netted");
+        assertEq(r.unloadPrepaid, FLOOR, "only alice's flat reward is credited against the walk");
     }
 
     // -------------------- Capped at free capital --------------------
@@ -191,12 +219,12 @@ contract LiquidatorRewardTest is Test {
     function test_noFreeCapital_paysNothing_earmarkStaysWhole() public {
         harness = new LiqRewardHarness();
         harness.seedCollateral(1_000_000e18);
-        _long(alice(), 0.1e18, 50_050e18, 10e18); // earns $1.00; seizes $10 into an empty fund
+        _long(alice(), 0.1e18, 50_050e18, 10e18); // earns $0.05; seizes $10 into an empty fund
         BazaarTypes.LiquidateResult memory r = _liq(alice(), PRICE);
 
         assertEq(r.liquidatedCount, 1);
-        assertEq(r.totalUpfrontReward, 0, "nothing accrued: the fund holds only the earmark");
-        assertEq(harness.claimable(address(this)), 0, "nothing claimable");
+        assertEq(harness.claimable(address(this)), 0, "nothing accrued: the fund holds only the earmark");
+        assertEq(r.unloadPrepaid, 0, "nothing paid, nothing credited against the walk");
         assertEq(harness.insurance(), 10e18, "the seizure sits in the fund untouched");
     }
 
@@ -204,13 +232,79 @@ contract LiquidatorRewardTest is Test {
     function test_partialFreeCapital_paysTheCappedReward() public {
         harness = new LiqRewardHarness();
         harness.seedCollateral(1_000_000e18);
-        harness.seedInsurance(0.4e18);
-        _long(alice(), 0.1e18, 50_050e18, 10e18); // earns $1.00 against $0.40 of free capital
+        harness.seedInsurance(0.04e18);
+        _long(alice(), 0.1e18, 50_050e18, 10e18); // earns $0.05 against $0.04 of free capital
         BazaarTypes.LiquidateResult memory r = _liq(alice(), PRICE);
 
-        assertEq(r.totalUpfrontReward, 0.4e18, "capped at free capital");
-        assertEq(harness.claimable(address(this)), 0.4e18, "the capped amount accrued");
-        assertEq(harness.insurance(), 10e18, "the earmark is whole: only the free $0.40 left the fund");
+        assertEq(harness.claimable(address(this)), 0.04e18, "capped at free capital");
+        assertEq(r.unloadPrepaid, 0.04e18, "the walk is credited with what was paid, not what was due");
+        assertEq(harness.insurance(), 10e18, "the earmark is whole: only the free $0.04 left the fund");
+    }
+
+    // -------------------- Positions below the order minimum --------------------
+
+    uint256 internal constant SUB_MIN_SIZE = 0.00008e18; // $4 at PRICE, under MIN_ORDER_AMOUNT
+    uint256 internal constant MIN_SIZE = 0.0001e18; // exactly MIN_ORDER_AMOUNT at PRICE
+
+    /// @notice A position worth less than MIN_ORDER_AMOUNT with no equity left earns no flat
+    ///         reward: the fund takes over nothing of value with it, so it pays nothing for it.
+    function test_subMinimumPosition_noEquity_paysNoFlatReward() public {
+        // $4 of notional entered at $50,100: a $0.008 loss against $0.005 of collateral.
+        _long(alice(), SUB_MIN_SIZE, 50_100e18, 0.005e18);
+        BazaarTypes.LiquidateResult memory r = _liq(alice(), PRICE);
+
+        assertEq(r.liquidatedCount, 1, "seized");
+        assertEq(harness.claimable(address(this)), 0, "no flat reward for an account with nothing left");
+        assertEq(harness.insurance(), 1_000e18 + 0.005e18, "the fund received the seizure and paid nothing");
+    }
+
+    /// @notice Below MIN_ORDER_AMOUNT the flat reward is the account's own equity when that is
+    ///         smaller than MIN_LIQUIDATOR_REWARD.
+    function test_subMinimumPosition_paysItsEquity() public {
+        // $4 of notional at its entry price with $0.03 of collateral, under the $0.06 maintenance line.
+        _long(alice(), SUB_MIN_SIZE, 50_000e18, 0.03e18);
+        BazaarTypes.LiquidateResult memory r = _liq(alice(), PRICE);
+
+        assertEq(r.liquidatedCount, 1, "seized");
+        assertEq(harness.claimable(address(this)), 0.03e18, "the flat reward is the account's equity");
+        assertEq(harness.insurance(), 1_000e18, "the fund paid out exactly the equity it took over");
+    }
+
+    /// @notice The cap binds only when the equity is smaller: a position below the minimum that
+    ///         still holds more than the floor earns the full floor.
+    function test_subMinimumPosition_equityAboveTheFloor_paysTheFullFloor() public {
+        // $4 of notional with $0.055 of collateral: under the $0.06 maintenance line, over the floor.
+        _long(alice(), SUB_MIN_SIZE, 50_000e18, 0.055e18);
+        BazaarTypes.LiquidateResult memory r = _liq(alice(), PRICE);
+
+        assertEq(r.liquidatedCount, 1, "seized");
+        assertEq(harness.claimable(address(this)), FLOOR, "the full floor");
+    }
+
+    /// @notice A position worth MIN_ORDER_AMOUNT or more earns the full floor even with no equity
+    ///         left: until it is seized its further losses are the fund's.
+    function test_positionAtTheMinimum_bankrupt_paysTheFullFloor() public {
+        // Exactly $5 of notional entered at $50,100 with no collateral: $0.01 past bankruptcy.
+        _long(alice(), MIN_SIZE, 50_100e18, 0);
+        BazaarTypes.LiquidateResult memory r = _liq(alice(), PRICE);
+
+        assertEq(r.liquidatedCount, 1, "seized");
+        assertEq(harness.claimable(address(this)), FLOOR, "the full floor, whatever the equity");
+    }
+
+    /// @notice Each account in a batch is capped on its own: a sub-minimum account with nothing
+    ///         left adds nothing, and a full-size one beside it still adds the floor.
+    function test_batch_capsEachAccountOnItsOwn() public {
+        _long(alice(), SUB_MIN_SIZE, 50_100e18, 0.005e18); // no equity left
+        _long(dave(), 0.1e18, 50_050e18, 10e18); // ~$5,000, under maintenance
+
+        address[] memory users = new address[](2);
+        users[0] = alice();
+        users[1] = dave();
+        BazaarTypes.LiquidateResult memory r = harness.liquidate(users, PRICE);
+
+        assertEq(r.liquidatedCount, 2, "both seized");
+        assertEq(harness.claimable(address(this)), FLOOR, "only the full-size account adds the floor");
     }
 
     // -------------------- Helpers --------------------
@@ -261,8 +355,9 @@ contract SeizureLedgerClampTest is Test {
     }
 
     /// @notice Book collateral above the whole ledger: liquidation succeeds, insurance is
-    ///         credited exactly the ledger balance, the ledger floors at zero, and no
-    ///         deficit is booked — settlement of the inherited estate decides solvency.
+    ///         credited exactly the ledger balance, the ledger floors at zero, the unpaid
+    ///         remainder is carried as the ledger's arrears to the fund, and no deficit is
+    ///         booked — settlement of the inherited estate decides solvency.
     function test_bucketAboveLedger_seizureCapsAndSucceeds() public {
         _underwaterLong(loser, 10_000e18);
         harness.seedCollateral(9_200e18);
@@ -272,30 +367,34 @@ contract SeizureLedgerClampTest is Test {
         assertEq(r.liquidatedCount, 1, "liquidation must not revert on a thin ledger");
         assertEq(
             harness.insurance(),
-            9_200e18 - r.totalUpfrontReward,
+            9_200e18 - harness.claimable(address(this)),
             "insurance receives the capped amount, less the reward"
         );
         assertEq(harness.deposits(), 0, "ledger floors at zero");
+        assertEq(harness.arrears(), 800e18, "the unpaid remainder is the ledger's arrears to the fund");
         assertEq(harness.deficit(), 0, "no deficit at seizure time");
         assertEq(harness.pendingLiqSize(), 1e18, "estate carries the full position");
     }
 
-    /// @notice Ledger fully covers the book: the cap is inactive and the full collateral
-    ///         moves to insurance.
+    /// @notice Ledger fully covers the book: the cap is inactive, the full collateral moves to
+    ///         insurance and no arrears arise.
     function test_ledgerCoversBook_fullSeizure() public {
         _underwaterLong(loser, 10_000e18);
         harness.seedCollateral(30_000e18);
 
-        BazaarTypes.LiquidateResult memory r = _liq(loser);
+        _liq(loser);
 
-        assertEq(harness.insurance(), 10_000e18 - r.totalUpfrontReward, "full book value seized, less the reward");
+        assertEq(
+            harness.insurance(), 10_000e18 - harness.claimable(address(this)), "full book value seized, less the reward"
+        );
         assertEq(harness.deposits(), 20_000e18);
+        assertEq(harness.arrears(), 0, "a ledger that covers the book owes nothing");
         assertEq(harness.deficit(), 0);
     }
 
     /// @notice A batch whose summed books exceed the ledger, though each position fits
     ///         alone: the first seizure takes its full book, the second is capped at the
-    ///         remainder, and both liquidations commit.
+    ///         remainder with the rest carried as arrears, and both liquidations commit.
     function test_batchCascade_capsAtRemainder() public {
         _underwaterLong(loser, 6_000e18);
         _underwaterLong(loser2, 6_000e18);
@@ -307,13 +406,18 @@ contract SeizureLedgerClampTest is Test {
         BazaarTypes.LiquidateResult memory r = harness.liquidate(users, PRICE);
 
         assertEq(r.liquidatedCount, 2, "the aggregate cap must not revert the batch");
-        assertEq(harness.insurance(), 9_000e18 - r.totalUpfrontReward, "6,000 full + 3,000 capped, less the rewards");
+        assertEq(
+            harness.insurance(),
+            9_000e18 - harness.claimable(address(this)),
+            "6,000 full + 3,000 capped, less the rewards"
+        );
         assertEq(harness.deposits(), 0);
+        assertEq(harness.arrears(), 3_000e18, "the second seizure's unpaid 3,000 is owed to the fund");
         assertEq(harness.pendingLiqSize(), 2e18, "both estates on the books");
     }
 
-    /// @notice An empty ledger seizes nothing but the liquidation still commits and the
-    ///         estate is still recorded.
+    /// @notice An empty ledger seizes nothing but the liquidation still commits, the estate is
+    ///         still recorded, and the whole book is owed to the fund.
     function test_emptyLedger_liquidationStillCommits() public {
         _underwaterLong(loser, 10_000e18);
         harness.seedCollateral(0);
@@ -322,6 +426,7 @@ contract SeizureLedgerClampTest is Test {
 
         assertEq(r.liquidatedCount, 1);
         assertEq(harness.insurance(), 0, "nothing attributable, nothing credited");
+        assertEq(harness.arrears(), 10_000e18, "the whole book is owed to the fund");
         assertEq(harness.claimable(address(this)), 0, "a reward the fund cannot cover is skipped, never partial");
         assertEq(harness.pendingLiqSize(), 1e18);
     }
@@ -339,6 +444,7 @@ contract NettingHarness {
     mapping(address => BazaarTypes.PositionBucket) public positionBuckets;
     BazaarTypes.Vault public vault;
     BazaarTypes.FeeEscrow internal feeEscrow;
+    address[] internal deferred;
 
     function setBucket(
         address user,
@@ -362,6 +468,20 @@ contract NettingHarness {
 
     function seedInsurance(uint256 amount) external {
         vault.insuranceFundBalance = amount;
+    }
+
+    /// @dev Seed what the deposits ledger already owes the fund, as an earlier seizure the
+    ///      ledger could only partly pay would have left it.
+    function seedArrears(uint256 amount) external {
+        vault.ledgerArrears = amount;
+    }
+
+    function arrears() external view returns (uint256) {
+        return vault.ledgerArrears;
+    }
+
+    function deposits() external view returns (uint256) {
+        return vault.totalCollateralDeposited;
     }
 
     /// @dev Simulate the vault already holding an inventory of liquidated positions on one side,
@@ -397,11 +517,36 @@ contract NettingHarness {
             positionBuckets,
             vault,
             feeEscrow,
+            deferred,
             BazaarTypes.LiquidateParams({
                 currentPrice: price,
                 currentFundingIndex: fundingIndex,
                 marginReqs: BazaarTypes.MarginRequirements({
-                    imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0, laggedMmrTs: 0
+                    imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0
+                }),
+                pairId: bytes32("TEST"),
+                currentBlock: 1
+            })
+        );
+    }
+
+    function liquidateMany(address[] calldata users, uint256 price, int256 fundingIndex)
+        external
+        returns (BazaarTypes.LiquidateResult memory)
+    {
+        return LiquidationLib.processLiquidations(
+            users,
+            orders,
+            book,
+            positionBuckets,
+            vault,
+            feeEscrow,
+            deferred,
+            BazaarTypes.LiquidateParams({
+                currentPrice: price,
+                currentFundingIndex: fundingIndex,
+                marginReqs: BazaarTypes.MarginRequirements({
+                    imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0
                 }),
                 pairId: bytes32("TEST"),
                 currentBlock: 1
@@ -423,6 +568,18 @@ contract NettingHarness {
 
     function deficit() external view returns (uint256) {
         return vault.deficit;
+    }
+
+    function deferredList() external view returns (address[] memory) {
+        return deferred;
+    }
+
+    function bucketSize(address user) external view returns (uint256) {
+        return positionBuckets[user].size;
+    }
+
+    function pendingLiqIsLong() external view returns (bool) {
+        return vault.pendingLiqIsLong;
     }
 }
 
@@ -468,13 +625,13 @@ contract VaultFundingNettingTest is Test {
         // the vault-inventory funding under test.
         h.setBucket(dave(), false, SIZE, entryNotional, SEIZED_COLLATERAL, currentIdx);
 
-        BazaarTypes.LiquidateResult memory r = h.liquidate(dave(), PRICE, currentIdx);
+        h.liquidate(dave(), PRICE, currentIdx);
 
         assertEq(h.pendingLiqSize(), 0, "equal opposite sizes fully net");
 
         uint256 nettedFunding = uint256(currentIdx - entryIdx) * SIZE / SCALE; // 100e18
         // base + seized - funding (long pays when funding rises) - liquidator reward; price netPnl == 0
-        uint256 expected = BASE_INSURANCE + SEIZED_COLLATERAL - nettedFunding - r.totalUpfrontReward;
+        uint256 expected = BASE_INSURANCE + SEIZED_COLLATERAL - nettedFunding - h.claimable(address(this));
         assertEq(h.insuranceFundBalance(), expected, "long-inventory funding realized as outflow");
     }
 
@@ -489,13 +646,13 @@ contract VaultFundingNettingTest is Test {
         h.seedPending(false, SIZE, entryNotional, _mulDiv(SIZE, 52_000e18, SCALE), entryIdx);
         h.setBucket(dave(), true, SIZE, entryNotional, SEIZED_COLLATERAL, currentIdx);
 
-        BazaarTypes.LiquidateResult memory r = h.liquidate(dave(), PRICE, currentIdx);
+        h.liquidate(dave(), PRICE, currentIdx);
 
         assertEq(h.pendingLiqSize(), 0, "equal opposite sizes fully net");
 
         uint256 nettedFunding = uint256(currentIdx - entryIdx) * SIZE / SCALE; // 100e18
         // base + seized + funding (short receives when funding rises) - liquidator reward; price netPnl == 0
-        uint256 expected = BASE_INSURANCE + SEIZED_COLLATERAL + nettedFunding - r.totalUpfrontReward;
+        uint256 expected = BASE_INSURANCE + SEIZED_COLLATERAL + nettedFunding - h.claimable(address(this));
         assertEq(h.insuranceFundBalance(), expected, "short-inventory funding realized as inflow");
     }
 
@@ -508,13 +665,13 @@ contract VaultFundingNettingTest is Test {
         h.seedPending(true, SIZE, entryNotional, _mulDiv(SIZE, 48_000e18, SCALE), idx);
         h.setBucket(dave(), false, SIZE, entryNotional, SEIZED_COLLATERAL, idx);
 
-        BazaarTypes.LiquidateResult memory r = h.liquidate(dave(), PRICE, idx);
+        h.liquidate(dave(), PRICE, idx);
 
         assertEq(h.pendingLiqSize(), 0, "equal opposite sizes fully net");
         // base + seized - liquidator reward only; price netPnl == 0 and funding delta == 0
         assertEq(
             h.insuranceFundBalance(),
-            BASE_INSURANCE + SEIZED_COLLATERAL - r.totalUpfrontReward,
+            BASE_INSURANCE + SEIZED_COLLATERAL - h.claimable(address(this)),
             "no funding term when delta is zero"
         );
     }
@@ -523,29 +680,489 @@ contract VaultFundingNettingTest is Test {
         return makeAddr("dave");
     }
 
-    // ----- Deficit recording: netting loss overruns insurance -> realized bad debt tracked -----
+    // ----- Deferral: a netting the fund cannot afford is not run -----
 
-    /// @notice When an opposing liquidation's netting loss exceeds the insurance fund, the overrun
-    ///         is recorded as `vault.deficit` (and insurance floors to 0). A non-zero deficit is the
-    ///         definitive insolvency signal that isVaultHealthy terminates on.
-    function test_nettingOverrunsInsurance_recordsDeficit() public {
-        // Vault holds a long inherited at $60k entry (underwater at $50k).
+    /// @notice When the netting's loss exceeds what backs the two netted slices — free capital
+    ///         above the reserve, their seizure and the ledger's arrears — the position is not
+    ///         seized: it stays open, is recorded as deferred for the auction to close against its
+    ///         own counterparties, and neither the inventory nor the fund moves. The liquidator
+    ///         earns the reward floor once for recording it, and nothing for naming it again.
+    function test_nettingBeyondBacking_defersInsteadOfBookingDeficit() public {
+        // Vault holds a long inherited at $60k entry, bankrupt at $58k: $2k seized with it.
         h.seedPending(true, SIZE, 60_000 * SCALE, 58_000 * SCALE, 0);
-        // Insurance only $4k.
+        // Insurance $4k, of which the $2k earmark: $2k free.
         h.seedInsurance(4_000 * SCALE);
-
         // Opposing short entered at $48k with $1k collateral -> insolvent at $50k (loss $2k > $1k).
+        h.setBucket(dave(), false, SIZE, 48_000 * SCALE, 1_000 * SCALE, 0);
+
+        BazaarTypes.LiquidateResult memory r = h.liquidate(dave(), PRICE, 0);
+
+        // The $12k entry gap (60k long against 48k short) against $2k free + $2k earmark + $1k
+        // seizure: unaffordable, so nothing is seized or netted.
+        assertEq(r.liquidatedCount, 0, "not seized");
+        assertEq(r.deferredCount, 1, "deferred");
+        assertEq(h.bucketSize(dave()), SIZE, "position left open");
+        assertEq(h.pendingLiqSize(), SIZE, "inventory untouched");
+        assertEq(h.deficit(), 0, "no bad debt booked");
+        address[] memory listed = h.deferredList();
+        assertEq(listed.length, 1, "recorded");
+        assertEq(listed[0], dave(), "recorded");
+        // The recording tip is the reward floor, paid from the fund's free capital. A deferral
+        // nets nothing, so it earns no rate and the whole tip is credited against the walk.
+        assertEq(h.claimable(address(this)), BazaarTypes.MIN_LIQUIDATOR_REWARD, "the floor, for the recording");
+        assertEq(r.unloadPrepaid, BazaarTypes.MIN_LIQUIDATOR_REWARD, "the whole tip credited against the walk");
+        assertEq(
+            h.insuranceFundBalance(),
+            4_000 * SCALE - BazaarTypes.MIN_LIQUIDATOR_REWARD,
+            "the fund moved by the tip alone"
+        );
+
+        // Naming a listed account again re-evaluates it and pays nothing.
+        r = h.liquidate(dave(), PRICE, 0);
+        assertEq(r.deferredCount, 1, "still deferred");
+        assertEq(h.claimable(address(this)), BazaarTypes.MIN_LIQUIDATOR_REWARD, "no tip for a re-submission");
+        assertEq(r.unloadPrepaid, 0, "nothing paid, nothing credited");
+        assertEq(h.deferredList().length, 1, "listed once");
+    }
+
+    /// @notice Recording several accounts in one call pays the flat reward for each, like
+    ///         seizing several does.
+    function test_twoNewDeferralsInOneCall_payTheFlatRewardEach() public {
+        // Two units inherited at $60k entry, bankrupt at $58k: $4k earmarked, the whole fund.
+        h.seedPending(true, 2 * SIZE, 120_000 * SCALE, 116_000 * SCALE, 0);
+        h.seedInsurance(4_200 * SCALE);
+        address erin = makeAddr("erin");
+        // Two opposing shorts, each from $48k on $1k: each netting's $12k entry gap is unaffordable.
+        h.setBucket(dave(), false, SIZE, 48_000 * SCALE, 1_000 * SCALE, 0);
+        h.setBucket(erin, false, SIZE, 48_000 * SCALE, 1_000 * SCALE, 0);
+        address[] memory users = new address[](2);
+        users[0] = dave();
+        users[1] = erin;
+
+        BazaarTypes.LiquidateResult memory r = h.liquidateMany(users, PRICE, 0);
+
+        assertEq(r.liquidatedCount, 0, "neither seized");
+        assertEq(r.deferredCount, 2, "both recorded");
+        assertEq(h.deferredList().length, 2);
+        assertEq(h.claimable(address(this)), 2 * BazaarTypes.MIN_LIQUIDATOR_REWARD, "one flat reward per recording");
+    }
+
+    /// @notice A new deferral is paid like a seizure and capped the same way: an account whose
+    ///         position is worth less than MIN_ORDER_AMOUNT earns at most its own equity.
+    function test_subMinimumDeferral_paysItsEquity() public {
+        // Vault holds a long inherited at $60k entry, bankrupt at $58k: $2k seized with it.
+        h.seedPending(true, SIZE, 60_000 * SCALE, 58_000 * SCALE, 0);
+        // $0.50 of free capital on top of the $2k earmark.
+        h.seedInsurance(2_000 * SCALE + SCALE / 2);
+        // A $4 short entered at $48k with $0.19 of collateral: its $0.16 loss at $50k leaves $0.03
+        // of equity, under the $0.06 maintenance line.
+        uint256 dust = 0.00008e18;
+        h.setBucket(dave(), false, dust, _mulDiv(dust, 48_000 * SCALE, SCALE), 0.19e18, 0);
+
+        BazaarTypes.LiquidateResult memory r = h.liquidate(dave(), PRICE, 0);
+
+        // Netting it would lose $0.96 on the entry gap against $0.85 of backing: the $0.50 free,
+        // $0.16 of the inventory's seizure and its own $0.19.
+        assertEq(r.deferredCount, 1, "deferred");
+        assertEq(r.liquidatedCount, 0, "not seized");
+        assertEq(h.claimable(address(this)), 0.03e18, "the flat reward is the account's equity");
+        assertEq(h.insuranceFundBalance(), 2_000 * SCALE + SCALE / 2 - 0.03e18, "the fund paid the capped reward");
+    }
+
+    /// @notice A deferred account is seized by the next call that finds the inventory it would
+    ///         have netted against gone: it becomes the vault's inventory on its own side, earns
+    ///         the call its flat reward and leaves the list.
+    function test_deferred_seizedOnceTheInventoryIsGone() public {
+        h.seedPending(true, SIZE, 60_000 * SCALE, 58_000 * SCALE, 0);
+        h.seedInsurance(4_000 * SCALE);
+        h.setBucket(dave(), false, SIZE, 48_000 * SCALE, 1_000 * SCALE, 0);
+        h.liquidate(dave(), PRICE, 0);
+        assertEq(h.deferredList().length, 1, "deferred");
+
+        // The inventory is unloaded elsewhere.
+        h.seedPending(true, 0, 0, 0, 0);
+        BazaarTypes.LiquidateResult memory r = h.liquidate(dave(), PRICE, 0);
+
+        assertEq(r.liquidatedCount, 1, "seized");
+        assertEq(r.deferredCount, 0, "not deferred again");
+        assertEq(h.deferredList().length, 0, "delisted");
+        assertEq(h.pendingLiqSize(), SIZE, "now the inventory");
+        assertFalse(h.pendingLiqIsLong(), "on its own side");
+        assertEq(h.claimable(address(this)), 2 * BazaarTypes.MIN_LIQUIDATOR_REWARD, "the flat reward, after the tip");
+        assertEq(r.unloadPrepaid, BazaarTypes.MIN_LIQUIDATOR_REWARD, "nothing netted: the whole flat reward credited");
+    }
+
+    /// @notice A deferred account that is solvent again when next named — a reversal, a deposit
+    ///         — is simply delisted: the gate reads the buckets, so nothing else tracked it.
+    function test_deferred_delistedWhenSolventAgain() public {
+        h.seedPending(true, SIZE, 60_000 * SCALE, 58_000 * SCALE, 0);
+        h.seedInsurance(4_000 * SCALE);
+        h.setBucket(dave(), false, SIZE, 48_000 * SCALE, 1_000 * SCALE, 0);
+        h.liquidate(dave(), PRICE, 0);
+        assertEq(h.deferredList().length, 1, "deferred");
+
+        // Back at his entry the short is whole.
+        BazaarTypes.LiquidateResult memory r = h.liquidate(dave(), 48_000 * SCALE, 0);
+
+        assertEq(r.liquidatedCount, 0, "solvent: not seized");
+        assertEq(r.deferredCount, 0, "solvent: not deferred");
+        assertEq(h.deferredList().length, 0, "delisted");
+        assertEq(h.bucketSize(dave()), SIZE, "still open");
+    }
+
+    /// @notice The list holds MAX_DEFERRED_LIQUIDATIONS accounts. A newcomer with a larger loss
+    ///         beyond its collateral than the smallest listed one takes that entry's place; one
+    ///         with a smaller loss is left untracked. The recording tip goes to the account that
+    ///         is newly listed and to nothing else.
+    function test_deferred_listCapKeepsTheLargestExcess() public {
+        h.seedPending(true, SIZE, 60_000 * SCALE, 58_000 * SCALE, 0);
+        h.seedInsurance(4_000 * SCALE);
+        uint256 cap = BazaarTypes.MAX_DEFERRED_LIQUIDATIONS;
+        // Every short entered at $48k loses $2k at $50k; collateral from $200 up in $100 steps,
+        // so the loss beyond it descends with the index and the last entry is the shallowest.
+        address[] memory shorts = new address[](cap);
+        for (uint256 i = 0; i < cap; i++) {
+            shorts[i] = makeAddr(string.concat("short", vm.toString(i)));
+            h.setBucket(shorts[i], false, SIZE, 48_000 * SCALE, (200 + 100 * i) * SCALE, 0);
+            h.liquidate(shorts[i], PRICE, 0);
+            assertEq(h.claimable(address(this)), (i + 1) * BazaarTypes.MIN_LIQUIDATOR_REWARD, "tipped");
+        }
+        assertEq(h.deferredList().length, cap, "full");
+
+        // $100 collateral: $1,900 beyond it, the largest of all -> displaces the shallowest entry.
+        address deeper = makeAddr("deeper");
+        h.setBucket(deeper, false, SIZE, 48_000 * SCALE, 100 * SCALE, 0);
+        BazaarTypes.LiquidateResult memory r = h.liquidate(deeper, PRICE, 0);
+        assertEq(r.deferredCount, 1, "deferred");
+        assertEq(h.claimable(address(this)), (cap + 1) * BazaarTypes.MIN_LIQUIDATOR_REWARD, "newly listed: tipped");
+        address[] memory listed = h.deferredList();
+        assertEq(listed.length, cap, "still at the cap");
+        assertTrue(_listed(listed, deeper), "the deeper account is listed");
+        assertFalse(_listed(listed, shorts[cap - 1]), "the shallowest entry made room");
+        assertEq(h.bucketSize(shorts[cap - 1]), SIZE, "displaced, not seized");
+
+        // The collateral the displaced entry held: its loss beyond it is smaller than every entry
+        // still listed, so this one is left untracked and earns nothing. Derived from the cap so
+        // the case survives a change to it.
+        address shallower = makeAddr("shallower");
+        h.setBucket(shallower, false, SIZE, 48_000 * SCALE, (200 + 100 * (cap - 1)) * SCALE, 0);
+        r = h.liquidate(shallower, PRICE, 0);
+        assertEq(r.deferredCount, 1, "deferred all the same");
+        assertEq(h.claimable(address(this)), (cap + 1) * BazaarTypes.MIN_LIQUIDATOR_REWARD, "not listed: no tip");
+        assertFalse(_listed(h.deferredList(), shallower), "untracked");
+        assertEq(h.bucketSize(shallower), SIZE, "still open");
+    }
+
+    function _listed(address[] memory list, address who) internal pure returns (bool) {
+        for (uint256 i = 0; i < list.length; i++) {
+            if (list[i] == who) return true;
+        }
+        return false;
+    }
+
+    // ----- Arrears netting: what the ledger owes the fund comes off the fund's payment first -----
+
+    /// @notice The same loss with the ledger owing the fund $7k from an earlier seizure it could
+    ///         only partly pay: $2k free, the $2k earmark, the $1k seizure and the $7k arrears
+    ///         back the $12k exactly, so the netting runs. The loss is paid net of the arrears
+    ///         and the $5k the fund holds covers the rest, with no deficit.
+    function test_nettingLoss_netsLedgerArrearsBeforeInsurancePays() public {
+        h.seedPending(true, SIZE, 60_000 * SCALE, 58_000 * SCALE, 0);
+        h.seedInsurance(4_000 * SCALE);
+        h.seedArrears(7_000 * SCALE);
+        h.setBucket(dave(), false, SIZE, 48_000 * SCALE, 1_000 * SCALE, 0);
+        uint256 ledgerBefore = h.deposits();
+
+        h.liquidate(dave(), PRICE, 0);
+
+        assertEq(h.pendingLiqSize(), 0, "equal opposite sizes fully net");
+        assertEq(h.arrears(), 0, "the loss consumed the whole arrears");
+        assertEq(h.insuranceFundBalance(), 0, "the fund paid the $5k left after netting");
+        assertEq(h.deficit(), 0, "no deficit: the fund covered the loss beyond the estates' collateral");
+        // The ledger gave up the $1k seizure and received the $5k net payment.
+        assertEq(h.deposits(), ledgerBefore - 1_000 * SCALE + 5_000 * SCALE, "ledger credited the net loss");
+    }
+
+    /// @notice Arrears count toward what the netting may spend, and short of covering the loss
+    ///         together with the rest of the backing they leave the position deferred: nothing
+    ///         is consumed and nothing booked.
+    function test_nettingLoss_arrearsShortOfTheLoss_defers() public {
+        h.seedPending(true, SIZE, 60_000 * SCALE, 58_000 * SCALE, 0);
+        h.seedInsurance(4_000 * SCALE);
+        h.seedArrears(3_000 * SCALE);
+        h.setBucket(dave(), false, SIZE, 48_000 * SCALE, 1_000 * SCALE, 0);
+
+        BazaarTypes.LiquidateResult memory r = h.liquidate(dave(), PRICE, 0);
+
+        // $2k free + $2k earmark + $1k seizure + $3k arrears = $8k against a $12k loss.
+        assertEq(r.deferredCount, 1, "deferred");
+        assertEq(h.arrears(), 3_000 * SCALE, "arrears untouched");
+        assertEq(h.pendingLiqSize(), SIZE, "inventory untouched");
+        assertEq(h.deficit(), 0, "nothing booked");
+    }
+
+    /// @notice A netting GAIN on a ledger too thin to pay it: the seizure takes what the ledger
+    ///         holds and the gain the ledger cannot pay is added to its arrears rather than
+    ///         dropped, so the fund's claim on the estates' value survives.
+    function test_nettingGain_thinLedgerCarriesTheGainAsArrears() public {
+        // Vault holds a long inherited at $40k entry (in profit at $50k).
+        h.seedPending(true, SIZE, 40_000 * SCALE, 38_000 * SCALE, 0);
+        h.seedInsurance(4_000 * SCALE);
+        // The ledger holds $500 against a $1k bucket: the seizure is capped at $500.
+        h.seedCollateral(500 * SCALE);
         h.setBucket(dave(), false, SIZE, 48_000 * SCALE, 1_000 * SCALE, 0);
 
         h.liquidate(dave(), PRICE, 0);
 
         assertEq(h.pendingLiqSize(), 0, "equal opposite sizes fully net");
-        assertEq(h.insuranceFundBalance(), 0, "insurance wiped by the netting loss");
-        // Short's $1k collateral is seized into insurance first (4k -> 5k), then the $12k netting
-        // loss (60k entry vs 48k) overruns it: deficit = 12k - 5k = 7k.
-        assertEq(h.deficit(), 7_000 * SCALE, "overrun recorded as realized deficit");
-        // The reward is judged after the netting: an emptied fund cannot pay it, so it is skipped.
-        assertEq(h.claimable(address(this)), 0, "no reward from a wiped fund");
+        assertEq(h.deposits(), 0, "the ledger gave up everything it held");
+        // $500 of unpaid seizure plus the $8k netting gain (48k − 40k) the empty ledger could not pay.
+        assertEq(h.arrears(), 8_500 * SCALE, "unpaid seizure and uncollected gain are both owed to the fund");
+        // The liquidator is paid 2 bp of the netted unit at $50k: $10.
+        assertEq(h.claimable(address(this)), 10 * SCALE, "the rate on what the netting retired");
+        assertEq(
+            h.insuranceFundBalance(), 4_500 * SCALE - 10 * SCALE, "fund holds base + the cash seized, less the reward"
+        );
+        assertEq(h.deficit(), 0);
+    }
+}
+
+// ==================== netting reward ====================
+
+/// @notice The rate a liquidation earns on what its nettings retire. A position seized against
+///         an opposite inventory cancels the overlap at once, which takes that much exposure off
+///         the fund just as an unload sale does, so its account earns LIQUIDATION_FEE_EBP of the
+///         overlap's notional at the liquidation price when that beats its flat reward. Each
+///         account earns its own larger figure, so batching changes nothing. What the payment
+///         holds beyond the nettings' rate is the credit handed to the inline unload
+///         (LiquidateResult.unloadPrepaid), which pays its own rate on what it sells only past
+///         that credit.
+///
+///         Every inventory here is staged at the oracle with no earmark and every opposing
+///         position enters at the oracle, so a netting's entry gap is zero: it is always
+///         affordable and moves the fund only by the seizure and the reward.
+contract NettingRewardTest is Test {
+    uint256 internal constant SCALE = 1e18;
+    uint256 internal constant PRICE = 50_000e18;
+    uint256 internal constant FLOOR = BazaarTypes.MIN_LIQUIDATOR_REWARD;
+
+    NettingHarness internal h;
+    address internal dave = makeAddr("dave");
+    address internal erin = makeAddr("erin");
+    address internal frank = makeAddr("frank");
+
+    function setUp() public {
+        h = new NettingHarness();
+        h.seedCollateral(1_000_000e18);
+        h.seedInsurance(1_000e18);
+    }
+
+    /// @dev LIQUIDATION_FEE_EBP of `size` at PRICE, computed as processLiquidations does.
+    function _rate(uint256 size) internal pure returns (uint256) {
+        return (size * PRICE / SCALE) * BazaarTypes.LIQUIDATION_FEE_EBP / BazaarTypes.EBP_SCALE;
+    }
+
+    /// @dev An inventory of `size` on `isLong`, entered at PRICE, with nothing earmarked.
+    function _inventory(bool isLong, uint256 size) internal {
+        uint256 notional = size * PRICE / SCALE;
+        h.seedPending(isLong, size, notional, notional, 0);
+    }
+
+    /// @dev A position of `size` entered at PRICE with `collateral`, under maintenance at PRICE
+    ///      whenever the collateral is below 1.5% of its notional.
+    function _position(address user, bool isLong, uint256 size, uint256 collateral) internal {
+        h.setBucket(user, isLong, size, size * PRICE / SCALE, collateral, 0);
+    }
+
+    function _three(address a, address b, address c) internal pure returns (address[] memory out) {
+        out = new address[](3);
+        out[0] = a;
+        out[1] = b;
+        out[2] = c;
+    }
+
+    /// @notice A netting that retires the whole inventory earns 2 bp of its notional, $10 for a
+    ///         unit at $50k, where the flat reward alone would pay $0.05.
+    function test_fullNetting_paysTheRateOnTheNettedNotional() public {
+        _inventory(true, SCALE);
+        _position(dave, false, SCALE, 10e18);
+
+        BazaarTypes.LiquidateResult memory r = h.liquidate(dave, PRICE, 0);
+
+        assertEq(r.liquidatedCount, 1, "seized");
+        assertEq(h.pendingLiqSize(), 0, "netted to zero");
+        assertEq(_rate(SCALE), 10e18, "premise: 2 bp of $50,000");
+        assertEq(h.claimable(address(this)), 10e18, "the rate on what the netting retired");
+        assertEq(r.unloadPrepaid, 0, "the netting rate spent the whole payment");
+        assertEq(h.insuranceFundBalance(), 1_000e18 + 10e18 - 10e18, "the fund received the seizure and paid the rate");
+    }
+
+    /// @notice An estate larger than the inventory nets only the overlap; the rest becomes the
+    ///         new inventory, exposure moved onto the fund, and earns nothing until it is sold.
+    function test_flipNetting_paysTheRateOnTheOverlapOnly() public {
+        _inventory(true, SCALE);
+        _position(dave, false, 3 * SCALE, 30e18);
+
+        BazaarTypes.LiquidateResult memory r = h.liquidate(dave, PRICE, 0);
+
+        assertEq(h.pendingLiqSize(), 2 * SCALE, "two units left over");
+        assertFalse(h.pendingLiqIsLong(), "now on the estate's side");
+        assertEq(h.claimable(address(this)), _rate(SCALE), "2 bp of the one unit netted, not of all three");
+        assertEq(r.unloadPrepaid, 0, "nothing left to credit against the walk");
+    }
+
+    /// @notice A netting smaller than the inventory nets its own size.
+    function test_partialNetting_paysTheRateOnTheEstate() public {
+        _inventory(true, 3 * SCALE);
+        _position(dave, false, SCALE, 10e18);
+
+        h.liquidate(dave, PRICE, 0);
+
+        assertEq(h.pendingLiqSize(), 2 * SCALE, "two units of inventory survive");
+        assertTrue(h.pendingLiqIsLong(), "on the inventory's side");
+        assertEq(h.claimable(address(this)), _rate(SCALE), "2 bp of the unit the estate retired");
+    }
+
+    /// @notice Below $250 netted, 2 bp is under the flat reward, which stands. The walk is then
+    ///         credited with what the flat reward pays beyond the netting rate, so that a sale
+    ///         earns only what its own rate adds past the flat total.
+    function test_smallNetting_flatRewardGoverns_walkCreditedWithTheRest() public {
+        uint256 size = 0.0002e18; // $10 at $50k
+        _inventory(true, size);
+        _position(dave, false, size, 0.1e18); // under the $0.15 maintenance line
+
+        BazaarTypes.LiquidateResult memory r = h.liquidate(dave, PRICE, 0);
+
+        uint256 rate = _rate(size);
+        assertEq(rate, 0.002e18, "premise: 2 bp of $10");
+        assertEq(h.claimable(address(this)), FLOOR, "the flat reward stands");
+        assertEq(r.unloadPrepaid, FLOOR - rate, "the walk is credited with the flat reward less the netting rate");
+    }
+
+    /// @notice Each account is paid its own larger figure: a $50 netting, whose 2 bp is a cent,
+    ///         earns its flat reward, and the two same-side seizures after it earn theirs. The
+    ///         walk is credited with the three flat rewards less the cent the netting's rate holds.
+    function test_smallNettingAndTwoSeizures_eachAccountEarnsItsOwnLarger() public {
+        uint256 size = 0.001e18; // $50 at $50k
+        _inventory(true, size);
+        _position(dave, false, size, 0.5e18); // nets the inventory away
+        _position(erin, false, size, 0.5e18); // seeds a short inventory
+        _position(frank, false, size, 0.5e18); // adds to it
+
+        BazaarTypes.LiquidateResult memory r = h.liquidateMany(_three(dave, erin, frank), PRICE, 0);
+
+        assertEq(r.liquidatedCount, 3, "all three seized");
+        assertEq(h.pendingLiqSize(), 2 * size, "erin and frank are the new inventory");
+        assertEq(h.claimable(address(this)), 3 * FLOOR, "three flat rewards, not three plus the rate");
+        assertEq(r.unloadPrepaid, 3 * FLOOR - _rate(size), "the flat total less the netting rate");
+    }
+
+    /// @notice A large netting and a small seizure in one call earn what two calls would: the
+    ///         netting's $10 and the seizure's $0.05, where one maximum over the call would drop
+    ///         the $0.05 and pay a keeper to split the batch.
+    function test_largeNettingAndASeizure_payWhatTwoCallsWould() public {
+        _inventory(true, SCALE);
+        _position(dave, false, SCALE, 10e18); // nets the inventory away: $10
+        _position(erin, false, 0.001e18, 0.5e18); // seeds a short inventory: $0.05
+        address[] memory users = new address[](2);
+        users[0] = dave;
+        users[1] = erin;
+
+        BazaarTypes.LiquidateResult memory r = h.liquidateMany(users, PRICE, 0);
+
+        assertEq(r.liquidatedCount, 2, "both seized");
+        assertEq(h.claimable(address(this)), _rate(SCALE) + FLOOR, "the netting's rate and the seizure's flat reward");
+        assertEq(r.unloadPrepaid, FLOOR, "erin's flat reward is credited against the walk that sells her");
+    }
+
+    /// @notice A cap between the netting's rate and its flat reward: the fund pays the free
+    ///         capital it has, and the walk is credited only with what that payment holds beyond
+    ///         the rate.
+    function test_capBetweenTheRateAndTheFlatReward_creditIsWhatWasPaidPastTheRate() public {
+        h.seedInsurance(0);
+        uint256 size = 0.0002e18; // $10 at $50k: a $0.002 rate against the $0.05 floor
+        _inventory(true, size);
+        _position(dave, false, size, 0.03e18); // its $0.03 seizure is the fund's only free capital
+
+        BazaarTypes.LiquidateResult memory r = h.liquidate(dave, PRICE, 0);
+
+        assertEq(h.claimable(address(this)), 0.03e18, "capped at the $0.03 the fund holds free");
+        assertEq(r.unloadPrepaid, 0.03e18 - _rate(size), "the payment less the netting's rate");
+    }
+
+    /// @notice Each netting is measured against the inventory left by the one before it: two
+    ///         one-unit estates against 1.5 units net 1 and 0.5, and the second's other half
+    ///         becomes the new inventory.
+    function test_twoNettings_eachMeasuredAgainstTheInventoryLeft() public {
+        _inventory(true, 1.5e18);
+        _position(dave, false, SCALE, 10e18);
+        _position(erin, false, SCALE, 10e18);
+        address[] memory users = new address[](2);
+        users[0] = dave;
+        users[1] = erin;
+
+        BazaarTypes.LiquidateResult memory r = h.liquidateMany(users, PRICE, 0);
+
+        assertEq(r.liquidatedCount, 2, "both seized");
+        assertEq(h.pendingLiqSize(), 0.5e18, "half of erin's unit is left over");
+        assertFalse(h.pendingLiqIsLong(), "on the estates' side");
+        assertEq(h.claimable(address(this)), _rate(1.5e18), "2 bp of the 1.5 units netted");
+    }
+
+    /// @notice The netting rate is paid like the flat part: capped at free capital. A fund that
+    ///         holds only the netted estate's seizure pays that and no more, and credits the
+    ///         walk with nothing.
+    function test_nettingRate_cappedAtFreeCapital() public {
+        h.seedInsurance(0);
+        _inventory(true, SCALE);
+        _position(dave, false, SCALE, 4e18); // its $4 seizure is the fund's only free capital
+
+        BazaarTypes.LiquidateResult memory r = h.liquidate(dave, PRICE, 0);
+
+        assertEq(h.pendingLiqSize(), 0, "netted to zero");
+        assertEq(h.claimable(address(this)), 4e18, "the $10 rate, capped at the $4 the fund holds free");
+        assertEq(r.unloadPrepaid, 0, "a capped payment leaves nothing to credit");
+        assertEq(h.insuranceFundBalance(), 0, "the fund paid out its free capital and no more");
+    }
+
+    /// @notice A netting the fund cannot afford is deferred, not run: the account earns the flat
+    ///         reward for its recording and the rate on nothing.
+    function test_deferredNetting_earnsNoRate() public {
+        // A unit inherited at $60k entry, bankrupt at $58k ($2k earmarked), against a short from
+        // $48k with $1k: the $12k entry gap is past the $2k free, the $2k earmark and the $1k seizure.
+        h.seedPending(true, SCALE, 60_000 * SCALE, 58_000 * SCALE, 0);
+        h.seedInsurance(4_000 * SCALE);
+        h.setBucket(dave, false, SCALE, 48_000 * SCALE, 1_000 * SCALE, 0);
+
+        BazaarTypes.LiquidateResult memory r = h.liquidate(dave, PRICE, 0);
+
+        assertEq(r.deferredCount, 1, "deferred");
+        assertEq(h.pendingLiqSize(), SCALE, "nothing netted");
+        assertEq(h.claimable(address(this)), FLOOR, "the recording tip alone");
+        assertEq(r.unloadPrepaid, FLOOR, "all of it credited against the walk");
+    }
+
+    /// @notice Whatever the two sizes, the call pays max(flat, 2 bp of the overlap) and credits
+    ///         the walk with what that leaves past the netting rate.
+    function testFuzz_netting_paysTheLargerOfFlatAndTheRateOnTheOverlap(uint256 inventorySize, uint256 estateSize)
+        public
+    {
+        // From the $5 order minimum to 100 BTC on each side, so the flat part is the full floor.
+        inventorySize = bound(inventorySize, 0.0001e18, 100e18);
+        estateSize = bound(estateSize, 0.0001e18, 100e18);
+        h.seedInsurance(1_000_000e18);
+        _inventory(true, inventorySize);
+        _position(dave, false, estateSize, 0); // no collateral: insolvent at any size
+
+        BazaarTypes.LiquidateResult memory r = h.liquidate(dave, PRICE, 0);
+
+        uint256 overlap = inventorySize < estateSize ? inventorySize : estateSize;
+        uint256 rate = _rate(overlap);
+        uint256 paid = rate > FLOOR ? rate : FLOOR;
+        assertEq(h.claimable(address(this)), paid, "max(flat, rate on the overlap)");
+        assertEq(r.unloadPrepaid, paid - rate, "the walk is credited with the flat part past the rate");
+        uint256 left = inventorySize > estateSize ? inventorySize - estateSize : estateSize - inventorySize;
+        assertEq(h.pendingLiqSize(), left, "the overlap left the books");
     }
 }
 
@@ -556,6 +1173,8 @@ contract VaultFundingNettingTest is Test {
 ///         standing up a full BazaarPair.
 contract AdlHarness {
     mapping(uint256 => BazaarTypes.Order) public orders;
+    BazaarTypes.FeeEscrow internal feeEscrow;
+    address[] internal deferred;
     BazaarTypes.OrderBook internal book;
     mapping(address => BazaarTypes.PositionBucket) public positionBuckets;
     BazaarTypes.Vault public vault;
@@ -636,7 +1255,18 @@ contract AdlHarness {
         returns (BazaarTypes.AdlResult memory)
     {
         return AdlLib.executeAdlCore(
-            orders, book, positionBuckets, vault, winners, params, adlEpoch, adlDepositEpoch, adlWindowDeposits
+            orders,
+            book,
+            positionBuckets,
+            vault,
+            feeEscrow,
+            deferred,
+            winners,
+            winners[0:0],
+            params,
+            adlEpoch,
+            adlDepositEpoch,
+            adlWindowDeposits
         );
     }
 }
@@ -670,7 +1300,7 @@ contract Phase3AdlGuardTest is Test {
             currentPrice: 100 * SCALE,
             currentFundingIndex: 0,
             marginRequirements: BazaarTypes.MarginRequirements({
-                imrBp: 2_000, mmrBp: 1_000, lastUpdateTs: 0, laggedMmrBp: 0, laggedMmrTs: 0
+                imrBp: 2_000, mmrBp: 1_000, lastUpdateTs: 0, laggedMmrBp: 0
             }),
             pairId: bytes32(uint256(0xBAB)),
             adlId: 0,
@@ -706,7 +1336,11 @@ contract Phase3AdlGuardTest is Test {
         assertEq(r.eligibleCount, 1, "pure-profit winner is eligible, not skipped");
         assertEq(r.totalLiqSize, 1 * SCALE, "closed in full");
         assertEq(harness.bucketCollateral(BAD_USER), 50 * SCALE, "credit = PnL on real (zero) collateral");
-        assertEq(harness.vaultInsurance(), 10 * SCALE, "inventory closed at its own basis: insurance untouched");
+        // Closed at its own basis, the inventory moves the fund only by the executor's 0.1% of
+        // the $10 the close averted against the $90 mark.
+        assertEq(
+            harness.vaultInsurance(), 10 * SCALE - 0.01e18, "inventory closed at its own basis: only the reward leaves"
+        );
     }
 
     /// @notice Zero-collateral winner ranks FIRST (descending-score order) ahead of a normal
@@ -775,6 +1409,13 @@ contract Phase3AdlGuardTest is Test {
             });
             winners[i] = w;
         }
+        // Identical positions score identically, and equal scores are submitted by ascending
+        // address.
+        for (uint256 i = 1; i < 6; i++) {
+            for (uint256 j = i; j > 0 && winners[j] < winners[j - 1]; j--) {
+                (winners[j], winners[j - 1]) = (winners[j - 1], winners[j]);
+            }
+        }
 
         // currentPrice at snapshot equals adlSnapshotPrice = $100 (per default params), which
         // is below bankruptcy $200 — vault is in loss → ADL pending state makes sense.
@@ -796,6 +1437,39 @@ contract Phase3AdlGuardTest is Test {
         assertEq(harness.bucketSize(winners[3]), 1 * SCALE, "fourth untouched");
         assertEq(harness.bucketSize(winners[4]), 1 * SCALE, "fifth untouched");
         assertEq(harness.bucketSize(winners[5]), 1 * SCALE, "sixth untouched");
+    }
+
+    /// @notice The band the batch is sized against reads the lower of the current rate and the
+    ///         lagged minimum. With the current rate at the 5% cap but a 2.5% minimum over the
+    ///         day, finishing at the narrower edge ($146.25) costs $53.75 a unit against the same
+    ///         $260 fund, so the cap lands at 62.5 / 53.70 = 1.16 units rather than 1.48.
+    function test_BatchCap_BandReadsTheLaggedMinimum() public {
+        harness.setPendingLiq({size: 6 * SCALE, bankruptcyNotional: 1_200 * SCALE, isLong: true});
+        harness.setOI({
+            totalLongOI: 0, totalShortOI: 6 * SCALE, longWeightedEntrySum: 0, shortWeightedEntrySum: 1_200 * SCALE
+        });
+        harness.setVaultInsurance(260 * SCALE);
+        address[] memory winners = new address[](6);
+        for (uint256 i = 0; i < 6; i++) {
+            address w = address(uint160(uint256(keccak256(abi.encode("winner", i)))));
+            harness.setBucket({
+                user: w, isLong: false, size: 1 * SCALE, entryValue: 200 * SCALE, collateral: 10 * SCALE
+            });
+            winners[i] = w;
+        }
+        for (uint256 i = 1; i < 6; i++) {
+            for (uint256 j = i; j > 0 && winners[j] < winners[j - 1]; j--) {
+                (winners[j], winners[j - 1]) = (winners[j - 1], winners[j]);
+            }
+        }
+        BazaarTypes.AdlParams memory p = _params();
+        p.currentPrice = 150 * SCALE;
+        p.adlSnapshotPrice = 150 * SCALE;
+        p.marginRequirements.laggedMmrBp = 250;
+
+        BazaarTypes.AdlResult memory r = harness.execAdl(winners, p);
+        assertApproxEqRel(r.totalLiqSize, 1.163873e18, 0.001e18, "$62.5 excess / $53.70 per unit");
+        assertLt(r.totalLiqSize, 1.48e18, "narrower band, smaller batch than at the 5% cap");
     }
 
     // ╔══════════════════════════════════════════════════════════════╗
@@ -930,6 +1604,8 @@ contract Phase3AdlGuardTest is Test {
 /// @notice Harness exposing VaultHealthLib.checkLiqExposure for direct testing.
 contract VaultHealthHarness {
     BazaarTypes.Vault public vault;
+    mapping(address => BazaarTypes.PositionBucket) internal positionBuckets;
+    address[] internal deferred;
 
     /// @dev `seizedCollateral` reconstructs the entry basis the loss is measured from: a long's
     ///      equity reaches zero that far BELOW entry, a short's that far above. The two must stay
@@ -970,7 +1646,17 @@ contract VaultHealthHarness {
         bool adlLongs
     ) external view returns (VaultHealthLib.LiqExposureResult memory) {
         return VaultHealthLib.checkLiqExposure(
-            vault, currentPrice, isAdlPending, adlPendingSince, adlSnapshotPrice, adlLongs, int256(0), int256(0), MMR_BP
+            vault,
+            positionBuckets,
+            deferred,
+            currentPrice,
+            isAdlPending,
+            adlPendingSince,
+            adlSnapshotPrice,
+            adlLongs,
+            int256(0),
+            int256(0),
+            MMR_BP
         );
     }
 
@@ -980,7 +1666,7 @@ contract VaultHealthHarness {
         returns (VaultHealthLib.LiqExposureResult memory)
     {
         return VaultHealthLib.checkLiqExposure(
-            vault, currentPrice, false, 0, 0, false, currentFundingIndex, int256(0), MMR_BP
+            vault, positionBuckets, deferred, currentPrice, false, 0, 0, false, currentFundingIndex, int256(0), MMR_BP
         );
     }
 

@@ -15,17 +15,28 @@ contract MultiplierHarness {
         return RiskParamsLib.getInsuranceMultiplier(c, t);
     }
 
-    function stressMove(uint256 v, int256 g, uint256 rg, bool cont) external pure returns (uint256) {
-        return RiskParamsLib.stressMoveBp(v, g, rg, cont);
+    function stressMove(uint256 v, int256 slip, uint256 rg, bool cont) external pure returns (uint256) {
+        return RiskParamsLib.stressMoveBp(v, slip, rg, cont);
     }
 
+    /// @dev The target with no realized drift on record, i.e. the forecast leg alone.
     function targetRatio(uint256 m) external pure returns (uint256) {
-        return RiskParamsLib.getTargetInsuranceRatio(m);
+        return RiskParamsLib.getTargetInsuranceRatio(m, 0);
     }
 
-    /// @dev The composed reading both outputs are taken from, as calculateIMRandMMR composes it.
-    function targetFor(uint256 v, int256 g, uint256 rg, bool cont) external pure returns (uint256) {
-        return RiskParamsLib.getTargetInsuranceRatio(RiskParamsLib.stressMoveBp(v, g, rg, cont));
+    /// @dev The composed reading both outputs are taken from, as calculateIMRandMMR composes it,
+    ///      on a pair with no realized drift.
+    function targetFor(uint256 v, int256 slip, uint256 rg, bool cont) external pure returns (uint256) {
+        return RiskParamsLib.getTargetInsuranceRatio(RiskParamsLib.stressMoveBp(v, slip, rg, cont), 0);
+    }
+
+    /// @dev The same composition with a realized-drift leg competing against the forecast.
+    function targetForWithDrift(uint256 v, int256 slip, uint256 rg, bool cont, int256 drift)
+        external
+        pure
+        returns (uint256)
+    {
+        return RiskParamsLib.getTargetInsuranceRatio(RiskParamsLib.stressMoveBp(v, slip, rg, cont), drift);
     }
 
     function volCap() external pure returns (uint256) {

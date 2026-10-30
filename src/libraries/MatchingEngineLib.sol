@@ -7,6 +7,7 @@ import {BazaarTypes} from "./BazaarTypes.sol";
 import {BazaarMathLib} from "./BazaarMathLib.sol";
 import {BucketLib} from "./BucketLib.sol";
 import {FeeEscrowLib} from "./FeeEscrowLib.sol";
+import {FundingLib} from "./FundingLib.sol";
 import {OrderBookLib} from "./OrderBookLib.sol";
 import {RiskParamsLib} from "./RiskParamsLib.sol";
 
@@ -14,10 +15,11 @@ import {RiskParamsLib} from "./RiskParamsLib.sol";
 /// @notice Arrival-matching engine over the on-chain sorted book: an incoming order walks the
 ///         opposing list from its head while it crosses, fills at each resting maker's limit
 ///         price, and then either rests its remainder in the book (GTC limits, via insertion
-///         hints) or cancels it (Market/StopLoss execution, IOC, post-only violation,
-///         self-match, step-cap, dust). A fill-or-kill arrival takes neither branch: it reverts
-///         unless the walk filled it completely. Also executes triggered stops and unloads vault
-///         liquidation inventory through the same fill machinery.
+///         hints), cancels it (Market, IOC, post-only violation, self-match, step-cap, dust), or
+///         — for a fired trigger order — leaves it live outside the book for its next
+///         execution. A fill-or-kill arrival takes none of these: it reverts unless the walk
+///         filled it completely. Also executes triggered stops and unloads vault liquidation
+///         inventory through the same fill machinery.
 ///         Runs via DELEGATECALL from BazaarPair — has direct storage access.
 ///
 /// Key invariants:
@@ -27,12 +29,16 @@ import {RiskParamsLib} from "./RiskParamsLib.sol";
 ///    against makers that may be newer than itself.)
 ///  • The book never rests crossed: every disposition that could leave a still-crossing
 ///    remainder (step-cap, far-side band breach, self-match, margin failure) cancels the
-///    incoming order.
+///    incoming order, or for a trigger order keeps it outside the book.
 ///  • The walk re-reads its side's head from storage every iteration and never carries a next
 ///    pointer across a settlement: a settlement unlinks the maker it just consumed or
-///    auto-cancels one that fails its margin gate, and can terminate the TAKER's own order
-///    through the oversize fence, so any cached pointer or cached liveness would go stale.
-///  • Margin checks always use normal IMR against the tx's cached price. Failure → auto-cancel.
+///    auto-cancels one that fails its margin gate, so any cached pointer would go stale. No
+///    fill can end the TAKER's own order — every account settled mid-walk is a maker's — and
+///    the walk re-reads the taker's stamps after each fill to hold that.
+///  • Margin checks judge each fill by the account it would leave at the tx's cached price —
+///    IMR on exposure it adds; on a reduction, IMR on the remainder or else a margin-to-MMR
+///    ratio no lower than before. A failing maker is auto-canceled; a failing taker is disposed
+///    of as above.
 ///  • Fills are banded only under the stale fallback (±MAX_STALE_DEVIATION_BP of the cached
 ///    price); fresh-oracle fills are unbanded — the margin gates and FundingLib's index clamp
 ///    carry the defense. A stale maker priced beyond the band away from the taker cancels the
@@ -58,6 +64,10 @@ library MatchingEngineLib {
         uint256 orderId;
         uint256 remaining;
         BazaarTypes.Order order;
+        // Why the order is being auto-canceled, set by the gate that kills it. It rides here rather
+        // than as an argument to _autoCancelOrder: the optimizer compiles a separate copy of a
+        // function for each distinct literal passed to it, and there is one reason per gate.
+        BazaarTypes.CancelReason cancelReason;
     }
 
     /// @dev The taker's bucket image and per-walk aggregates, carried in memory across the
@@ -137,7 +147,11 @@ library MatchingEngineLib {
     /// @dev Untriggered stops (StopLimit/StopLoss whose trigger the fresh price does not meet,
     ///      or any stop created under the stale fallback) do not walk: they rest outside the
     ///      book until executeTriggers fires them. A stop whose trigger a fresh price already
-    ///      meets arms immediately here, with no keeper and no tip.
+    ///      meets arms immediately here, with no keeper: the share of its bounty this execution
+    ///      earns goes back to the owner's claimable balance, and the rest stays escrowed for
+    ///      whoever finishes it. A stop the stale fallback leaves unjudged is stamped with this
+    ///      block (Order.restedBlock), so that an execution in the same block pays the owner
+    ///      too (executeTriggers); a stop a fresh price left unmet carries no stamp.
     ///
     ///      A fill-or-kill taker always reaches its enforcement point (_disposeRemainder):
     ///      creation confines that time-in-force to Limit and Market, neither of which is
@@ -154,6 +168,7 @@ library MatchingEngineLib {
         BazaarTypes.MatchHints memory hints,
         BazaarTypes.ArrivalContext memory ctx
     ) external returns (BazaarTypes.WalkSummary memory sum) {
+        bool triggerGated;
         {
             BazaarTypes.Order storage t = orders[takerId];
             BazaarTypes.OrderType ot = t.orderType;
@@ -161,37 +176,94 @@ library MatchingEngineLib {
             if (ot == BazaarTypes.OrderType.Market && ctx.isOracleStale) {
                 revert MatchingEngineLib__BlockedOracleStale();
             }
-            if (_isTriggerGated(ot)) {
-                if (ctx.isOracleStale || !_triggerReached(ot, t.isLong, t.triggerPrice, ctx.cachedPrice)) {
+            triggerGated = _isTriggerGated(ot);
+            if (triggerGated) {
+                if (ctx.isOracleStale) {
+                    // The stale fallback cannot judge the trigger, so the stop waits unarmed
+                    // whatever the live price says. The block it was left in is stamped: an
+                    // execution in that block pays the bounty to the owner (executeTriggers).
+                    t.restedBlock = uint32(ctx.currentBlock);
                     return sum;
                 }
+                if (!_triggerReached(ot, t.isLong, t.triggerPrice, ctx.cachedPrice)) return sum;
             }
         }
         uint256 cap = _resolveCap(hints.maxSteps);
         BazaarTypes.ArrivalResult memory res = _initResult(pairVault, cap);
+        // Only trigger types hold a bounty, so the settle (and its escrow read) is skipped for
+        // the rest. The fill count before the walk is read from storage rather than written as
+        // the zero a fresh order has: a literal here would make the optimizer compile a second
+        // copy of _settleBounty specialised to it.
+        uint256 filledBefore;
+        if (triggerGated) filledBefore = orders[takerId].filledSize;
         _walkTaker(orders, positionBuckets, userActiveLimitOrders, book, takerId, hints, cap, ctx, res);
+        if (triggerGated) {
+            _settleBounty(
+                orders,
+                feeEscrow,
+                ctx.pairId,
+                takerId,
+                filledBefore,
+                res.takerRemainingAtStart,
+                orders[takerId].creator
+            );
+        }
         _finalizeTx(pairVault, feeEscrow, ctx, res);
         sum = _summarize(res);
     }
 
-    /// @notice Execute triggered StopLimit/StopLoss orders against a fresh oracle price.
+    /// @notice Execute triggered StopLimit/StopLoss/TakeProfit orders against a fresh oracle
+    ///         price. Each execution earns the caller the share of the order's escrowed bounty
+    ///         that it filled or armed (_settleBounty); nothing is taken from the owner's
+    ///         collateral, so a stop on a thin account pays its executor like any other. An
+    ///         execution in the block a stale-fallback creation left the order waiting in pays
+    ///         that share to the owner instead.
     /// @dev Per order, every disqualifier is a silent skip — racing keepers must not revert each
     ///      other's batches: wrong type, terminal state, already in the book (an armed
-    ///      StopLimit), expiry, or an unmet trigger. The keeper tip is charged from the owner's
-    ///      bucket collateral before the walk (so the fill margin checks see post-tip
-    ///      collateral) and accrues to the keeper's claimable balance; an owner who cannot
-    ///      cover it has the stop auto-canceled instead, mirroring the fee-coverage rule in
-    ///      _checkMargin.
+    ///      StopLimit), expiry, an unmet trigger, or a StopLimit whose resting slot the keeper's
+    ///      hints cannot reach (resolved before the walk, so a skipped stop is left untouched).
+    ///      A stop stays live outside the book, eligible again on the next call, when its walk
+    ///      died on the node budget, its owner's own order at the head or a fill its margin could
+    ///      not carry; when a StopLoss or TakeProfit ran out of crossing liquidity; and when a
+    ///      StopLimit with less than MIN_ORDER_LIFETIME_BLOCKS of its life left ends its walk
+    ///      with more than dust over. Otherwise a StopLimit's remainder rests in the book or is
+    ///      canceled as dust, and a StopLoss or TakeProfit whose position is gone is canceled
+    ///      (_disposeRemainder).
+    ///
+    ///      An execution in the block a creation on the stale fallback left the order in pays
+    ///      the owner because no keeper service was needed: a trigger the fresh price already
+    ///      meets arms on arrival, with no keeper and the bounty returned (executeArrival), so
+    ///      the stale fallback — which judges no trigger — is the one way an order whose trigger
+    ///      the live price meets reaches this function unarmed, and whether a creation carries a
+    ///      price is the submitter's choice, since priceUpdate sits outside the signed payload.
+    ///      Paying the owner for an execution in that block leaves a relayer nothing to gain from
+    ///      withholding the update and firing the signed order itself; a keeper that
+    ///      independently fires such a stop in that block forgoes a bounty the owner would have
+    ///      kept had the creation carried the price. An order whose creation read a fresh price
+    ///      carries no stamp (executeArrival), so a keeper completing it in that block — a
+    ///      take-profit the arrival could only part-fill, against liquidity that came later in
+    ///      the block — is paid as usual. The stamp is read before the walk, since a StopLimit
+    ///      remainder that rests re-stamps it with this block.
     ///
     ///      The whole batch shares one accumulator and settles storage once at the end. What
     ///      keeps one owner's outcome from coupling to another's is preserved per exec: each
-    ///      stop's tip is charged against its own bucket, each walk margin-gates its own fills
-    ///      against its own bucket, and the shared fee budget only ever shrinks by charges that
-    ///      settle (a waived or refunded attempt restores exactly what it reserved) — the same
-    ///      running-ledger sequence a per-exec settle would produce, without rewriting the
-    ///      vault slots per exec.
-    /// @return executedCount Number of stops that actually fired (fills or armed insertions).
+    ///      walk margin-gates its own fills against its own bucket, and the shared fee budget
+    ///      only ever shrinks by charges that settle (a waived or refunded attempt restores
+    ///      exactly what it reserved) — the same running-ledger sequence a per-exec settle would
+    ///      produce, without rewriting the vault slots per exec.
+    /// @param orders The pair's order storage.
+    /// @param positionBuckets The pair's position buckets.
+    /// @param userActiveLimitOrders Each owner's live Limit/StopLimit ids.
+    /// @param pairVault The pair's vault aggregates.
+    /// @param feeEscrow The pair's fee and bounty escrow.
+    /// @param book The pair's book heads/counts.
+    /// @param execs The orders to fire, each with its walk and insertion hints.
+    /// @param ctx The transaction's matching context.
+    /// @param seqCounter The pair's id counter, the source of an armed StopLimit's queue position.
+    /// @return executedCount Number of eligible orders whose walk ran, whether or not it filled.
     /// @return sum Aggregate fill totals across all execs for the pair's post-walk hooks.
+    /// @return nextSeq seqCounter advanced past every queue position the batch drew; the pair
+    ///         stores it back as the counter.
     function executeTriggers(
         mapping(uint256 => BazaarTypes.Order) storage orders,
         mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
@@ -200,8 +272,9 @@ library MatchingEngineLib {
         BazaarTypes.FeeEscrow storage feeEscrow,
         BazaarTypes.OrderBook storage book,
         BazaarTypes.TriggerExec[] calldata execs,
-        BazaarTypes.ArrivalContext memory ctx
-    ) external returns (uint256 executedCount, BazaarTypes.WalkSummary memory sum) {
+        BazaarTypes.ArrivalContext memory ctx,
+        uint256 seqCounter
+    ) external returns (uint256 executedCount, BazaarTypes.WalkSummary memory sum, uint256 nextSeq) {
         if (execs.length == 0 || execs.length > BazaarTypes.MAX_TRIGGER_EXECS_PER_CALL) {
             revert MatchingEngineLib__InvalidTriggerBatch(execs.length);
         }
@@ -211,7 +284,6 @@ library MatchingEngineLib {
         uint256 cap = _resolveCap(0);
         // The integrator-dedup buffer must hold every fill of every exec in the batch.
         BazaarTypes.ArrivalResult memory res = _initResult(pairVault, cap * execs.length);
-        uint256 tipsTotal;
         for (uint256 i; i < execs.length; ++i) {
             uint256 orderId = execs[i].orderId;
             BazaarTypes.Order storage o = orders[orderId];
@@ -220,66 +292,120 @@ library MatchingEngineLib {
             if (o.creator == address(0) || o.canceledBlock != 0 || o.filledBlock != 0 || o.inBook) continue;
             if (o.expiryBlock < ctx.currentBlock) continue;
             if (!_triggerReached(ot, o.isLong, o.triggerPrice, ctx.cachedPrice)) continue;
-            {
-                BazaarTypes.PositionBucket storage bucket = positionBuckets[o.creator];
-                // The tip debits the deposits ledger too, and D can legitimately sit below an
-                // individual bucket's collateral (realized-but-unwithdrawn PnL). res.feeBudget
-                // IS the batch's running view of D (seeded from it, drawn down by every tip and
-                // settled fee charge). Skip rather than underflow: reverting here would take
-                // every other owner's stop in the batch down with it, exactly when the vault is
-                // most distressed.
-                if (res.feeBudget < BazaarTypes.TRIGGER_TIP) continue;
-                if (bucket.collateral < BazaarTypes.TRIGGER_TIP) {
-                    Head memory dead;
-                    dead.orderId = orderId;
-                    dead.order = o;
-                    _autoCancelOrder(orders, positionBuckets, userActiveLimitOrders, book, dead, ctx);
-                    continue;
-                }
-                unchecked {
-                    // Guarded by the collateral check above; the running budget mirrors D.
-                    bucket.collateral -= uint128(BazaarTypes.TRIGGER_TIP);
-                    res.feeBudget -= BazaarTypes.TRIGGER_TIP;
-                    tipsTotal += BazaarTypes.TRIGGER_TIP;
-                }
-            }
 
             BazaarTypes.MatchHints memory hints = execs[i].hints;
+            if (ot == BazaarTypes.OrderType.StopLimit) {
+                // A StopLimit is the one trigger type whose remainder rests, and resting it is
+                // the one step of an exec that can fail: past MAX_WALK_STEPS from the keeper's
+                // hints the book gives up, and a revert there would unwind every other owner's
+                // stop in the batch. Resolve the slot now, before the walk fills anything. That
+                // is sound because the walk never touches the side the stop rests on — it
+                // consumes the opposite side's head, and the TP/SL fence it runs cancels only
+                // orders that never rest — so a predecessor found here still brackets the slot
+                // when the remainder is placed. Unreachable means the keeper's view of the book
+                // is stale: skip like any other disqualifier, leaving the order exactly as it
+                // was for a keeper carrying fresh hints. Otherwise hand the found predecessor to
+                // the insert as an exact hint, so it links without a second walk.
+                //
+                // The stop joins its price level only now, so the slot is resolved under a fresh
+                // queue position from the id counter, the value an amend that moves an order also
+                // draws (BazaarTypes.Order). Under its creation id it would sort ahead of every
+                // order at that price created after it, including orders resting there since
+                // before it armed. The position is written once the slot is found and before the
+                // walk, so the insert that rests the remainder reads the value the slot was
+                // resolved under. A stop that does not end up resting — filled whole, canceled as
+                // dust, or left fired outside the book for its next execution, which draws again —
+                // leaves its drawn value unused, and a gap in the counter is harmless.
+                uint48 seq = uint48(seqCounter); // counter values stay far below 2^48 (BazaarTypes.Order)
+                (bool found, uint64 pred) = OrderBookLib.locate(orders, book, orderId, seq, hints);
+                if (!found) continue;
+                o.prioritySeq = seq;
+                unchecked {
+                    ++seqCounter;
+                }
+                hints.pred = pred;
+                hints.pred2 = 0;
+                hints.pred3 = 0;
+                hints.pred4 = 0;
+            }
+
             // The keeper's insertion hints are safe to honour (every candidate is verified
-            // against the real neighbours before linking), but its step budget is NOT: hitting
-            // the cap while still crossing CANCELS the remainder, so a keeper choosing
-            // maxSteps = 1 could fill a stop against one dust node and destroy the rest of a
-            // protective order it was paid to execute. The stop's owner never authorised this
-            // caller, so the budget is always the protocol default here.
+            // against the real neighbours before linking), but its step budget is NOT: the
+            // budget decides how much of the order executes, and the stop's owner never
+            // authorised this caller, so the walk always runs the protocol default here.
             hints.maxSteps = 0;
             // The node cap bounds each stop's own walk; the fee budget and fill aggregates
             // carry across the batch.
             res.nodesVisited = 0;
+            uint256 filledBefore = o.filledSize;
+            address recipient = o.restedBlock == uint32(ctx.currentBlock) ? o.creator : msg.sender;
             _walkTaker(orders, positionBuckets, userActiveLimitOrders, book, orderId, hints, cap, ctx, res);
+            _settleBounty(orders, feeEscrow, ctx.pairId, orderId, filledBefore, res.takerRemainingAtStart, recipient);
             unchecked {
                 ++executedCount;
             }
         }
-        // Tips leave the deposits ledger and become a claimable liability — the keeper pulls
-        // them via claimFees, so no transfer can fail mid-batch.
-        if (tipsTotal > 0) {
-            pairVault.totalCollateralDeposited -= tipsTotal;
-            FeeEscrowLib.credit(feeEscrow, ctx.pairId, msg.sender, tipsTotal);
-        }
         _finalizeTx(pairVault, feeEscrow, ctx, res);
         sum = _summarize(res);
+        nextSeq = seqCounter;
+    }
+
+    /// @dev Assign the part of a trigger order's escrowed bounty that one execution earned.
+    ///      `recipient` is who earns it: the keeper for executeTriggers, or the owner when no
+    ///      keeper service was rendered — an arrival-time execution, or one in the block a
+    ///      stale-fallback creation left the order in — so the share goes back to the owner's
+    ///      claimable balance. Paid in proportion to the size this execution filled out of what
+    ///      remained when it started, so a wall of dust that fills a sliver earns a sliver; the
+    ///      whole remainder pays out once the order completes or rests, because nothing is left
+    ///      for a later executor to do. An order the walk killed pays the executor for what it
+    ///      filled before the kill and returns the rest to the owner, since no executor can
+    ///      ever complete it. The proportion is over the remainder as the walk began it — a
+    ///      TP/SL's is capped to the position it could close — so the denominator is never
+    ///      smaller than the fill.
+    function _settleBounty(
+        mapping(uint256 => BazaarTypes.Order) storage orders,
+        BazaarTypes.FeeEscrow storage feeEscrow,
+        bytes32 pairId,
+        uint256 orderId,
+        uint256 filledBefore,
+        uint256 remainingAtStart,
+        address recipient
+    ) private {
+        uint256 held = feeEscrow.bounty[orderId];
+        if (held == 0) return;
+        BazaarTypes.Order storage o = orders[orderId];
+        uint256 pay;
+        if (o.filledBlock != 0 || o.inBook) {
+            pay = held;
+        } else {
+            uint256 filledNow = o.filledSize - filledBefore;
+            if (filledNow != 0) pay = Math.mulDiv(held, filledNow, remainingAtStart);
+        }
+        if (pay != 0) FeeEscrowLib.assignBounty(feeEscrow, pairId, orderId, recipient, pay);
+        // A walk that killed the order (a dust remainder, a position that is gone) still pays
+        // for what it closed; only the rest goes back to the owner.
+        if (o.canceledBlock != 0 && held != pay) {
+            FeeEscrowLib.assignBounty(feeEscrow, pairId, orderId, o.creator, held - pay);
+        }
     }
 
     /// @notice Cross the vault's pending liquidation inventory into the book, down to the unload
-    ///         bound and within the insurance fund's headroom (_planUnload), until the inventory,
-    ///         the crossing book, the headroom, or the node budget runs out. Shared by
-    ///         liquidate()'s inline unload and unloadVault.
-    /// @param payReward When true (the permissionless unloadVault path), the caller earns
-    ///        max(UNLOAD_BOUNTY_MIN, LIQUIDATION_FEE_EBP of unloaded notional) from insurance —
-    ///        gated by UNLOAD_BOUNTY_MIN_NOTIONAL so dust-sized unloads can't farm the flat
-    ///        floor, capped at the fund's free capital, and accrued to the caller's
-    ///        claimable balance (pulled via claimFees). liquidate()'s inline unload passes
-    ///        false: the liquidator is already paid per position.
+    ///         bound and within the insurance fund's headroom (RiskParamsLib.planUnload), until
+    ///         the inventory, the crossing book, the headroom, or the node budget runs out.
+    ///         Shared by liquidate()'s inline unload and unloadVault.
+    /// @param prepaid Who is paid and how. BazaarTypes.UNLOAD_BY_KEEPER for unloadVault: the
+    ///        caller earns LIQUIDATION_FEE_EBP of the unloaded notional, raised to
+    ///        UNLOAD_BOUNTY_MIN once the call unloads UNLOAD_BOUNTY_MIN_NOTIONAL or clears the
+    ///        inventory, so dust-sized unloads can't farm the flat floor. Otherwise the credit
+    ///        the enclosing liquidate() left (LiquidateResult.unloadPrepaid): what it already paid,
+    ///        after the fund's cap, less LIQUIDATION_FEE_EBP of the inventory its nettings retired;
+    ///        0 when the call only re-submitted listed accounts. The caller earns whatever
+    ///        LIQUIDATION_FEE_EBP of the unloaded notional exceeds it, so the call is paid its
+    ///        nettings' rate plus the larger of its remaining flat rewards and the rate on what it
+    ///        unloaded. Either way the payment is capped at the fund's free capital and, while the
+    ///        inventory left carries a loss at the mark, at what that capital above the reserve
+    ///        covers the loss by (RiskParamsLib.unloadRewardPayable), and accrued to the caller's
+    ///        claimable balance (pulled via claimFees).
     /// @return sum Fill totals for the pair's post-walk hooks.
     function unloadBook(
         mapping(uint256 => BazaarTypes.Order) storage orders,
@@ -289,17 +415,26 @@ library MatchingEngineLib {
         BazaarTypes.FeeEscrow storage feeEscrow,
         BazaarTypes.OrderBook storage book,
         uint256 maxSteps,
-        bool payReward,
+        uint256 prepaid,
         BazaarTypes.ArrivalContext memory ctx
     ) external returns (BazaarTypes.WalkSummary memory sum) {
-        if (pairVault.pendingLiqSize == 0) return sum;
+        // Nothing crosses against the stale fallback. The frozen mark is the last price anyone
+        // stored, while off-chain venues can already show where the market will reopen, so a
+        // maker who sees the reopen would take the inventory at the frozen mark only when it
+        // favours the vault: the fund would exit exactly when holding pays and hold when it loses.
+        // The inventory waits for a fresh mark instead. liquidate() still seizes against a
+        // fallback no older than MAX_LIQUIDATION_PRICE_AGE, so only its inline walk waits; a stale
+        // unloadVault fills nothing and earns nothing. Every gap-EMA sample the walk records is
+        // therefore measured against a fresh oracle, never one whose error would read as depth.
+        if (pairVault.pendingLiqSize == 0 || ctx.isOracleStale) return sum;
         uint256 cap = maxSteps == 0
             ? BazaarTypes.MAX_WALK_STEPS
             : (maxSteps < BazaarTypes.MAX_WALK_STEPS ? maxSteps : BazaarTypes.MAX_WALK_STEPS);
         BazaarTypes.ArrivalResult memory res = _initResult(pairVault, cap);
         // The vault unwinds its inherited side against the counterparties who take it over:
         // inherited longs sell to resting bids; inherited shorts buy from resting asks.
-        UnloadPlan memory plan = _planUnload(pairVault, ctx, payReward);
+        BazaarTypes.UnloadPlan memory plan =
+            RiskParamsLib.planUnload(pairVault, ctx.cachedPrice, ctx.cachedFundingIdx, ctx.marginReqs, prepaid);
 
         while (pairVault.pendingLiqSize > 0) {
             uint64 headId = plan.vaultIsLong ? book.bidHead : book.askHead;
@@ -312,6 +447,7 @@ library MatchingEngineLib {
             m.orderId = headId;
             m.order = orders[headId];
             if (m.order.expiryBlock < ctx.currentBlock) {
+                m.cancelReason = BazaarTypes.CancelReason.Expired;
                 _autoCancelOrder(orders, positionBuckets, userActiveLimitOrders, book, m, ctx);
                 continue;
             }
@@ -348,34 +484,41 @@ library MatchingEngineLib {
 
         _finalizeTx(pairVault, feeEscrow, ctx, res);
 
-        // The caller is paid the bps rate on whatever it actually unloaded. The flat floor is
-        // reserved for a call that did a whole unit of work — one that moved at least
-        // UNLOAD_BOUNTY_MIN_NOTIONAL, or finished the inventory. Granting the floor to every call
-        // would let a keeper slice one large unload into minimum-sized pieces and collect it on
-        // each, paying itself many times the intended rate out of insurance. Below that bar the
-        // rate still pays, because a keeper that drains every in-band maker on a thin book has
-        // done all the work available and must not come away with nothing. Slicing gains nothing
-        // under this rule: the bps total is identical however the unload is divided, and the
-        // floor can be earned at most once per inventory.
-        if (payReward) {
-            uint256 reward = Math.mulDiv(res.totalMatchedVolume, BazaarTypes.LIQUIDATION_FEE_EBP, BazaarTypes.EBP_SCALE);
+        // The caller is paid the bps rate on whatever it actually unloaded. For a keeper's
+        // unloadVault the flat floor is reserved for a call that did a whole unit of work — one
+        // that moved at least UNLOAD_BOUNTY_MIN_NOTIONAL, or finished the inventory. Granting the
+        // floor to every call would let a keeper slice one large unload into minimum-sized pieces
+        // and collect it on each, paying itself many times the intended rate out of insurance.
+        // Below that bar the rate still pays, because a keeper that drains every in-band maker on
+        // a thin book has done all the work available and must not come away with nothing.
+        // Slicing gains nothing under this rule: the bps total is identical however the unload
+        // is divided, and the floor can be earned at most once per inventory.
+        //
+        // A liquidation's walk pays only what the rate exceeds the credit its liquidations left,
+        // so the flat rewards and the rate on the sale are never both paid.
+        uint256 reward = Math.mulDiv(res.totalMatchedVolume, BazaarTypes.LIQUIDATION_FEE_EBP, BazaarTypes.EBP_SCALE);
+        if (prepaid == BazaarTypes.UNLOAD_BY_KEEPER) {
             if (res.totalMatchedVolume >= BazaarTypes.UNLOAD_BOUNTY_MIN_NOTIONAL || pairVault.pendingLiqSize == 0) {
                 if (reward < BazaarTypes.UNLOAD_BOUNTY_MIN) reward = BazaarTypes.UNLOAD_BOUNTY_MIN;
             }
-            // A walk that filled nothing earns nothing: no fills means totalMatchedVolume is 0,
-            // and the floor is unreachable because pendingLiqSize can only reach 0 through a fill.
-            // Capped at the fund's free capital: the seizure still earmarked against open
-            // inventory is what settles that inventory, and a reward drawn from it would
-            // resurface as a shortfall on the next fill, booked as deficit. The reserve may pay
-            // it — it is held for exactly the payouts no bound can refuse — the earmark may not.
-            // The reward moves from insurance into the claimable-fee escrow (pulled later via
-            // claimFees), so the unload itself never runs a token transfer.
-            uint256 free = RiskParamsLib.insuranceFreeCapital(pairVault);
-            if (reward > free) reward = free;
-            if (reward > 0) {
-                pairVault.insuranceFundBalance -= reward;
-                FeeEscrowLib.credit(feeEscrow, ctx.pairId, msg.sender, reward);
-            }
+        } else {
+            reward = reward > prepaid ? reward - prepaid : 0;
+        }
+        // A walk that filled nothing earns nothing: no fills means totalMatchedVolume is 0, and
+        // the keeper's floor is unreachable because pendingLiqSize can only reach 0 through a
+        // fill. Capped at the fund's free capital: the seizure still earmarked against open
+        // inventory is what settles that inventory, and a reward drawn from it would resurface as
+        // a shortfall on the next fill, booked as deficit. The reserve may pay it — it is held for
+        // exactly the payouts no bound can refuse — the earmark may not. Capped too at what free
+        // capital above the reserve covers the remaining inventory's loss at the mark by: where
+        // the fills left the pair on the healthy side of the ADL gate, the reward must not carry
+        // it over (RiskParamsLib.unloadRewardPayable). The reward moves from insurance into the
+        // claimable-fee escrow (pulled later via claimFees), so the unload itself never runs a
+        // token transfer.
+        reward = RiskParamsLib.unloadRewardPayable(pairVault, ctx.cachedPrice, ctx.cachedFundingIdx, reward);
+        if (reward > 0) {
+            pairVault.insuranceFundBalance -= reward;
+            FeeEscrowLib.credit(feeEscrow, ctx.pairId, msg.sender, reward);
         }
 
         sum = _summarize(res);
@@ -410,24 +553,40 @@ library MatchingEngineLib {
         tc.posWasLong = tc.bkt.isLong;
         tc.sizeAtStart = tc.bkt.size;
         // Bind a firing TP/SL to the position it closes, at the only moment the answer can be
-        // right: the size is capped at whatever the position holds, so a caller who wrote
-        // type(uint256).max to mean "all of it" closes exactly the position and no more. A
-        // position that went flat or flipped to the order's own side leaves nothing to reduce
-        // (filling there would OPEN exposure), which zeroes `remaining` and kills the order
-        // below. The capped amount is written back to storage because the fill path stamps an
-        // order terminal on filledSize == size, and an uncapped size would never reach it.
+        // right: what remains of the order is capped at whatever the position holds, so a
+        // caller who wrote type(uint256).max to mean "all of it" closes exactly the position
+        // and no more. A position that went flat or flipped to the order's own side leaves
+        // nothing to reduce (filling there would OPEN exposure), which zeroes `remaining` and
+        // kills the order below. The cap is applied to the remainder, not the whole size: an
+        // order that already filled part of the position on an earlier execution has shrunk the
+        // position by exactly that part, and capping the size alone would count the earlier
+        // fill against the position twice and close too little. The cap lives only in the walk's
+        // image of the order, which is what the fill path stamps terminal against
+        // (filledSize == size) and what its events report; the stored size keeps the owner's
+        // intent, so an order written for "all of it" still covers a position that grows
+        // between two executions.
         // Walk status: ALIVE while the taker can keep trading, DEAD when its remainder must be
         // canceled, GONE when a fill already terminated its order (nothing left to dispose).
         uint8 status = ALIVE;
         if (_isPositionReducing(t.order.orderType)) {
             uint256 posSize = (tc.bkt.size != 0 && tc.bkt.isLong != t.order.isLong) ? uint256(tc.bkt.size) : 0;
-            if (t.order.size > posSize) {
-                // posSize fits: it is a uint128 bucket size.
-                t.order.size = uint128(posSize);
-                orders[takerId].size = uint128(posSize);
-                t.remaining = posSize > t.order.filledSize ? posSize - t.order.filledSize : 0;
+            if (t.remaining > posSize) {
+                // Fits: filledSize is a uint128 and posSize a uint128 bucket size at most as
+                // large as the remainder it replaces.
+                t.order.size = uint128(t.order.filledSize + posSize);
+                t.remaining = posSize;
             }
-            if (t.remaining == 0) status = DEAD;
+            if (t.remaining == 0) {
+                status = DEAD;
+                t.cancelReason = BazaarTypes.CancelReason.PositionClosed;
+            }
+        }
+        res.takerRemainingAtStart = t.remaining;
+        // Every caller reaches here with a trigger-gated order only once its trigger is met, so
+        // this is the one point that sees every stop and take-profit fire. Reported after the
+        // cap above, so a TP/SL's event carries the size it will actually close.
+        if (_isTriggerGated(t.order.orderType)) {
+            _emitOrderUpdated(ctx.pairId, t, BazaarTypes.OrderAction.Triggered, BazaarTypes.CancelReason.None);
         }
         tc.isLong = t.order.isLong;
         tc.bound = BazaarMathLib.effectivePrice(
@@ -446,12 +605,15 @@ library MatchingEngineLib {
                 ++res.nodesVisited;
             }
             if (res.nodesVisited > cap) {
-                // Still crossing at the cap: the remainder must die — resting it would leave a
-                // crossed book.
+                // Still crossing at the cap: the remainder cannot rest, since that would leave
+                // a crossed book. _disposeRemainder cancels it, or for a trigger order keeps it
+                // fired outside the book for the next execution.
                 status = DEAD;
+                t.cancelReason = BazaarTypes.CancelReason.StepLimit;
                 break;
             }
             if (m.order.expiryBlock < ctx.currentBlock) {
+                m.cancelReason = BazaarTypes.CancelReason.Expired;
                 _autoCancelOrder(orders, positionBuckets, userActiveLimitOrders, book, m, ctx);
                 continue;
             }
@@ -481,9 +643,11 @@ library MatchingEngineLib {
                     / BazaarTypes.BP_SCALE;
                 if (tc.isLong ? mPrice > hi : mPrice < lo) {
                     status = DEAD;
+                    t.cancelReason = BazaarTypes.CancelReason.PriceBand;
                     break;
                 }
                 if (tc.isLong ? mPrice < lo : mPrice > hi) {
+                    m.cancelReason = BazaarTypes.CancelReason.PriceBand;
                     _autoCancelOrder(orders, positionBuckets, userActiveLimitOrders, book, m, ctx);
                     continue;
                 }
@@ -491,17 +655,22 @@ library MatchingEngineLib {
             if (t.order.isPostOnly) {
                 // Crossing a live maker at all is the violation; cancel before any fill.
                 status = DEAD;
+                t.cancelReason = BazaarTypes.CancelReason.PostOnly;
                 break;
             }
             if (m.order.creator == t.order.creator) {
-                // Self-match cancels the newer order, and the arriving side is always newer.
+                // Self-match stops the newer order, and the arriving side is always newer.
+                // _disposeRemainder cancels it, or for a trigger order keeps it fired outside
+                // the book.
                 status = DEAD;
+                t.cancelReason = BazaarTypes.CancelReason.SelfMatch;
                 break;
             }
             m.remaining = m.order.size - m.order.filledSize;
             uint8 outcome = _fillCrossed(orders, positionBuckets, userActiveLimitOrders, book, m, t, tc, ctx, res);
             if (outcome == TAKER_DEAD) {
                 status = DEAD;
+                t.cancelReason = BazaarTypes.CancelReason.Margin;
                 break;
             }
             // Guard the invariant that nothing a fill touches can terminate the TAKER's own
@@ -523,10 +692,20 @@ library MatchingEngineLib {
 
     /// @dev Dispose of the taker's post-walk remainder: rest it, cancel it, leave it alone, or —
     ///      for a fill-or-kill taker — revert.
-    ///      Market, StopLoss/TakeProfit executions, and IOC limits never rest — a thin book
-    ///      therefore leaves a fired TP/SL dead rather than resting for the part it could not
-    ///      close. A sub-minimum remainder rests only under the live full-close exemption
-    ///      (mirroring creation), so partial fills cannot mint resting dust.
+    ///      Market orders and IOC limits never rest and cancel whatever they could not fill. A
+    ///      fired StopLoss/TakeProfit never rests either, but its remainder stays LIVE outside
+    ///      the book: its price bound is derived from the oracle at each firing, so resting it
+    ///      at one firing's bound would leave a limit that goes stale as the oracle moves, while
+    ///      cancelling it would strip a protective order at the moment the market reached it.
+    ///      The next execution re-evaluates the trigger and prices a fresh bound. The same
+    ///      holds for any trigger order whose walk died with its position still open (node
+    ///      budget, self-match, a fill its margin could not carry): the fills it took stand and
+    ///      the rest waits for the next execution, so nothing planted in the book can end a
+    ///      stop. So does what a StopLimit fired with less than MIN_ORDER_LIFETIME_BLOCKS of its
+    ///      life left could not fill, since it may not rest. Everything else that dies at the cap
+    ///      is canceled: resting it would leave a crossed book. A sub-minimum remainder rests
+    ///      only under the live full-close exemption (mirroring creation), so partial fills
+    ///      cannot mint resting dust.
     ///
     ///      Fill-or-kill is enforced here because this is the one point every arriving taker
     ///      reaches with its outcome known: the walk exits through it whether the book was empty,
@@ -558,12 +737,28 @@ library MatchingEngineLib {
         }
         if (status == GONE) return; // already canceled mid-walk; nothing left to dispose
         if (status == DEAD) {
+            // A trigger order dies to its walk only when its position is gone. Running out of
+            // budget, meeting its owner's own resting order at the head, or a fill that its
+            // owner's margin cannot carry at the head's price all leave it fired outside the
+            // book for the next execution: none is a defect of the order, and each is a state
+            // the book can be steered into — a wall in front of the liquidity, a book cleared
+            // down to the owner's own bid, a maker planted at the worst admissible price — so
+            // cancelling on any of them would let a third party strip a protective stop, and
+            // the self-match case would let an owner void a keeper's fills by resting a bid
+            // behind the liquidity. The owner's own order is theirs to cancel when they want
+            // the stop to proceed past it. Post-only and the stale band cannot reach a trigger
+            // order: creation refuses the flag and the stale fallback never fires one.
+            if (
+                _isTriggerGated(t.order.orderType) && t.cancelReason != BazaarTypes.CancelReason.PositionClosed
+            ) return;
             _autoCancelOrder(orders, positionBuckets, userActiveLimitOrders, book, t, ctx);
             return;
         }
         if (t.remaining == 0) return; // fully filled; _persistFill stamped it terminal
 
-        if (_isOracleDerivedPrice(t.order.orderType) || t.order.tif == BazaarTypes.TimeInForce.IOC) {
+        if (_isPositionReducing(t.order.orderType)) return; // stays fired, outside the book
+        if (t.order.orderType == BazaarTypes.OrderType.Market || t.order.tif == BazaarTypes.TimeInForce.IOC) {
+            t.cancelReason = BazaarTypes.CancelReason.Unfilled;
             _autoCancelOrder(orders, positionBuckets, userActiveLimitOrders, book, t, ctx);
             return;
         }
@@ -573,10 +768,22 @@ library MatchingEngineLib {
         bool restable = remNotional >= BazaarTypes.MIN_ORDER_AMOUNT
             || (tc.bkt.size > 0 && tc.bkt.isLong != tc.isLong && t.remaining == tc.bkt.size);
         if (!restable) {
+            t.cancelReason = BazaarTypes.CancelReason.BelowMinimum;
             _autoCancelOrder(orders, positionBuckets, userActiveLimitOrders, book, t, ctx);
             return;
         }
-        OrderBookLib.insert(orders, book, t.orderId, hints);
+        // A remainder rests only with MIN_ORDER_LIFETIME_BLOCKS of its life left, the floor every
+        // link into the book is held to: a quote at the head then stands open to fills for that
+        // long before it can expire into a dead node a later walk spends a step removing.
+        // Creation always leaves that much, so only a StopLimit fired after its creation block
+        // can be short of it. Its remainder then stays fired outside the book, as when its walk
+        // runs out of budget, and a later execution can fill it until it expires. Cancelling it
+        // would let whoever picks the moment to fire it strip the stop of its last minute by
+        // firing when nothing crosses.
+        if (t.order.expiryBlock < ctx.currentBlock + BazaarTypes.MIN_ORDER_LIFETIME_BLOCKS) return;
+        // The far-side premium is stamped only against a fresh index: a remainder measured
+        // against the stale fallback's older price was not on offer at the distance it reads.
+        OrderBookLib.insert(orders, book, t.orderId, hints, ctx.currentBlock, ctx.isOracleStale ? 0 : ctx.cachedPrice);
     }
 
     /// @dev Write the taker's walk-carried bucket image back to storage, run the TP/SL fence
@@ -607,13 +814,11 @@ library MatchingEngineLib {
         bucket.entryValue = tc.bkt.entryValue;
         bucket.collateral = tc.bkt.collateral;
         bucket.entryFundingIndex = tc.bkt.entryFundingIndex;
-        bucket.entryMmrBp = tc.bkt.entryMmrBp;
-        bucket.mmrUpdateTs = tc.bkt.mmrUpdateTs;
 
         {
             uint256 keep = (tc.bkt.size > 0 && tc.bkt.isLong != tc.posWasLong) ? 0 : uint256(tc.bkt.size);
             if (tc.sizeAtStart != 0 && keep == 0) {
-                _cancelTpSlOverSize(user, bucket, keep, orders, book, ctx.pairId, ctx.currentBlock);
+                _cancelTpSlOverSize(bucket, keep, orders, book, ctx.pairId, ctx.currentBlock);
             }
         }
 
@@ -711,6 +916,7 @@ library MatchingEngineLib {
                 unchecked {
                     res.feeBudget += p.fees.longTotalFee + p.fees.shortTotalFee;
                 }
+                mkH.cancelReason = BazaarTypes.CancelReason.Margin;
                 _autoCancelOrder(orders, positionBuckets, userActiveLimitOrders, book, mkH, ctx);
                 return MAKER_DEAD;
             }
@@ -794,8 +1000,56 @@ library MatchingEngineLib {
         }
 
         _aggregateFill(res, longResult, shortResult, p.fees, p.fillSize, fillNotional, longH, shortH);
+        _accrueMarkPrint(res, p.makerIsLong ? longH : shortH, p.fillSize, fillNotional, ctx);
         _accumulateFillIntegratorFees(res, longH, shortH, p.fees);
         _emitFillEvents(ctx, longH, shortH, p, longResult, shortResult);
+    }
+
+    /// @dev Fold one fill into the mark-price accumulators. Only a fill against a maker resting on
+    ///      the far side of the oracle counts — a bid above it or an ask below it. It counts in
+    ///      proportion to how long the maker had stood in the book at its current price and size
+    ///      (FundingLib.makerExposureWeight), and at no more premium than the maker stood at when
+    ///      it linked (Order.restedPremiumPpm, FundingLib.printPriceOf). A quote on the far side
+    ///      is a standing offer anyone could have taken at a profit, so a print against one that
+    ///      stood untaken says where the market clears, and the longer it stood the more it says
+    ///      — but only for the premium it was on offer at. A quote that linked nearer the index
+    ///      than it now sits reaches its current premium only because the index moved after it
+    ///      linked, and its owner can take it in the transaction that stores the move, before
+    ///      anyone else could; it counts at its stamp, and one stamped zero (linked on the near
+    ///      side, or against the stale fallback) not at all. A quote on the near side can rest at no risk,
+    ///      and a print against it shows nothing a fill's own two parties could not arrange
+    ///      between themselves at any admissible price; the same holds for a far-side quote taken
+    ///      in the block it was placed, which was never on offer to anyone else. Such prints leave
+    ///      the mark to decay toward the index, and add nothing to the rolling volume the counting
+    ///      prints are weighed against, so they cannot dilute them either. The unweighted totals
+    ///      stay in totalMatchedVolume/totalFillSize for the unload reward and the post-walk
+    ///      health check.
+    ///      The accumulators hold notional × weight and size × weight, the notional at the print
+    ///      price; _summarize divides both by MAKER_EXPOSURE_BLOCKS once per walk. Unchecked
+    ///      because nothing here can overflow: a counted notional is a uint128 size times, over
+    ///      1e18, the uint128 limit or (for an ask) a price below the oracle price, so under 2^196
+    ///      for any oracle price under 2^128; the weight is at most MAKER_EXPOSURE_BLOCKS, and a
+    ///      batch settles far fewer than 2^20 fills.
+    function _accrueMarkPrint(
+        BazaarTypes.ArrivalResult memory res,
+        Head memory makerH,
+        uint256 fillSize,
+        uint256 fillNotional,
+        BazaarTypes.ArrivalContext memory ctx
+    ) private pure {
+        uint256 price = makerH.order.limitPrice;
+        bool isLong = makerH.order.isLong;
+        if (isLong ? price <= ctx.cachedPrice : price >= ctx.cachedPrice) return;
+        uint256 restedPremium = makerH.order.restedPremiumPpm;
+        if (restedPremium == 0) return;
+        uint256 weight = FundingLib.makerExposureWeight(ctx.currentBlock, makerH.order.restedBlock);
+        uint256 printPrice = FundingLib.printPriceOf(isLong, price, restedPremium, ctx.cachedPrice);
+        uint256 notional =
+            printPrice == price ? fillNotional : Math.mulDiv(fillSize, printPrice, BazaarTypes.BAZAAR_SCALE);
+        unchecked {
+            res.markNotional += notional * weight;
+            res.markSize += fillSize * weight;
+        }
     }
 
     function _aggregateFill(
@@ -848,10 +1102,10 @@ library MatchingEngineLib {
         }
     }
 
-    /// @dev Per-fill events: an OrderFilled per side (the per-price trade record), plus the
-    ///      MAKER's PositionModified — the maker is a different account at every node, so its
-    ///      position settles per fill. The taker's PositionModified is emitted once per walk by
-    ///      _flushTaker, with the walk's VWAP and net deltas.
+    /// @dev Per-fill events: the fill's Trade record, plus the MAKER's PositionModified — the
+    ///      maker is a different account at every node, so its position settles per fill. The
+    ///      taker's PositionModified is emitted once per walk by _flushTaker, with the walk's
+    ///      VWAP and net deltas.
     function _emitFillEvents(
         BazaarTypes.ArrivalContext memory ctx,
         Head memory longH,
@@ -860,33 +1114,22 @@ library MatchingEngineLib {
         BazaarTypes.FillResult memory longResult,
         BazaarTypes.FillResult memory shortResult
     ) private {
-        emit BazaarTypes.OrderFilled(
-            ctx.pairId,
-            longH.orderId,
-            longH.order.creator,
-            true,
-            p.fillSize,
-            longH.order.filledSize,
-            longH.remaining,
-            p.fillPrice,
-            p.fees.longTotalFee,
-            longH.remaining == 0,
-            p.makerIsLong
-        );
-        emit BazaarTypes.OrderFilled(
-            ctx.pairId,
-            shortH.orderId,
-            shortH.order.creator,
-            false,
-            p.fillSize,
-            shortH.order.filledSize,
-            shortH.remaining,
-            p.fillPrice,
-            p.fees.shortTotalFee,
-            shortH.remaining == 0,
-            !p.makerIsLong
-        );
         Head memory mkH = p.makerIsLong ? longH : shortH;
+        Head memory tkH = p.makerIsLong ? shortH : longH;
+        emit BazaarTypes.Trade(
+            ctx.pairId,
+            mkH.order.creator,
+            tkH.order.creator,
+            mkH.orderId,
+            tkH.orderId,
+            !p.makerIsLong,
+            p.fillSize,
+            p.fillPrice,
+            p.makerIsLong ? p.fees.longTotalFee : p.fees.shortTotalFee,
+            p.makerIsLong ? p.fees.shortTotalFee : p.fees.longTotalFee,
+            mkH.remaining,
+            tkH.remaining
+        );
         BazaarTypes.FillResult memory mkResult = p.makerIsLong ? longResult : shortResult;
         emit BazaarTypes.PositionModified(
             ctx.pairId,
@@ -1035,6 +1278,7 @@ library MatchingEngineLib {
                 ctx.cachedPrice,
                 ctx.marginReqs
             )) {
+            makerH.cancelReason = BazaarTypes.CancelReason.Margin;
             _autoCancelOrder(orders, positionBuckets, userActiveLimitOrders, book, makerH, ctx);
             return 0; // head advanced; the unload loop retries the next maker
         }
@@ -1053,9 +1297,7 @@ library MatchingEngineLib {
             ctx
         );
 
-        int256 vaultPnl = _settleVaultLiquidation(
-            pairVault, res, data.fillSize, data.execPrice, data.fillNotional, ctx.cachedFundingIdx
-        );
+        int256 vaultPnl = _settleVaultLiquidation(pairVault, res, ctx, data.fillSize, data.execPrice, data.fillNotional);
 
         unchecked {
             res.deltaLongOI += mr.longOIDelta;
@@ -1072,23 +1314,26 @@ library MatchingEngineLib {
             // Fits: the fill is capped at the maker's remaining (see _persistFill).
             makerH.order.filledSize += uint128(data.fillSize);
         }
+        _accrueMarkPrint(res, makerH, data.fillSize, data.fillNotional, ctx);
 
         res.integratorCount = _accumulateIntegratorFee(
             res.integratorAccums, res.integratorCount, makerH.order.integrator, data.makerIntFee
         );
 
-        emit BazaarTypes.OrderFilled(
+        // The vault is the taker: it has no order and pays no fee.
+        emit BazaarTypes.Trade(
             ctx.pairId,
-            makerH.orderId,
             makerH.order.creator,
-            makerH.order.isLong,
+            address(this),
+            makerH.orderId,
+            0,
+            !makerH.order.isLong,
             data.fillSize,
-            makerH.order.filledSize,
-            makerH.remaining,
             data.execPrice,
             data.makerTotalFee,
-            makerH.remaining == 0,
-            true
+            0,
+            makerH.remaining,
+            0
         );
         emit BazaarTypes.PositionModified(
             ctx.pairId,
@@ -1105,131 +1350,18 @@ library MatchingEngineLib {
         return data.fillSize;
     }
 
-    /// @notice Per-walk figures for the vault's unload: which side it sells, the deepest price
-    ///         it takes, the reference price a fill is measured against, and how much the fund
-    ///         may spend on fills inside that reference.
-    struct UnloadPlan {
-        bool vaultIsLong;
-        uint256 bound;
-        uint256 referencePrice;
-        int256 headroom;
-    }
-
-    /// @dev Computed once from start-of-walk state. Three quantities anchor the walk.
-    ///
-    ///      The fund-neutral price: the price at which closing the inventory pays back exactly
-    ///      the collateral seized with it, net of the funding accrued since the estates entered
-    ///      — the entry basis less the seizure, carried forward by that funding, valued per unit.
-    ///      A fill at it costs the fund nothing; each unit sold away from it costs the distance.
-    ///
-    ///      The bound is the looser of two anchors: the fund-neutral price itself, and the oracle
-    ///      moved min(LIQ_MAX_SLIPPAGE_BP, MMR) against the vault. A maker beyond both is refused,
-    ///      so a fill outside the band that still beats the estates' bankruptcy price goes through,
-    ///      and so does one under bankruptcy that stays inside the band. Neither anchor moves
-    ///      during the walk: every fill releases a proportional slice of the aggregate, so the
-    ///      neutral price is invariant, and the oracle is fixed within the transaction.
-    ///
-    ///      The headroom is what the fund may spend on fills inside the bound: free capital above
-    ///      its reserve (RiskParamsLib.vaultAdlExposure), less the loss the inventory already
-    ///      carries at the mark, less the caller's reward when one is paid, since that leaves the
-    ///      fund after the walk and must not come out of the reserve. A fill is measured against
-    ///      the reference price: beyond it a fill lowers the loss the remainder carries by at
-    ///      least what it costs, so it is always taken; inside it a fill costs the difference per
-    ///      unit, and the walk takes only what the headroom covers. While the base covers the
-    ///      loss at the mark — the gate's own healthy condition — the reference is the nearer of
-    ///      the neutral price and the oracle, because the headroom has already set that loss
-    ///      aside: spending it to zero leaves the fund above its reserve by exactly the remaining
-    ///      inventory's loss at the mark, the pair ends the walk healthy, and the post-walk
-    ///      verdict opens the auction only if the price has moved since. Past the trigger nothing
-    ///      was set aside, so a fill at the mark would draw cash the fund does not hold above its
-    ///      reserve: the reference is the neutral price and the walk takes only fills that cost
-    ///      the fund nothing, leaving the rest to the auction. An unload can therefore never take
-    ///      the fund below its reserve, and never carry a pair over the ADL trigger it did not
-    ///      start past.
-    ///
-    ///      Rounded toward the vault: the neutral price rounds up as a floor and down as a
-    ///      ceiling, and sizes round down.
-    /// @param pairVault The pair's vault aggregates
-    /// @param ctx The walk context: oracle price, funding index and margin requirements
-    /// @param payReward Whether the caller earns the unload reward this walk
-    /// @return plan The side, bound, reference price and headroom for the walk
-    function _planUnload(BazaarTypes.Vault storage pairVault, BazaarTypes.ArrivalContext memory ctx, bool payReward)
-        private
-        view
-        returns (UnloadPlan memory plan)
-    {
-        plan.vaultIsLong = pairVault.pendingLiqIsLong;
-        uint256 size = pairVault.pendingLiqSize;
-        uint256 oracle = ctx.cachedPrice;
-
-        (uint256 expectedLoss, uint256 base,,) =
-            RiskParamsLib.vaultAdlExposure(pairVault, oracle, ctx.cachedFundingIdx, ctx.marginReqs.mmrBp);
-        plan.headroom = int256(base) - int256(expectedLoss);
-
-        // Positive when the index rose since the estates' entry: paid by inherited longs,
-        // received by inherited shorts — the term _settleVaultLiquidation realizes on a fill.
-        // Either way it raises the fund-neutral price: a long that has paid must sell that
-        // much higher to break even, a short that has received can buy back that much higher.
-        int256 rawFunding = BazaarMathLib.signedMulDiv(
-            ctx.cachedFundingIdx - pairVault.pendingLiqEntryFundingIndex, int256(size), int256(BazaarTypes.BAZAAR_SCALE)
-        );
-        // The seizure sits on the sale side of the ledger for longs (the vault sells and must
-        // recover it) and on the purchase side for shorts (the vault buys and may spend it).
-        int256 neutralNotional = plan.vaultIsLong
-            ? int256(pairVault.pendingLiqEntryNotional) - int256(pairVault.pendingLiqSeized) + rawFunding
-            : int256(pairVault.pendingLiqEntryNotional) + int256(pairVault.pendingLiqSeized) + rawFunding;
-        uint256 neutral;
-        if (neutralNotional > 0) {
-            neutral = Math.mulDiv(
-                uint256(neutralNotional),
-                BazaarTypes.BAZAAR_SCALE,
-                size,
-                plan.vaultIsLong ? Math.Rounding.Ceil : Math.Rounding.Floor
-            );
-        }
-        uint256 mmrBp = ctx.marginReqs.mmrBp;
-        uint256 bandBp = mmrBp < BazaarTypes.LIQ_MAX_SLIPPAGE_BP ? mmrBp : BazaarTypes.LIQ_MAX_SLIPPAGE_BP;
-        // The headroom pre-charges the inventory's loss at the mark, so a fill at the mark is
-        // free only while the base actually covers that loss. Past the trigger it does not, and
-        // the reference moves to the neutral price: the only fills left are the ones that cost
-        // the fund nothing.
-        bool funded = base >= expectedLoss;
-        if (plan.vaultIsLong) {
-            uint256 bandEdge = oracle * (BazaarTypes.BP_SCALE - bandBp) / BazaarTypes.BP_SCALE;
-            plan.bound = neutral < bandEdge ? neutral : bandEdge;
-            plan.referencePrice = funded && oracle < neutral ? oracle : neutral;
-        } else {
-            uint256 bandEdge = oracle * (BazaarTypes.BP_SCALE + bandBp) / BazaarTypes.BP_SCALE;
-            plan.bound = neutral > bandEdge ? neutral : bandEdge;
-            plan.referencePrice = funded && oracle > neutral ? oracle : neutral;
-        }
-
-        // The caller's reward is paid after the walk on the notional actually filled, so it is
-        // reserved on the notional the walk could fill at most: the whole inventory at the
-        // price furthest from the oracle the bound admits.
-        if (payReward) {
-            uint256 dearest = plan.vaultIsLong ? oracle : (plan.bound > oracle ? plan.bound : oracle);
-            uint256 reward = Math.mulDiv(
-                Math.mulDiv(size, dearest, BazaarTypes.BAZAAR_SCALE),
-                BazaarTypes.LIQUIDATION_FEE_EBP,
-                BazaarTypes.EBP_SCALE
-            );
-            if (reward < BazaarTypes.UNLOAD_BOUNTY_MIN) reward = BazaarTypes.UNLOAD_BOUNTY_MIN;
-            plan.headroom -= int256(reward);
-        }
-    }
-
     /// @dev Settle one vault-liquidation fill: compute vault PnL (price + funding accrued on the
     ///      inventory from the liquidatees' entries through this close), update gap-EMA
     ///      accumulators, and decrement the pending-liq aggregates proportionally.
     function _settleVaultLiquidation(
         BazaarTypes.Vault storage pairVault,
         BazaarTypes.ArrivalResult memory res,
+        BazaarTypes.ArrivalContext memory ctx,
         uint256 fillSize,
         uint256 execPrice,
-        uint256 fillNotional,
-        int256 currentFundingIndex
+        uint256 fillNotional
     ) private returns (int256 vaultPnl) {
+        int256 currentFundingIndex = ctx.cachedFundingIdx;
         unchecked {
             uint256 existingSize = pairVault.pendingLiqSize;
             // Proportional entry notional for this fill, rounded ONCE and reused verbatim by the
@@ -1257,17 +1389,58 @@ library MatchingEngineLib {
             );
             vaultPnl += pairVault.pendingLiqIsLong ? -rawFunding : rawFunding;
 
-            // Gap-EMA accumulators (against avg bankruptcy price)
-            uint256 avgBP = Math.mulDiv(pairVault.pendingLiqBankruptcyNotional, BazaarTypes.BAZAAR_SCALE, existingSize);
-            int256 gapBp;
-            if (avgBP != 0) {
-                gapBp = pairVault.pendingLiqIsLong
-                    ? (int256(avgBP) - int256(execPrice)) * int256(BazaarTypes.BP_SCALE) / int256(avgBP)
-                    : (int256(execPrice) - int256(avgBP)) * int256(BazaarTypes.BP_SCALE) / int256(avgBP);
+            // Gap-EMA accumulators, split at the oracle. SLIPPAGE is the fill against the oracle:
+            // the execution cost of closing the inventory, which is what maintenance margin has
+            // to pay for. DRIFT is the oracle against the estates' average bankruptcy price: how
+            // far the market ran past the level margin was set to survive while the vault held
+            // the position, which is what the fund has to cover. Measuring both against the
+            // bankruptcy price alone would fuse them into one number that reads as neither —
+            // blind to a thin book whenever slippage stays inside MMR, and unbounded above it
+            // because a short bought back in a squeeze can print arbitrarily far past bankruptcy.
+            // Both legs read a fresh oracle: unloadBook never walks against the stale fallback.
+            uint256 oracle = ctx.cachedPrice;
+            if (oracle != 0) {
+                bool vaultIsLong = pairVault.pendingLiqIsLong;
+                int256 slipBp = vaultIsLong
+                    ? (int256(oracle) - int256(execPrice)) * int256(BazaarTypes.BP_SCALE) / int256(oracle)
+                    : (int256(execPrice) - int256(oracle)) * int256(BazaarTypes.BP_SCALE) / int256(oracle);
+
+                uint256 avgBP =
+                    Math.mulDiv(pairVault.pendingLiqBankruptcyNotional, BazaarTypes.BAZAAR_SCALE, existingSize);
+                int256 driftBp;
+                if (avgBP != 0) {
+                    driftBp = vaultIsLong
+                        ? (int256(avgBP) - int256(oracle)) * int256(BazaarTypes.BP_SCALE) / int256(avgBP)
+                        : (int256(oracle) - int256(avgBP)) * int256(BazaarTypes.BP_SCALE) / int256(avgBP);
+                }
+
+                // Each fill is recorded at what it cost the fund, floored at zero. A reading on
+                // the fund's side — a fill better than the oracle, or an oracle that has not yet
+                // reached the estates' bankruptcy price — is value the unload has already paid
+                // into the fund; letting it pull an EMA negative would count it twice, once in the
+                // fund's balance and again by damping the response to the next genuine cost. The
+                // fill still enters the weight at full size, as a zero-cost sample, so clean
+                // liquidations dilute a later bad one instead of cancelling it with banked
+                // credit. On slippage the floor also drops the windfall of stale makers left on
+                // the fund's side of a moving oracle: a fast market fills them first, and netting
+                // them against the fills behind them in the same walk would hide the thin book
+                // beyond.
+                //
+                // Slippage is also capped at LIQ_MAX_SLIPPAGE_BP. The unload bound keeps every
+                // fill inside that band of the oracle unless the fund-neutral price is looser,
+                // which takes the market having moved more than the band past it in the fund's
+                // favor — and there the walk takes any maker that still beats it. A reading
+                // beyond the band measures that latitude, not the cost of a forced exit. Drift is
+                // not capped: a large reading there is a genuine overrun.
+                if (slipBp > 0) {
+                    if (slipBp > int256(BazaarTypes.LIQ_MAX_SLIPPAGE_BP)) {
+                        slipBp = int256(BazaarTypes.LIQ_MAX_SLIPPAGE_BP);
+                    }
+                    res.sumLiqSlipTimesSize += slipBp * int256(fillSize);
+                }
+                if (driftBp > 0) res.sumLiqDriftTimesSize += driftBp * int256(fillSize);
+                res.totalLiqFillSize += fillSize;
             }
-            res.sumLiqGapTimesSize += gapBp * int256(fillSize);
-            res.totalLiqFillSize += fillSize;
-            ++res.liqCount;
 
             // Decrement vault aggregate proportionally (entryPortion shared with the PnL above)
             uint256 bkPortion = Math.mulDiv(pairVault.pendingLiqBankruptcyNotional, fillSize, existingSize);
@@ -1276,6 +1449,7 @@ library MatchingEngineLib {
             pairVault.pendingLiqEntryNotional -= entryPortion;
             pairVault.pendingLiqBankruptcyNotional -= bkPortion;
             pairVault.pendingLiqSeized -= seizedPortion;
+            res.vaultEarmarkReleased += seizedPortion;
         }
     }
 
@@ -1314,9 +1488,11 @@ library MatchingEngineLib {
     }
 
     /// @dev Auto-cancel an order — used for expiry-on-contact, self-match, post-only violation,
-    ///      margin failure, step-cap, stale-band, dust, and IOC/market remainders. Sets
-    ///      canceledBlock, unlinks from the book, clears the appropriate slot pointer, emits
-    ///      OrderUpdated.
+    ///      margin failure, step-cap, stale-band, dust, IOC/market remainders, and a TP/SL whose
+    ///      position is gone. Sets canceledBlock, unlinks from the book, clears the appropriate
+    ///      slot pointer, emits OrderUpdated with h.cancelReason. Does not touch the escrow: a
+    ///      canceled trigger order's bounty is refunded by the settle that follows a walk, or
+    ///      lazily through cancelOrders / sweepExpired.
     function _autoCancelOrder(
         mapping(uint256 => BazaarTypes.Order) storage orders,
         mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
@@ -1338,24 +1514,41 @@ library MatchingEngineLib {
             positionBuckets[h.order.creator].stopLossOrderId = 0;
         }
 
+        h.order.canceledBlock = ctx.currentBlock;
+        _emitOrderUpdated(ctx.pairId, h, BazaarTypes.OrderAction.Canceled, h.cancelReason);
+    }
+
+    /// @dev Emit OrderUpdated from the walk's memory image of an order rather than re-reading
+    ///      storage. The image is current: a maker's is loaded fresh each iteration, and the
+    ///      taker's receives every fill and the TP/SL size cap as they are written to storage.
+    function _emitOrderUpdated(
+        bytes32 pairId,
+        Head memory h,
+        BazaarTypes.OrderAction action,
+        BazaarTypes.CancelReason reason
+    ) private {
+        BazaarTypes.Order memory o = h.order;
         emit BazaarTypes.OrderUpdated(
-            ctx.pairId,
+            pairId,
             h.orderId,
-            h.order.creator,
+            o.creator,
             BazaarTypes.OrderUpdatePayload({
-                action: BazaarTypes.OrderAction.Canceled,
-                orderType: ot,
-                isLong: h.order.isLong,
-                isPostOnly: h.order.isPostOnly,
-                size: h.order.size,
-                filledSize: h.order.filledSize,
-                triggerPrice: h.order.triggerPrice,
-                limitPrice: h.order.limitPrice,
-                maxSlippageBp: h.order.maxSlippageBp,
-                canceledBlock: ctx.currentBlock,
-                filledBlock: h.order.filledBlock,
-                expiryBlock: h.order.expiryBlock,
-                creationBlock: h.order.creationBlock
+                action: action,
+                orderType: o.orderType,
+                isLong: o.isLong,
+                isPostOnly: o.isPostOnly,
+                size: o.size,
+                filledSize: o.filledSize,
+                triggerPrice: o.triggerPrice,
+                limitPrice: o.limitPrice,
+                maxSlippageBp: o.maxSlippageBp,
+                canceledBlock: o.canceledBlock,
+                filledBlock: o.filledBlock,
+                expiryBlock: o.expiryBlock,
+                prioritySeq: o.prioritySeq,
+                tif: o.tif,
+                integrator: o.integrator,
+                cancelReason: reason
             })
         );
     }
@@ -1365,17 +1558,19 @@ library MatchingEngineLib {
     // ================================================================
 
     /// @notice Margin gate for a candidate fill. Classifies the trade by SIZE (open / add / close /
-    ///         flip), realizes PnL on closing portions, and applies a one-sided incipient-loss debit
-    ///         on fresh exposure. Returns false (caller auto-cancels) on any of:
-    ///           - open/add: post-debit collateral < required IMR
-    ///           - fresh exposure: incipient loss exceeds collateral (would open insolvent at the mark)
-    ///           - close/flip: realized loss exceeds collateral (would create bad debt)
-    ///           - partial close: post-realization collateral < MMR on the remainder
-    ///           - flip: post-close collateral < IMR on residual
+    ///         flip) and judges the account as the fill would leave it at the mark: collateral after
+    ///         the fee and the PnL and funding the fill realizes, less the unrealized loss of the
+    ///         position that survives the fill and the incipient loss of fresh exposure. Unrealized
+    ///         gains are never credited. Returns false (caller auto-cancels) on any of:
+    ///           - the fee exceeds collateral
+    ///           - open/add/flip: that margin falls short of IMR on the resulting notional
+    ///           - close/flip: that margin is negative (the fill would leave bad debt)
+    ///           - partial close: that margin is below IMR on the remainder, and its ratio to the
+    ///             remainder's MMR is lower than the account's was before the fill
     /// @dev The caller passes the batch's resolved margin requirements — there is no stale branch
-    ///      inside. Risk-reducing fills are judged against MMR rather than IMR, which is why the
-    ///      whole struct is threaded rather than a rate: the partial-close branch needs the lagged
-    ///      sample and its timestamp together to resolve the remainder's effective MMR.
+    ///      inside. The whole struct is threaded rather than a rate because a partial close reads
+    ///      both rates: the current IMR for the outright pass, and the lagged MMR to resolve the
+    ///      remainder's effective rate (BucketLib.effectiveMmrBp) for the ratio.
     function _checkMargin(
         BazaarTypes.PositionBucket memory bucket,
         BazaarTypes.BucketState memory state,
@@ -1393,6 +1588,16 @@ library MatchingEngineLib {
         // whose fee is fully collectable ever proceed (nominal fee == collected fee thereafter).
         if (state.effectiveCollateral < fee) return false;
         uint256 collateralAfterFee = state.effectiveCollateral - fee;
+
+        // The held position's unrealized loss (price and funding together, at the mark) is owed
+        // whether or not this fill touches it. Margin that left it out would treat an account
+        // underwater by more than its collateral as still holding that collateral: it could add
+        // exposure against money its losses already consume, and a partial fill at an off-market
+        // price against a colluding counterparty could move value out of an account whose equity
+        // cannot back it, leaving the difference as bad debt. Gains are not credited: paper profit
+        // is only as good as the mark and evaporates in the move it would need to buffer, the same
+        // reason the incipient debit below is one-sided.
+        uint256 heldLoss = state.totalPnl < 0 ? uint256(-state.totalPnl) : 0;
 
         uint256 newExposureSize; // size of fresh exposure (drives incipient-loss debit)
         // Notional driving the IMR/MMR requirement. Fresh exposure is valued at the oracle price,
@@ -1412,14 +1617,15 @@ library MatchingEngineLib {
             newTotalNotional = Math.mulDiv(fillSize, cachedPrice, BazaarTypes.BAZAAR_SCALE);
             effectiveBp = marginReqs.imrBp;
         } else if (bucket.isLong == isLong) {
-            // Same-side add
+            // Same-side add: the held position survives whole, so all of its loss comes off.
+            if (heldLoss > collateralAfterFee) return false;
+            collateralAfterFee -= heldLoss;
             newExposureSize = fillSize;
             newTotalNotional = state.currentNotional + Math.mulDiv(fillSize, cachedPrice, BazaarTypes.BAZAAR_SCALE);
             effectiveBp = marginReqs.imrBp;
         } else if (fillSize <= bucket.size) {
-            // Partial / full close — apply realized PnL up front, reject if it underwaters collateral
-            newExposureSize = 0;
-
+            // Partial / full close: the closed share realizes at the execution price, and the
+            // remainder keeps its share of the held loss.
             uint256 closedEntryValue = Math.mulDiv(state.entryValue, fillSize, bucket.size);
             uint256 closedNotional = Math.mulDiv(fillSize, executionPrice, BazaarTypes.BAZAAR_SCALE);
             int256 realizedPnl = bucket.isLong
@@ -1429,17 +1635,46 @@ library MatchingEngineLib {
             // combined sum so the gate and settlement agree.
             int256 closedFunding =
                 BazaarMathLib.signedMulDiv(state.fundingPnl, int256(fillSize), int256(uint256(bucket.size)));
-
-            int256 postFillCol = int256(collateralAfterFee) + realizedPnl + closedFunding;
-            if (postFillCol < 0) return false; // bad debt — must liquidate instead
-            collateralAfterFee = uint256(postFillCol);
-
             uint256 remaining = bucket.size - fillSize;
-            newTotalNotional = Math.mulDiv(remaining, cachedPrice, BazaarTypes.BAZAAR_SCALE);
-            // 24h-lagged effective MMR for the surviving remainder (consistent with BucketLib).
-            effectiveBp = BucketLib.effectiveMmr(
-                state.mmrUpdateTs, state.entryMmrBp, marginReqs.laggedMmrBp, marginReqs.laggedMmrTs, marginReqs.mmrBp
-            );
+
+            // Nonnegative margin also means the realized loss fits the collateral, which the
+            // settlement in _applyFillCore relies on: the remainder's share of the held loss only
+            // lowers the figure.
+            int256 marginAfter = int256(collateralAfterFee) + realizedPnl + closedFunding
+                - int256(Math.mulDiv(heldLoss, remaining, bucket.size));
+            if (marginAfter < 0) return false; // bad debt — must liquidate instead
+
+            // A remainder that still meets IMR at the pair's current rate passes outright. IMR is
+            // the level the withdrawal gates hold an open position to, so margin above it is the
+            // account's to release, by withdrawal or through the price of a reduction. With no
+            // remainder, as on a full close, any nonnegative margin clears it.
+            uint256 remainingNotional = Math.mulDiv(remaining, cachedPrice, BazaarTypes.BAZAAR_SCALE);
+            if (marginAfter >= int256(Math.mulDiv(marginReqs.imrBp, remainingNotional, BazaarTypes.BP_SCALE))) {
+                return true;
+            }
+
+            // Below IMR the fill must keep at least the margin-to-MMR ratio the account held before,
+            // whether the remainder ends above maintenance or under it. Closing at the mark qualifies
+            // (fee aside), as does a close through a thin book whose price gap per unit stays within
+            // the account's own margin per unit.
+            // - Above maintenance: were any fill that leaves MMR covered admitted, a reduction sold
+            //   at a deep discount to the owner's own second account could carry the band between
+            //   IMR and MMR out of a position that stays open. That is margin the withdrawal gates
+            //   would have kept, and the remainder would survive one stress move instead of two,
+            //   leaving the loss beyond it to the insurance fund.
+            // - Under maintenance: liquidation seizes the account and leaves the fund to unload the
+            //   remainder, so the fund's exposure is the remainder's unload cost less the margin
+            //   behind it. Holding the ratio leaves no less margin per unit of remainder, so that
+            //   exposure can only shrink, whatever the unload costs. Requiring full MMR instead
+            //   would strand the account at its first partial fill, so a close walking several
+            //   makers could never start; requiring only that the shortfall not grow would let it
+            //   spend up to the whole MMR rate on execution against a colluding counterparty.
+            // The remainder's MMR is the pair's 24h-lagged effective rate, as liquidation reads it.
+            uint256 mmrBp = BucketLib.effectiveMmrBp(marginReqs);
+            int256 requiredAfter = int256(Math.mulDiv(mmrBp, remainingNotional, BazaarTypes.BP_SCALE));
+            int256 marginBefore = int256(state.effectiveCollateral) - int256(heldLoss);
+            int256 requiredBefore = int256(Math.mulDiv(mmrBp, state.currentNotional, BazaarTypes.BP_SCALE));
+            return marginAfter * requiredBefore >= marginBefore * requiredAfter;
         } else {
             // Flip — close existing fully, residual = fillSize − bucket.size on the new side
             uint256 closedNotional = Math.mulDiv(bucket.size, executionPrice, BazaarTypes.BAZAAR_SCALE);
@@ -1512,8 +1747,6 @@ library MatchingEngineLib {
             state.entryValue = fillNotional;
             newPosIsLong = orderIsLong;
             state.adjustedEntryFundingIndex = ctx.cachedFundingIdx;
-            state.entryMmrBp = ctx.marginReqs.mmrBp;
-            state.mmrUpdateTs = block.timestamp; // (re)stamp grace clock when entry MMR is set
 
             result.sizeDelta = int256(fillSize);
             if (orderIsLong) {
@@ -1538,8 +1771,6 @@ library MatchingEngineLib {
             state.adjustedSize = newSize;
             state.entryValue = newEntryValue;
             state.adjustedEntryFundingIndex = newWeightedFunding;
-            state.entryMmrBp = ctx.marginReqs.mmrBp;
-            state.mmrUpdateTs = block.timestamp; // (re)stamp grace clock when entry MMR is set
 
             result.sizeDelta = int256(fillSize);
             if (orderIsLong) {
@@ -1601,8 +1832,6 @@ library MatchingEngineLib {
                     state.entryValue = newNotional;
                     newPosIsLong = orderIsLong;
                     state.adjustedEntryFundingIndex = ctx.cachedFundingIdx;
-                    state.entryMmrBp = ctx.marginReqs.mmrBp;
-                    state.mmrUpdateTs = block.timestamp; // (re)stamp grace clock when entry MMR is set
                     if (orderIsLong) {
                         unchecked {
                             result.longOIDelta += int256(remainingFillSize);
@@ -1618,8 +1847,6 @@ library MatchingEngineLib {
                     state.adjustedSize = 0;
                     state.entryValue = 0;
                     state.adjustedEntryFundingIndex = 0;
-                    state.entryMmrBp = 0;
-                    state.mmrUpdateTs = 0; // clear grace clock when fully flat
                 }
             } else {
                 result.sizeDelta = -int256(fillSize);
@@ -1672,7 +1899,7 @@ library MatchingEngineLib {
         {
             uint256 keep = (state.adjustedSize > 0 && newIsLong != wasLong) ? 0 : state.adjustedSize;
             if (originalSize != 0 && keep == 0) {
-                _cancelTpSlOverSize(user, bucket, keep, orders, book, ctx.pairId, ctx.currentBlock);
+                _cancelTpSlOverSize(bucket, keep, orders, book, ctx.pairId, ctx.currentBlock);
             }
         }
     }
@@ -1711,7 +1938,6 @@ library MatchingEngineLib {
     ///      this is the shared exit for every path that empties a position and must stay correct
     ///      if a close-only type ever rests again.
     function _cancelTpSlOverSize(
-        address user,
         BazaarTypes.PositionBucket storage bucket,
         uint256 currentSize,
         mapping(uint256 => BazaarTypes.Order) storage orders,
@@ -1727,7 +1953,13 @@ library MatchingEngineLib {
             ) {
                 tpOrder.canceledBlock = currentBlock;
                 OrderBookLib.unlink(orders, book, bucket.takeProfitOrderId);
-                _emitOrderCanceled(pairId, bucket.takeProfitOrderId, user, tpOrder);
+                OrderBookLib.emitOrderUpdated(
+                    pairId,
+                    bucket.takeProfitOrderId,
+                    tpOrder,
+                    BazaarTypes.OrderAction.Canceled,
+                    BazaarTypes.CancelReason.PositionClosed
+                );
             }
             bucket.takeProfitOrderId = 0;
         }
@@ -1739,33 +1971,16 @@ library MatchingEngineLib {
             ) {
                 slOrder.canceledBlock = currentBlock;
                 OrderBookLib.unlink(orders, book, bucket.stopLossOrderId);
-                _emitOrderCanceled(pairId, bucket.stopLossOrderId, user, slOrder);
+                OrderBookLib.emitOrderUpdated(
+                    pairId,
+                    bucket.stopLossOrderId,
+                    slOrder,
+                    BazaarTypes.OrderAction.Canceled,
+                    BazaarTypes.CancelReason.PositionClosed
+                );
             }
             bucket.stopLossOrderId = 0;
         }
-    }
-
-    function _emitOrderCanceled(bytes32 pairId, uint256 orderId, address owner, BazaarTypes.Order storage o) private {
-        emit BazaarTypes.OrderUpdated(
-            pairId,
-            orderId,
-            owner,
-            BazaarTypes.OrderUpdatePayload({
-                action: BazaarTypes.OrderAction.Canceled,
-                orderType: o.orderType,
-                isLong: o.isLong,
-                isPostOnly: o.isPostOnly,
-                size: o.size,
-                filledSize: o.filledSize,
-                triggerPrice: o.triggerPrice,
-                limitPrice: o.limitPrice,
-                maxSlippageBp: o.maxSlippageBp,
-                canceledBlock: o.canceledBlock,
-                filledBlock: o.filledBlock,
-                expiryBlock: o.expiryBlock,
-                creationBlock: o.creationBlock
-            })
-        );
     }
 
     // ================================================================
@@ -1794,11 +2009,14 @@ library MatchingEngineLib {
         pure
         returns (BazaarTypes.WalkSummary memory sum)
     {
-        sum.totalMatchedVolume = res.totalMatchedVolume;
         sum.totalFillSize = res.totalFillSize;
-        sum.sumLiqGapTimesSize = res.sumLiqGapTimesSize;
+        // The weighted sums were accumulated as notional × weight and size × weight
+        // (_accrueMarkPrint); one division per walk puts them on the fill scale.
+        sum.markNotional = res.markNotional / FundingLib.MAKER_EXPOSURE_BLOCKS;
+        sum.markSize = res.markSize / FundingLib.MAKER_EXPOSURE_BLOCKS;
+        sum.sumLiqSlipTimesSize = res.sumLiqSlipTimesSize;
+        sum.sumLiqDriftTimesSize = res.sumLiqDriftTimesSize;
         sum.totalLiqFillSize = res.totalLiqFillSize;
-        sum.liqCount = res.liqCount;
     }
 
     /// @dev Apply a walk's accumulated deltas to storage: OI aggregates, the fee-ledger debit,
@@ -1830,15 +2048,9 @@ library MatchingEngineLib {
             // smaller buckets and withdraw LESS from the deposits ledger. Book it as a D → I
             // TRANSFER — a bare insurance credit raises expectedBalance (I + D) above actual
             // USDC with no cash counterpart, permanently, and enough accumulated vault/netting
-            // profits would false-trigger the reason-3 shortfall termination. Capped at D
-            // defensively; an uncredited excess errs as unclaimable surplus, never as an
-            // unbacked claim.
-            uint256 gain = uint256(res.totalVaultPnl);
-            uint256 take = gain < pairVault.totalCollateralDeposited ? gain : pairVault.totalCollateralDeposited;
-            pairVault.totalCollateralDeposited -= take;
-            unchecked {
-                pairVault.insuranceFundBalance += take;
-            }
+            // profits would false-trigger the reason-3 shortfall termination. What the ledger
+            // cannot pay is carried as its arrears to the fund.
+            RiskParamsLib.collectFromLedger(pairVault, uint256(res.totalVaultPnl));
         } else if (res.totalVaultPnl < 0) {
             // A vault loss is value flowing from insurance to the trader pot: it is the backing
             // for the surviving counterparties' offsetting gains, which they will realize into
@@ -1847,15 +2059,17 @@ library MatchingEngineLib {
             // the deposits ledger drifts below Σ bucket.collateral and the last withdrawers
             // underflow it despite their claims being fully cash-backed. I + D is invariant
             // under the transfer, so the books-vs-USDC health check's expected balance is
-            // unmoved. The uncovered overrun is unbacked bad debt (claims stay intact, backing
-            // is gone): recorded as realized deficit so the post-walk isVaultHealthy terminates
-            // the pair.
-            uint256 loss = uint256(-res.totalVaultPnl);
-            uint256 funded = loss < pairVault.insuranceFundBalance ? loss : pairVault.insuranceFundBalance;
-            pairVault.insuranceFundBalance -= funded;
-            pairVault.totalCollateralDeposited += funded;
-            if (loss > funded) {
-                pairVault.deficit += loss - funded;
+            // unmoved. Paid out of the earmark the walk released first, then net of the ledger's
+            // arrears (RiskParamsLib.fundLedgerFrom), so the fund's outlay is the loss beyond the
+            // estates' collateral, and the inventory left keeps its share of the arrears on every
+            // fill taken at or beyond the neutral price. The uncovered overrun is unbacked bad
+            // debt (claims stay intact, backing is gone): recorded as realized deficit so the
+            // post-walk isVaultHealthy terminates the pair.
+            uint256 uncovered = RiskParamsLib.fundLedgerFrom(
+                pairVault, uint256(-res.totalVaultPnl), res.vaultEarmarkReleased, pairVault.insuranceFundBalance
+            );
+            if (uncovered > 0) {
+                pairVault.deficit += uncovered;
             }
         }
 
@@ -1902,15 +2116,6 @@ library MatchingEngineLib {
         return ot == BazaarTypes.OrderType.TakeProfit || ot == BazaarTypes.OrderType.StopLoss;
     }
 
-    /// @dev Bind a firing TP/SL to the position it is closing. `size == 0` means "whatever the
-    ///      position holds"; any other size is capped at it. Both are resolved here, at the only
-    ///      moment the answer can be right — the position may have grown, shrunk, or vanished
-    ///      since creation, and a keeper fires the order much later than its owner wrote it.
-    ///
-    ///      The resolved amount is written back to storage rather than kept in memory: the
-    ///      fill path stamps an order terminal on `filledSize == size`, so a size-0 order left
-    ///      at 0 would close the position and still read as live, and the emitted events would
-    ///      report a size the order never traded.
     /// @dev True for the types that wait outside the book for an oracle price to reach them.
     function _isTriggerGated(BazaarTypes.OrderType ot) internal pure returns (bool) {
         return ot == BazaarTypes.OrderType.StopLimit || ot == BazaarTypes.OrderType.StopLoss

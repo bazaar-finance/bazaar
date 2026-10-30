@@ -45,7 +45,7 @@ contract StaleAndRewardEdgeTest is IntegrationBase {
         // Fresh price: creation clears the IMR.
         bytes[] memory fresh = _priceUpdateFor(AAPL_USD_FEED_ID, 200, uint64(vm.getBlockTimestamp()));
         _placeLimitAapl(alice, 1 * BAZAAR_SCALE, 200 * BAZAAR_SCALE, fresh);
-        (uint256[] memory ids,,,) = aaplPair.getUserActiveLimitOrders(alice);
+        (uint256[] memory ids,,,) = lens.getUserActiveLimitOrders(address(aaplPair), alice);
         assertEq(ids.length, 1, "fresh-price creation succeeds at 1x IMR");
 
         // Cancel, stale the cache, retry with an empty update: the SAME 1x IMR still clears.
@@ -53,7 +53,7 @@ contract StaleAndRewardEdgeTest is IntegrationBase {
         aaplPair.cancelOrders(ids, 0, 0, 0, "", "");
         vm.warp(vm.getBlockTimestamp() + 30);
         _placeLimitAapl(alice, 1 * BAZAAR_SCALE, 200 * BAZAAR_SCALE, new bytes[](0));
-        (uint256[] memory staleIds,,,) = aaplPair.getUserActiveLimitOrders(alice);
+        (uint256[] memory staleIds,,,) = lens.getUserActiveLimitOrders(address(aaplPair), alice);
         assertEq(staleIds.length, 1, "stale-price creation succeeds at the same 1x IMR");
     }
 
@@ -76,7 +76,7 @@ contract StaleAndRewardEdgeTest is IntegrationBase {
         BucketStore.setSize(address(aaplPair), dave, 1 * BAZAAR_SCALE); // size
         BucketStore.setEntryValue(address(aaplPair), dave, 200 * BAZAAR_SCALE); // entryValue
 
-        vm.warp(vm.getBlockTimestamp() + 30); // stale the cache (MAX_PRICE_STALENESS = 2s)
+        vm.warp(vm.getBlockTimestamp() + 30); // stale the cache (MAX_PRICE_STALENESS = 3s)
         vm.prank(dave);
         vm.expectRevert(CollateralLib.CollateralLib__WithdrawalRequiresFreshPrice.selector);
         aaplPair.withdrawCollateral(10 * BAZAAR_SCALE, new bytes[](0), 0, 0, 0, "");
@@ -127,7 +127,7 @@ contract StaleAndRewardEdgeTest is IntegrationBase {
         BucketStore.setSize(address(aaplPair), dave, 1 * BAZAAR_SCALE);
         BucketStore.setEntryValue(address(aaplPair), dave, 300 * BAZAAR_SCALE);
 
-        vm.warp(vm.getBlockTimestamp() + 30); // stale (MAX_PRICE_STALENESS = 2s)
+        vm.warp(vm.getBlockTimestamp() + 30); // stale (MAX_PRICE_STALENESS = 3s)
         vm.prank(bob);
         uint256 n = aaplPair.liquidate(_arr1(dave), new bytes[](0));
         assertEq(n, 1, "liquidated at the stale fallback price");

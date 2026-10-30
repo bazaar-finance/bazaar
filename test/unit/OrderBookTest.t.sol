@@ -4,6 +4,7 @@ pragma solidity 0.8.34;
 import {Test} from "forge-std/Test.sol";
 import {OrderBookLib} from "../../src/libraries/OrderBookLib.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
+import {FundingLib} from "../../src/libraries/FundingLib.sol";
 
 /// @notice Drives OrderBookLib over real storage: an orders mapping and an OrderBook struct,
 ///         mirroring how BazaarPair hosts them.
@@ -11,6 +12,8 @@ contract OrderBookHarness {
     mapping(uint256 => BazaarTypes.Order) internal orders;
     BazaarTypes.OrderBook internal book;
     uint256 internal nextOrderId = 1;
+    /// @dev The index every insert stamps the far-side premium against; 0 (no index) by default.
+    uint256 internal indexPrice;
 
     function create(bool isLong, uint256 limitPrice) external returns (uint256 orderId) {
         orderId = nextOrderId++;
@@ -20,10 +23,47 @@ contract OrderBookHarness {
         o.isLong = isLong;
         o.limitPrice = uint128(limitPrice);
         o.size = 1e18;
+        o.prioritySeq = uint48(orderId);
+    }
+
+    /// @dev Give a resting candidate the queue position an amendment would: a counter value past
+    ///      every id so far.
+    function setPrioritySeq(uint256 orderId, uint48 seq) external {
+        orders[orderId].prioritySeq = seq;
+    }
+
+    function setIndex(uint256 index) external {
+        indexPrice = index;
     }
 
     function insert(uint256 orderId, BazaarTypes.MatchHints calldata hints) external {
-        OrderBookLib.insert(orders, book, orderId, hints);
+        OrderBookLib.insert(orders, book, orderId, hints, uint64(block.number), indexPrice);
+    }
+
+    function restedBlock(uint256 orderId) external view returns (uint32) {
+        return orders[orderId].restedBlock;
+    }
+
+    function restedPremiumPpm(uint256 orderId) external view returns (uint16) {
+        return orders[orderId].restedPremiumPpm;
+    }
+
+    function locate(uint256 orderId, BazaarTypes.MatchHints calldata hints)
+        external
+        view
+        returns (bool found, uint64 pred)
+    {
+        return OrderBookLib.locate(orders, book, orderId, orders[orderId].prioritySeq, hints);
+    }
+
+    /// @dev locate under a queue position the order does not carry yet, as executeTriggers
+    ///      resolves an arming StopLimit's slot before writing its new prioritySeq.
+    function locateAt(uint256 orderId, uint64 seq, BazaarTypes.MatchHints calldata hints)
+        external
+        view
+        returns (bool found, uint64 pred)
+    {
+        return OrderBookLib.locate(orders, book, orderId, seq, hints);
     }
 
     function unlink(uint256 orderId) external {
@@ -166,6 +206,110 @@ contract OrderBookTest is Test {
         _assertList(false, _arr2(a2, a1));
     }
 
+    /// @notice Linking stamps the order with the block it joined the book in, and a relink
+    ///         restamps it: the stamp is the start of the order's exposure at its current slot,
+    ///         not the order's age.
+    function test_insert_stampsTheJoiningBlock_relinkRestamps() public {
+        vm.roll(1_000_000);
+        uint256 a = _mk(true, 100 * P, 0);
+        assertEq(h.restedBlock(a), 1_000_000, "stamped with the linking block");
+
+        vm.roll(1_000_300);
+        h.unlink(a);
+        assertEq(h.restedBlock(a), 1_000_000, "unlink leaves the stamp; it is read only for members");
+        h.insert(a, _hints(0));
+        assertEq(h.restedBlock(a), 1_000_300, "relinking restamps");
+    }
+
+    /// @notice Linking stamps how far on the far side of the index the order stood — a bid above
+    ///         it, an ask below it — in millionths of the index, rounded up; the near side, the
+    ///         index itself and a link with no index stamp zero.
+    function test_insert_stampsTheFarSidePremium() public {
+        h.setIndex(100 * P);
+        assertEq(h.restedPremiumPpm(_mk(true, 101 * P, 0)), 10_000, "bid 1% above the index");
+        assertEq(h.restedPremiumPpm(_mk(false, 99 * P, 0)), 10_000, "ask 1% below the index");
+        assertEq(h.restedPremiumPpm(_mk(true, 99 * P, 0)), 0, "bid below the index: near side");
+        assertEq(h.restedPremiumPpm(_mk(false, 101 * P, 0)), 0, "ask above the index: near side");
+        assertEq(h.restedPremiumPpm(_mk(true, 100 * P, 0)), 0, "at the index");
+        assertEq(h.restedPremiumPpm(_mk(false, 100 * P, 0)), 0, "at the index, ask side");
+        // 0.0333...% above: 333.33 ppm, rounded up.
+        assertEq(h.restedPremiumPpm(_mk(true, 100 * P + P / 30, 0)), 334, "rounded up");
+
+        h.setIndex(0);
+        assertEq(h.restedPremiumPpm(_mk(true, 150 * P, 0)), 0, "no index: nothing stamped");
+    }
+
+    /// @notice The stamp is capped at the mark's band: the mark never reads past it, so a farther
+    ///         quote proves no more.
+    function test_insert_farSidePremiumCappedAtTheBand() public {
+        h.setIndex(100 * P);
+        uint256 cap = FundingLib.MAX_MARK_DEVIATION_BP * FundingLib.RESTED_PREMIUM_SCALE / 10_000;
+        assertEq(h.restedPremiumPpm(_mk(true, 110 * P, 0)), cap, "bid 10% above: the band");
+        assertEq(h.restedPremiumPpm(_mk(false, 60 * P, 0)), cap, "ask 40% below: the band");
+        assertEq(h.restedPremiumPpm(_mk(true, 104 * P, 0)), cap, "exactly the band");
+    }
+
+    /// @notice A relink re-measures the stamp against the index of its own moment, and an unlink
+    ///         leaves it in place, read only for members.
+    function test_insert_relinkRemeasuresThePremium() public {
+        h.setIndex(100 * P);
+        uint256 a = _mk(true, 101 * P, 0);
+        assertEq(h.restedPremiumPpm(a), 10_000, "linked 1% over the index");
+
+        h.setIndex(102 * P);
+        h.unlink(a);
+        assertEq(h.restedPremiumPpm(a), 10_000, "unlink leaves the stamp");
+        h.insert(a, _hints(0));
+        assertEq(h.restedPremiumPpm(a), 0, "relinked on the near side of the new index");
+
+        h.setIndex(98 * P);
+        h.unlink(a);
+        h.insert(a, _hints(0));
+        // (101 - 98) / 98 = 3.0612%: 30612.24 ppm, rounded up.
+        assertEq(h.restedPremiumPpm(a), 30_613, "relinked on the far side of the next one");
+    }
+
+    /// @notice Within a price level the queue is ordered by prioritySeq, not by id: an older order
+    ///         that re-enters the level under a later queue position rests behind a younger one
+    ///         that was already there.
+    function test_insert_equalPrice_queuesByPrioritySeq() public {
+        uint256 a = h.create(true, 100 * P); // id 1
+        uint256 b = h.create(true, 100 * P); // id 2
+        h.insert(b, _hints(0));
+        h.setPrioritySeq(a, 3); // a is repriced onto the level after b rested there
+        h.insert(a, _hints(0));
+        uint256[] memory ids = h.traverse(true);
+        assertEq(ids.length, 2);
+        assertEq(ids[0], b, "the order already resting keeps the front");
+        assertEq(ids[1], a, "the lower id queues behind under its later queue position");
+        (bool found, uint64 pred) = h.locate(h.create(true, 100 * P), _hints(0));
+        assertTrue(found);
+        assertEq(pred, uint64(a), "a fresh order at the level queues behind both");
+    }
+
+    /// @notice locate resolves the slot under the queue position it is handed, not the one the
+    ///         order carries — how executeTriggers places an arming StopLimit before writing its
+    ///         new prioritySeq. An old id handed a later position lands behind the level, and the
+    ///         insert that follows under that stored value links at the slot locate reported.
+    function test_locate_atGivenSeq_resolvesUnderThatSeq() public {
+        uint256 s = h.create(true, 100 * P); // id 1, waiting outside the book like a dormant stop
+        uint256 m1 = _mk(true, 100 * P, 0); // id 2
+        uint256 m2 = _mk(true, 100 * P, uint64(m1)); // id 3
+        (bool found, uint64 pred) = h.locate(s, _hints(0));
+        assertTrue(found);
+        assertEq(pred, 0, "under its creation id the older order would take the front of the level");
+        (found, pred) = h.locateAt(s, 4, _hints(0));
+        assertTrue(found);
+        assertEq(pred, uint64(m2), "under a later queue position it rests behind the whole level");
+        h.setPrioritySeq(s, 4);
+        h.insert(s, _hints(pred));
+        uint256[] memory ids = h.traverse(true);
+        assertEq(ids.length, 3);
+        assertEq(ids[0], m1);
+        assertEq(ids[1], m2);
+        assertEq(ids[2], s, "linked where locate reported");
+    }
+
     function test_insert_equalPrice_queuesBehind() public {
         uint256 b1 = _mk(true, 100 * P, 0);
         uint256 b2 = _mk(true, 100 * P, uint64(b1)); // same price, newer id → behind
@@ -279,6 +423,61 @@ contract OrderBookTest is Test {
         h.insert(failId, _hints(uint64(okId)));
         (,,, askCount) = h.heads();
         assertEq(uint256(askCount), n + 2, "hinted insert landed");
+    }
+
+    function test_locate_headWhenEmptyOrAheadOfHead() public {
+        uint256 a = h.create(false, 5 * P);
+        (bool found, uint64 pred) = h.locate(a, _hints(0));
+        assertTrue(found, "empty side: found");
+        assertEq(uint256(pred), 0, "empty side: head slot");
+        h.insert(a, _hints(0));
+
+        uint256 b = h.create(false, 3 * P); // sorts ahead of the ask head
+        (found, pred) = h.locate(b, _hints(uint64(a)));
+        assertTrue(found, "ahead of head: found");
+        assertEq(uint256(pred), 0, "ahead of head: head slot, hint irrelevant");
+    }
+
+    function test_locate_matchesInsertPlacement() public {
+        uint256 a = _mk(false, 1 * P, 0);
+        uint256 c = _mk(false, 3 * P, uint64(a));
+        uint256 e = _mk(false, 5 * P, uint64(c));
+        uint256 d = h.create(false, 4 * P);
+
+        // Anchor two nodes short of the slot: the bounded walk names the same predecessor insert
+        // links behind.
+        (bool found, uint64 pred) = h.locate(d, _hints(uint64(a)));
+        assertTrue(found, "found");
+        assertEq(pred, uint64(c), "rests behind the 3P ask");
+        h.insert(d, _hints(pred));
+        (, uint64 prv, uint64 nxt,,) = h.node(d);
+        assertEq(uint256(prv), c, "prev");
+        assertEq(uint256(nxt), e, "next");
+    }
+
+    function test_locate_reportsNotFoundPastCap_neverReverts() public {
+        // One node past the length at which a tail insert from the head is exactly at the cap.
+        uint256 n = BazaarTypes.MAX_WALK_STEPS + 2;
+        uint256 prev = _mk(false, 1 * P, 0);
+        for (uint256 i = 2; i <= n; ++i) {
+            prev = _mk(false, i * P, uint64(prev));
+        }
+        uint256 id = h.create(false, (n + 1) * P);
+
+        (bool found, uint64 pred) = h.locate(id, _hints(0));
+        assertFalse(found, "tail slot is past the cap from the head anchor");
+        assertEq(uint256(pred), 0, "no predecessor reported");
+
+        // The same query with a live hint at the tail resolves without a walk.
+        (found, pred) = h.locate(id, _hints(uint64(prev)));
+        assertTrue(found, "exact hint resolves");
+        assertEq(pred, uint64(prev), "predecessor is the tail");
+
+        // locate mutated nothing either way.
+        (,,, uint64 askCount) = h.heads();
+        assertEq(uint256(askCount), n, "book untouched");
+        (bool inBook,,,,) = h.node(id);
+        assertFalse(inBook, "order not linked");
     }
 
     function test_insert_alreadyInBook_reverts() public {

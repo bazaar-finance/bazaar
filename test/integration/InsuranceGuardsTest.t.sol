@@ -31,17 +31,26 @@ contract InsuranceGuardsTest is IntegrationBase {
         pair.requestInsuranceWithdrawal(shares, 0, 0, 0, "", "");
     }
 
+    /// @dev A full live-pair redemption: the lock, then the paying call once it opens.
     function _execute(address user) internal {
-        bytes[] memory pu = _freshPrice();
-        vm.prank(user);
-        pair.executeInsuranceWithdrawal(pu, 0, 0, 0, "");
+        _redeemAt(user, 50_000);
     }
 
+    /// @dev Locks `user`'s redemption and expects its paying call to revert with `selector`: the
+    ///      rate limit is drawn on only by the call that pays.
+    function _claimExpect(address user, bytes4 selector) internal {
+        _executeRedemption(pair, user, _freshPrice());
+        _warpToRedemptionClaim(pair, user);
+        _executeExpect(user, selector);
+    }
+
+    /// @dev One call expecting `selector`; the gates it exercises run on the lock and the claim
+    ///      alike, so a first call meets them before anything is locked.
     function _executeExpect(address user, bytes4 selector) internal {
         bytes[] memory pu = _freshPrice();
         vm.prank(user);
         vm.expectRevert(selector);
-        pair.executeInsuranceWithdrawal(pu, 0, 0, 0, "");
+        pair.executeInsuranceWithdrawal(pu, 0, 0, 0, "", "");
     }
 
     // ============================ OI-based rate limits ============================
@@ -53,8 +62,8 @@ contract InsuranceGuardsTest is IntegrationBase {
         _openOI(); // OI notional $100k -> above-target period cap = 1% = $1,000
         _depositInsurance(carol, 30_000 * BAZAAR_SCALE); // fund ~ $34k -> ratio ~34% >> target
         _requestAll(carol);
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
-        _executeExpect(carol, InsuranceVaultLib.InsuranceVaultLib__RateLimitExceeded.selector);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
+        _claimExpect(carol, InsuranceVaultLib.InsuranceVaultLib__RateLimitExceeded.selector);
         assertGt(pair.insuranceShares(carol), 0, "shares retained after the blocked exit");
     }
 
@@ -65,7 +74,7 @@ contract InsuranceGuardsTest is IntegrationBase {
         // Request ~$400 of shares: comfortably below the above-target period cap of 1% x $100k = $1,000.
         vm.prank(carol);
         pair.requestInsuranceWithdrawal(400 * BAZAAR_SCALE, 0, 0, 0, "", "");
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
         uint256 usdcBefore = usdc.balanceOf(carol);
         _execute(carol);
         assertGt(usdc.balanceOf(carol), usdcBefore, "compliant withdrawal paid out");
@@ -87,7 +96,7 @@ contract InsuranceGuardsTest is IntegrationBase {
         pair.requestInsuranceWithdrawal(4_000 * BAZAAR_SCALE, 0, 0, 0, "", "");
         vm.prank(dave);
         pair.requestInsuranceWithdrawal(4_000 * BAZAAR_SCALE, 0, 0, 0, "", "");
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
 
         // Carol's withdrawal fits the fresh period budget and accrues into withdrawnThisPeriod.
         uint256 usdcBefore = usdc.balanceOf(carol);
@@ -95,7 +104,7 @@ contract InsuranceGuardsTest is IntegrationBase {
         assertGt(usdc.balanceOf(carol), usdcBefore, "first withdrawal within budget paid out");
 
         // Dave's withdrawal in the SAME 6h period pushes the cumulative total over the budget -> rejected.
-        _executeExpect(dave, InsuranceVaultLib.InsuranceVaultLib__RateLimitExceeded.selector);
+        _claimExpect(dave, InsuranceVaultLib.InsuranceVaultLib__RateLimitExceeded.selector);
         assertGt(pair.insuranceShares(dave), 0, "dave's shares retained after the blocked exit");
     }
 
@@ -116,7 +125,7 @@ contract InsuranceGuardsTest is IntegrationBase {
         // Withdraw 50 shares — many multiples of the 1%-of-OI cap ($1), but within the 10%-of-fund floor.
         vm.prank(carol);
         pair.requestInsuranceWithdrawal(50 * BAZAAR_SCALE, 0, 0, 0, "", "");
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
         uint256 usdcBefore = usdc.balanceOf(carol);
         _execute(carol);
         assertGt(usdc.balanceOf(carol), usdcBefore, "fund-floor withdrawal paid out despite tiny OI");
@@ -128,11 +137,11 @@ contract InsuranceGuardsTest is IntegrationBase {
         _openOI(); // OI notional $100k -> period cap = $500
         _depositInsurance(carol, 6_000 * BAZAAR_SCALE);
         _requestAll(carol);
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
         // Crush the fund so the ratio (0.9%) is below the 2% floor target, and carol's share
         // value (~$540) exceeds the $500 period cap.
         _stdstore.target(address(pair)).sig("pairVault()").depth(5).checked_write(900 * BAZAAR_SCALE);
-        _executeExpect(carol, InsuranceVaultLib.InsuranceVaultLib__RateLimitExceeded.selector);
+        _claimExpect(carol, InsuranceVaultLib.InsuranceVaultLib__RateLimitExceeded.selector);
     }
 
     /// @notice Under 0.5% of OI the OI term exceeds the whole fund, so only the 5%-of-fund ceiling
@@ -141,11 +150,11 @@ contract InsuranceGuardsTest is IntegrationBase {
         _openOI(); // OI notional $100k -> OI term = $500
         _depositInsurance(carol, 6_000 * BAZAAR_SCALE);
         _requestAll(carol);
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
         // Crush the fund to $400 (0.4% of OI): the $500 OI term is larger than the fund, so the OI
         // term alone would let carol's whole stake (~$218) leave. Ceiling = 5% x $400 = $20.
         _stdstore.target(address(pair)).sig("pairVault()").depth(5).checked_write(400 * BAZAAR_SCALE);
-        _executeExpect(carol, InsuranceVaultLib.InsuranceVaultLib__RateLimitExceeded.selector);
+        _claimExpect(carol, InsuranceVaultLib.InsuranceVaultLib__RateLimitExceeded.selector);
         assertGt(pair.insuranceShares(carol), 0, "shares retained after the blocked exit");
     }
 
@@ -159,14 +168,14 @@ contract InsuranceGuardsTest is IntegrationBase {
         // Carol requests 2.5% of the supply: worth 2.5% of the fund at any balance, inside the ceiling.
         _requestShares(carol, pair.totalInsuranceShares() / 40);
         _requestAll(dave);
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
         _stdstore.target(address(pair)).sig("pairVault()").depth(5).checked_write(400 * BAZAAR_SCALE);
 
         uint256 usdcBefore = usdc.balanceOf(carol);
         _execute(carol);
         assertGt(usdc.balanceOf(carol), usdcBefore, "withdrawal inside the fund ceiling paid out");
         // Dave's stake (~$141) is far past what remains of the period budget.
-        _executeExpect(dave, InsuranceVaultLib.InsuranceVaultLib__RateLimitExceeded.selector);
+        _claimExpect(dave, InsuranceVaultLib.InsuranceVaultLib__RateLimitExceeded.selector);
     }
 
     // ============================ vote-lock ============================
@@ -176,16 +185,16 @@ contract InsuranceGuardsTest is IntegrationBase {
     function test_voteLock_blocksWithdrawalOfVotedShares() public {
         BazaarPairTerminator terminator = factory.pairTerminator();
         _depositInsurance(carol, 10_000 * BAZAAR_SCALE);
-        _requestAll(carol); // executable in [T0+20d, T0+23d]
+        _requestAll(carol); // executable from T0 + cooldown until the window closes
 
         // Inside the execute window: propose + vote ALL shares -> they lock.
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1 hours);
-        uint256 bond = 500 * USDC_SCALE;
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1 hours);
+        uint256 bond = 1_000 * USDC_SCALE; // INSURER_TERMINATION_BOND_USDC
         usdc.mint(carol, bond);
         vm.startPrank(carol);
         usdc.approve(address(terminator), bond);
-        terminator.proposeInsurerTermination(address(pair));
-        terminator.voteForInsurerTermination(address(pair), pair.insuranceShares(carol));
+        bytes32 id = terminator.proposeInsurerTermination(address(pair), uint64(vm.getBlockTimestamp()) + 1 days);
+        terminator.voteForInsurerTermination(address(pair), id, pair.insuranceShares(carol));
         vm.stopPrank();
 
         _executeExpect(carol, InsuranceVaultLib.InsuranceVaultLib__SharesLockedForVoting.selector);
@@ -199,13 +208,13 @@ contract InsuranceGuardsTest is IntegrationBase {
         vm.prank(carol);
         pair.requestInsuranceWithdrawal(5_000 * BAZAAR_SCALE, 0, 0, 0, "", "");
 
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1 hours);
-        uint256 bond = 500 * USDC_SCALE;
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1 hours);
+        uint256 bond = 1_000 * USDC_SCALE; // INSURER_TERMINATION_BOND_USDC
         usdc.mint(carol, bond);
         vm.startPrank(carol);
         usdc.approve(address(terminator), bond);
-        terminator.proposeInsurerTermination(address(pair));
-        terminator.voteForInsurerTermination(address(pair), 4_000 * BAZAAR_SCALE); // 5k + 4k <= 10k
+        bytes32 id = terminator.proposeInsurerTermination(address(pair), uint64(vm.getBlockTimestamp()) + 1 days);
+        terminator.voteForInsurerTermination(address(pair), id, 4_000 * BAZAAR_SCALE); // 5k + 4k <= 10k
         vm.stopPrank();
 
         uint256 usdcBefore = usdc.balanceOf(carol);
@@ -219,8 +228,9 @@ contract InsuranceGuardsTest is IntegrationBase {
     /// @dev The vault holds one unit of inherited long inventory at a $60k entry with half the
     ///      fund seized alongside it, staged directly so no fill, unload or health check runs
     ///      between the drift and the redemption — the thin-book case. Free capital is the other
-    ///      half of the fund, so the ADL trigger sits at 80% of that; the mark each test resolves
-    ///      decides how far past the seizure the inventory has drifted.
+    ///      half of the fund, so the ADL gate opens once the loss beyond the seizure passes that
+    ///      half less the reserve; the mark each test resolves decides how far past the seizure
+    ///      the inventory has drifted.
     function _stageDriftingInventory() internal returns (uint256 fund) {
         fund = _insuranceBal();
         _stageHeldInventory(60_000 * BAZAAR_SCALE, fund / 2);
@@ -237,45 +247,54 @@ contract InsuranceGuardsTest is IntegrationBase {
     function test_insuranceWithdrawal_blockedByLiveExposure_latchUnset() public {
         _depositInsurance(carol, 1_000 * BAZAAR_SCALE);
         _requestShares(carol, 200 * BAZAAR_SCALE);
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
         uint256 fund = _stageDriftingInventory();
-        // At a $50k mark the loss beyond the seizure is $10k - fund/2, past 80% of the free half.
-        assertGt(10_000 * BAZAAR_SCALE - fund / 2, (fund / 2) * 80 / 100, "fixture clears the ADL trigger");
+        // At a $50k mark the loss beyond the seizure is $10k - fund/2, past the whole free half.
+        assertGt(10_000 * BAZAAR_SCALE - fund / 2, fund / 2, "fixture clears the ADL trigger");
         assertEq(pair.adlPendingSince(), 0, "no health check has run since the drift");
 
         bytes[] memory pu = _priceAt(50_000);
         vm.prank(carol);
         vm.expectRevert(InsuranceVaultLib.InsuranceVaultLib__AdlBlocking.selector);
-        pair.executeInsuranceWithdrawal(pu, 0, 0, 0, "");
+        pair.executeInsuranceWithdrawal(pu, 0, 0, 0, "", "");
 
         assertEq(pair.adlPendingSince(), 0, "the reverted call leaves no latch behind");
         assertEq(pair.insuranceShares(carol), 1_000 * BAZAAR_SCALE, "shares retained");
         assertEq(_insuranceBal(), fund, "fund untouched");
     }
 
-    /// @notice Control: the same inventory judged at a mark that keeps the loss under the trigger
+    /// @notice Control: the same staging judged at a mark that keeps the loss under the trigger
     ///         lets the redemption through — so the block above is the live verdict, not the mere
     ///         presence of inventory. It is priced on the free half less the loss the fund bears
-    ///         at that mark, which the leaver carries their share of.
+    ///         at that mark, which the leaver carries their share of. The fund is large enough
+    ///         that the free half also covers the most the payout cap can keep back, the reserve at
+    ///         the unload band's upper edge plus the cost of finishing the inventory at its lower
+    ///         edge, so the claim is paid whole.
     function test_insuranceWithdrawal_exposureUnderTrigger_proceeds() public {
-        _depositInsurance(carol, 1_000 * BAZAAR_SCALE);
+        _depositInsurance(carol, 20_000 * BAZAAR_SCALE);
         _requestShares(carol, 200 * BAZAAR_SCALE);
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
         uint256 fund = _stageDriftingInventory();
-        // At a $57k mark the loss beyond the seizure is $3k - fund/2, under 80% of the free half.
-        uint256 loss = 3_000 * BAZAAR_SCALE - fund / 2;
-        assertLt(loss, (fund / 2) * 80 / 100, "fixture stays under the ADL trigger");
+        // At a $46k mark the loss beyond the seizure is $14k - fund/2, and finishing at the band's
+        // lower edge, at most LIQ_MAX_SLIPPAGE_BP under the mark, costs at most $16.3k - fund/2.
+        // The inventory is the only open interest, so the reserve the cap values at the band's
+        // upper edge, at most LIQ_MAX_SLIPPAGE_BP over the mark, is at most 1% of the notional
+        // there (ADL_RESERVE_BP of INSURANCE_TARGET_MAX). The free half covers both, and with them
+        // the loss, with the claim to spare.
+        uint256 loss = 14_000 * BAZAAR_SCALE - fund / 2;
+        uint256 finish = 16_300 * BAZAAR_SCALE - fund / 2;
+        uint256 reserveBound = 48_300 * BAZAAR_SCALE / 100;
+        (uint256 longOI, uint256 shortOI,,,,,,,,,,,,,,,) = pair.pairVault();
+        assertEq(longOI + shortOI, 0, "fixture: the inventory is the only open interest");
         uint256 supply = pair.totalInsuranceShares();
+        uint256 claim = 200 * BAZAAR_SCALE * (fund / 2 - loss) / supply;
+        assertLt(reserveBound + finish + claim, fund / 2, "fixture leaves the claim under the payout cap");
 
         uint256 before = usdc.balanceOf(carol);
-        bytes[] memory pu = _priceAt(57_000);
-        vm.prank(carol);
-        pair.executeInsuranceWithdrawal(pu, 0, 0, 0, "");
+        _redeemAt(carol, 46_000);
 
         uint256 paid = (usdc.balanceOf(carol) - before) * 1e12;
-        assertApproxEqRel(
-            paid, 200 * BAZAAR_SCALE * (fund / 2 - loss) / supply, 1e15, "priced on the free half less the loss"
-        );
+        assertApproxEqRel(paid, claim, 1e15, "priced on the free half less the loss");
         assertLt(paid, 200 * BAZAAR_SCALE * (fund / 2) / supply, "strictly below the free-half price");
         assertEq(pair.adlPendingSince(), 0, "a healthy verdict leaves no latch");
     }
@@ -283,7 +302,8 @@ contract InsuranceGuardsTest is IntegrationBase {
     /// @notice On a non-continuously traded pair the venue's closure freezes the mark, and the
     ///         redemption refuses that frozen fallback outright: off-chain venues print the reopen
     ///         hours before the oracle can, and the fund is sized to absorb exactly that gap. The
-    ///         same matured request clears with the first fresh print.
+    ///         first fresh print locks the same matured request, and the paying call opens a reopen
+    ///         delay after it, once keepers have had time to book what the gap revealed.
     function test_insuranceWithdrawal_staleMark_requiresFreshPrice() public {
         // Warm the AAPL mark so the stale fallback has a price to resolve.
         bytes[] memory warm = _priceUpdateFor(AAPL_USD_FEED_ID, 150, uint64(vm.getBlockTimestamp()));
@@ -297,19 +317,34 @@ contract InsuranceGuardsTest is IntegrationBase {
         aaplPair.requestInsuranceWithdrawal(200 * BAZAAR_SCALE, 0, 0, 0, "", "");
         vm.stopPrank();
         // Ages the cache past MAX_PRICE_STALENESS: empty calldata now resolves the stale fallback.
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
 
         vm.prank(carol);
         vm.expectRevert(BazaarPair.BazaarPair__InsuranceWithdrawalRequiresFreshPrice.selector);
-        aaplPair.executeInsuranceWithdrawal(new bytes[](0), 0, 0, 0, "");
+        aaplPair.executeInsuranceWithdrawal(new bytes[](0), 0, 0, 0, "", "");
         assertEq(aaplPair.insuranceShares(carol), 1_000 * BAZAAR_SCALE, "shares retained while frozen");
 
-        // The reopen: a fresh print clears the same matured request.
+        // The reopen: the first fresh print locks the same matured request and pays nothing.
         bytes[] memory fresh = _priceUpdateFor(AAPL_USD_FEED_ID, 150, uint64(vm.getBlockTimestamp()));
         uint256 before = usdc.balanceOf(carol);
         vm.prank(carol);
-        aaplPair.executeInsuranceWithdrawal(fresh, 0, 0, 0, "");
-        assertGt(usdc.balanceOf(carol), before, "redeemed on the fresh print");
+        aaplPair.executeInsuranceWithdrawal(fresh, 0, 0, 0, "", "");
+        assertEq(usdc.balanceOf(carol), before, "the reopen print only locks");
+        assertEq(aaplPair.insuranceShares(carol), 1_000 * BAZAAR_SCALE, "nothing burned at the lock");
+
+        // That print ended the closure, so the paying call opens a reopen delay after it rather
+        // than a claim delay after the lock.
+        (,,, uint256 opensTs,) = lens.getInsuranceWithdrawalLock(address(aaplPair), carol);
+        assertEq(
+            opensTs,
+            vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_REOPEN_CLAIM_DELAY,
+            "claim opens a reopen delay after the print"
+        );
+        vm.warp(opensTs);
+        fresh = _priceUpdateFor(AAPL_USD_FEED_ID, 150, uint64(vm.getBlockTimestamp()));
+        vm.prank(carol);
+        aaplPair.executeInsuranceWithdrawal(fresh, 0, 0, 0, "", "");
+        assertGt(usdc.balanceOf(carol), before, "redeemed once the claim opened");
         assertEq(aaplPair.insuranceShares(carol), 800 * BAZAAR_SCALE, "requested shares burned");
     }
 
@@ -319,7 +354,7 @@ contract InsuranceGuardsTest is IntegrationBase {
     function test_insuranceWithdrawal_discoveringShortfall_reverts() public {
         _depositInsurance(carol, 1_000 * BAZAAR_SCALE);
         _requestShares(carol, 200 * BAZAAR_SCALE);
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
         vm.prank(address(pair));
         usdc.transfer(makeAddr("driftSink"), 1_000 * USDC_SCALE);
 
@@ -357,7 +392,7 @@ contract InsuranceGuardsTest is IntegrationBase {
         vm.prank(pair.umaContract());
         pair.fixSettlementPrice(50_000 * BAZAAR_SCALE);
         pair.finalizeTermination();
-        assertEq(pair.auxState().terminalPrincipalRatioBp, 7_500, "ratio = cash / principal");
+        assertEq(pair.auxState().terminalPrincipalRatio, 75 * BAZAAR_SCALE / 100, "ratio = cash / principal");
 
         // 1,000 nominal pays 750.
         uint256 before1 = usdc.balanceOf(alice);
@@ -419,7 +454,7 @@ contract InsuranceGuardsTest is IntegrationBase {
     ///      deposits `amount`.
     function _orphanThenRecap(uint256 orphan, uint256 amount) internal {
         _requestAll(deployer);
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
         _execute(deployer);
         assertEq(pair.totalInsuranceShares(), 0, "share supply fully exited");
 
@@ -445,12 +480,12 @@ contract InsuranceGuardsTest is IntegrationBase {
 
         // Full exit: carol gets back exactly her contribution; the orphan is unreachable.
         _requestAll(carol);
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
         uint256 usdcBefore = usdc.balanceOf(carol);
         _execute(carol);
         assertEq(usdc.balanceOf(carol) - usdcBefore, 100 * USDC_SCALE, "withdrew exactly her deposit");
         assertEq(pair.totalInsuranceShares(), orphan, "only locked shares remain");
-        (,,,,, uint256 fund,,,,,,,,) = pair.pairVault();
+        (,,,,, uint256 fund,,,,,,,,,,,) = pair.pairVault();
         assertEq(fund, orphan, "orphan stays in the fund as buffer");
     }
 
@@ -541,7 +576,7 @@ contract InsuranceGuardsTest is IntegrationBase {
 
         _drainAndRescue(dave, 10_000 * BAZAAR_SCALE); // bump: carol's stake is wiped
 
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
         _executeExpect(carol, InsuranceVaultLib.InsuranceVaultLib__WithdrawalRequestStaleEpoch.selector);
         assertEq(pair.totalInsuranceShares(), 10_000 * BAZAAR_SCALE, "new-epoch supply untouched");
         assertEq(pair.getSharesAsOf(carol, uint64(vm.getBlockTimestamp())), 0, "no stale voting power");
@@ -555,7 +590,8 @@ contract InsuranceGuardsTest is IntegrationBase {
     function test_shareEpoch_RipeRequestVoidedByBump_NoCooldownSkipOnRedeposit() public {
         _drainAndRescue(carol, 10_000 * BAZAAR_SCALE);
         _requestAll(carol);
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1); // request ripens: window open
+        // The request ripens: its window is open.
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
 
         _drainAndRescue(dave, 10_000 * BAZAAR_SCALE); // wipe + bump: carol's stake -> 0
 
@@ -567,7 +603,7 @@ contract InsuranceGuardsTest is IntegrationBase {
         // The legitimate path: re-request in the current epoch and serve the full cooldown.
         _requestAll(carol);
         _executeExpect(carol, InsuranceVaultLib.InsuranceVaultLib__CooldownNotElapsed.selector);
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
         uint256 usdcBefore = usdc.balanceOf(carol);
         _execute(carol);
         assertGt(usdc.balanceOf(carol), usdcBefore, "fresh-epoch request pays out after its own cooldown");
@@ -586,6 +622,29 @@ contract InsuranceGuardsTest is IntegrationBase {
         assertEq(lens.getInsuranceDepositValue(address(pair), carol), 100 * BAZAAR_SCALE, "carol's claim = her deposit");
     }
 
+    /// @notice Cash under $1 is not a dead pool while the deposits ledger owes the fund more: the
+    ///         arrears are the fund's to collect, so the next deposit is priced against the cash
+    ///         plus the arrears and the incumbents' shares stay live. $0.50 of cash and $99.50 owed
+    ///         make a $100 basis, so a $100 deposit mints the supply over again, and the lens quotes
+    ///         the same count.
+    function test_shareEpoch_cashUnderOneDollarWithArrears_isNotReset() public {
+        _stdstore.target(address(pair)).sig("pairVault()").depth(5).checked_write(BAZAAR_SCALE / 2); // $0.50
+        _stdstore.target(address(pair)).sig("pairVault()").depth(14).checked_write(99.5e18); // $99.50 owed
+        uint256 seedShares = pair.insuranceShares(deployer);
+        uint256 supply = pair.totalInsuranceShares();
+        assertGt(seedShares, 0, "premise: the seed LP holds live shares");
+        (uint256 spot,,,,) = pair.lastPairPrice();
+        assertEq(
+            lens.quoteInsuranceDeposit(address(pair), 100 * BAZAAR_SCALE, spot), supply, "the quote prices the arrears"
+        );
+
+        _depositInsurance(carol, 100 * BAZAAR_SCALE);
+
+        assertEq(pair.insuranceShares(deployer), seedShares, "the incumbents' shares stay live");
+        assertEq(pair.insuranceShares(carol), supply, "priced against $100 of cash and arrears");
+        assertEq(pair.totalInsuranceShares(), 2 * supply, "no reset");
+    }
+
     /// @notice The insurer-termination vote denominator must exclude the locked orphan shares —
     ///         they can never vote, so counting them could deadlock the 60% threshold forever.
     function test_insurerVote_snapshotExcludesLockedOrphanShares() public {
@@ -594,14 +653,14 @@ contract InsuranceGuardsTest is IntegrationBase {
         vm.warp(vm.getBlockTimestamp() + 7 days);
 
         BazaarPairTerminator terminator = factory.pairTerminator();
-        uint256 bond = 500 * USDC_SCALE;
+        uint256 bond = 1_000 * USDC_SCALE; // INSURER_TERMINATION_BOND_USDC
         usdc.mint(carol, bond);
         vm.startPrank(carol);
         usdc.approve(address(terminator), bond);
-        terminator.proposeInsurerTermination(address(pair));
+        bytes32 id = terminator.proposeInsurerTermination(address(pair), uint64(vm.getBlockTimestamp()) + 1 days);
         vm.stopPrank();
 
-        (,,,,, uint256 snapTotal,,) = terminator.insurerProposals(address(pair));
+        (,,,,,,, uint256 snapTotal,,,,,,,,) = terminator.insurerProposals(id);
         assertEq(snapTotal, pair.insuranceShares(carol), "vote denominator counts live shares only");
     }
 

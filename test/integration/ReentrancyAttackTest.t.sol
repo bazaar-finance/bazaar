@@ -3,7 +3,7 @@ pragma solidity 0.8.34;
 
 import {IntegrationBase} from "./IntegrationBase.sol";
 import {BazaarPair} from "../../src/BazaarPair.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 
 /// @dev Malicious ETH receiver. `_refundEth` sends excess msg.value back to the caller with a raw
 ///      call and EMPTY calldata, landing on receive(); the actor re-enters a nonReentrant entrypoint
@@ -72,7 +72,7 @@ contract ReentrancyAttackTest is IntegrationBase {
         assertFalse(actor.reentrySucceeded(), "reentrant liquidate must be rejected");
         assertEq(
             bytes4(actor.reentryReturndata()),
-            ReentrancyGuard.ReentrancyGuardReentrantCall.selector,
+            ReentrancyGuardTransient.ReentrancyGuardReentrantCall.selector,
             "rejected by the reentrancy guard, not some other revert"
         );
     }
@@ -87,7 +87,7 @@ contract ReentrancyAttackTest is IntegrationBase {
         assertFalse(actor.reentrySucceeded(), "cross-function reentry must be rejected");
         assertEq(
             bytes4(actor.reentryReturndata()),
-            ReentrancyGuard.ReentrancyGuardReentrantCall.selector,
+            ReentrancyGuardTransient.ReentrancyGuardReentrantCall.selector,
             "guard is global across entrypoints"
         );
     }

@@ -4,24 +4,25 @@ pragma solidity 0.8.34;
 import {IntegrationBase} from "./IntegrationBase.sol";
 import {BazaarPair} from "../../src/BazaarPair.sol";
 import {InsuranceVaultLib} from "../../src/libraries/InsuranceVaultLib.sol";
+import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 
 /// @title InsuranceSharePriceTest
 /// @notice Share pricing against the fund's value at the mark while the vault holds inventory.
 ///         Both bases start from free capital — the fund less the collateral seized alongside
 ///         the inventory, which leaves again when it unloads — and add the inventory's
-///         unrealized result: a redemption counts the loss the fund bears and never a gain; a
-///         deposit counts both on a fresh mark and the gain only on a stale one; a loss counts
-///         only up to free capital above the reserve, where the ADL takes the rest from winners.
+///         unrealized result: a redemption counts the loss the fund bears and never a gain, and a
+///         deposit counts both and refuses a stale mark. Past free capital above the reserve the
+///         ADL takes the rest of a loss from winners, and a deposit is refused there.
 contract InsuranceSharePriceTest is IntegrationBase {
     uint256 constant MARK = 50_000 * BAZAAR_SCALE; // the BTC mark every fresh update here carries
     uint256 constant AAPL_MARK = 150 * BAZAAR_SCALE;
 
     function _insuranceBalance() internal view returns (uint256 b) {
-        (,,,,, b,,,,,,,,) = pair.pairVault();
+        (,,,,, b,,,,,,,,,,,) = pair.pairVault();
     }
 
     function _fundOf(BazaarPair target) internal view returns (uint256 b) {
-        (,,,,, b,,,,,,,,) = target.pairVault();
+        (,,,,, b,,,,,,,,,,,) = target.pairVault();
     }
 
     function _requestAll(address user) internal returns (uint256 shares) {
@@ -30,10 +31,10 @@ contract InsuranceSharePriceTest is IntegrationBase {
         pair.requestInsuranceWithdrawal(shares, 0, 0, 0, "", "");
     }
 
+    /// @dev A full live-pair redemption at the $50k mark: the lock, then the paying call once it
+    ///      opens.
     function _execute(address user) internal {
-        bytes[] memory pu = _freshPrice();
-        vm.prank(user);
-        pair.executeInsuranceWithdrawal(pu, 0, 0, 0, "");
+        _redeemAt(user, 50_000);
     }
 
     /// @dev Stage the vault long one unit with `seized` banked alongside it, at the entry that
@@ -51,14 +52,14 @@ contract InsuranceSharePriceTest is IntegrationBase {
         return int256(seized) + int256(mark) - int256(entry) - target.currentFundingIndex();
     }
 
-    /// @dev Reserve the unload walk keeps: ADL_RESERVE_BP (20%) of the target on the one staged
-    ///      unit at `mark`, with no other open interest.
+    /// @dev Reserve the unload walk keeps: ADL_RESERVE_BP of the target on the one staged unit at
+    ///      `mark`, with no other open interest.
     function _reserveAt(uint256 mark, uint256 targetBp) internal pure returns (uint256) {
-        return mark * targetBp * 2_000 / 1e8;
+        return mark * targetBp * BazaarTypes.ADL_RESERVE_BP / 1e8;
     }
 
     function _cachedTargetBp() internal view returns (uint256 t) {
-        (,,,,,,,,,,,, t,) = pair.pairVault();
+        (,,,,,,,,,,,, t,,,,) = pair.pairVault();
     }
 
     /// @dev Direct deposit into `target` carrying `pu` as the price update.
@@ -81,7 +82,7 @@ contract InsuranceSharePriceTest is IntegrationBase {
         uint256 shares = 100 * BAZAAR_SCALE;
         vm.prank(carol);
         pair.requestInsuranceWithdrawal(shares, 0, 0, 0, "", "");
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
 
         uint256 fund = _insuranceBalance();
         uint256 seized = fund / 2;
@@ -107,7 +108,7 @@ contract InsuranceSharePriceTest is IntegrationBase {
         uint256 shares = 100 * BAZAAR_SCALE;
         vm.prank(carol);
         pair.requestInsuranceWithdrawal(shares, 0, 0, 0, "", "");
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
 
         uint256 fund = _insuranceBalance();
         uint256 seized = fund / 2;
@@ -129,7 +130,7 @@ contract InsuranceSharePriceTest is IntegrationBase {
         _depositInsurance(carol, 30_000 * BAZAAR_SCALE);
         uint256 fundBefore = _insuranceBalance();
         _requestAll(carol);
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
 
         _execute(carol);
         assertLt(_insuranceBalance(), fundBefore / 4, "no earmark, so the exit takes the fund");
@@ -140,14 +141,14 @@ contract InsuranceSharePriceTest is IntegrationBase {
     function test_withdraw_fullyCommittedFund_reverts() public {
         _depositInsurance(carol, 30_000 * BAZAAR_SCALE);
         _requestAll(carol);
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
 
         _stageHeldInventory(60_000 * BAZAAR_SCALE, _insuranceBalance());
 
         bytes[] memory pu = _freshPrice();
         vm.prank(carol);
         vm.expectRevert(InsuranceVaultLib.InsuranceVaultLib__FundCommittedToInventory.selector);
-        pair.executeInsuranceWithdrawal(pu, 0, 0, 0, "");
+        pair.executeInsuranceWithdrawal(pu, 0, 0, 0, "", "");
         assertGt(pair.insuranceShares(carol), 0, "shares retained when pricing is blocked");
     }
 
@@ -194,28 +195,30 @@ contract InsuranceSharePriceTest is IntegrationBase {
         assertApproxEqRel(minted * (basis + amount) / (supply + minted), amount, 1e12, "whole after the loss");
     }
 
-    /// @notice The deduction stops at free capital above the reserve. Beyond it the ADL closes the
-    ///         inventory at the estates' bankruptcy price and the winners take the rest, so the
-    ///         fund keeps the reserve and a deposit is priced at exactly that.
-    function test_deposit_freshMark_lossCappedAtReserve() public {
+    /// @notice A loss past free capital above the reserve is the state a health check at this mark
+    ///         opens an ADL window on, where the auction closes the inventory at the estates'
+    ///         bankruptcy price and the winners take the rest. The deposit is refused there rather
+    ///         than priced, since capital arriving first would shrink that auction or cancel it.
+    function test_deposit_freshMark_lossPastHeadroom_refused() public {
         _depositInsurance(carol, 30_000 * BAZAAR_SCALE);
         uint256 fund = _insuranceBalance();
-        uint256 supply = pair.totalInsuranceShares();
         uint256 seized = fund / 2;
-        _setTargetInsuranceRatioBp(pair, 1_000); // 10% target: the reserve on one unit at the mark is 2% of it
+        _setTargetInsuranceRatioBp(pair, 1_000); // 10% target: the reserve on one unit at the mark is 1% of it
         // A loss far beyond free capital above the reserve.
         _stageNet(pair, MARK, seized, -30_000 * int256(BAZAAR_SCALE));
 
-        uint256 amount = 1_000 * BAZAAR_SCALE;
-        _depositInsurance(dave, amount);
-        uint256 minted = pair.insuranceShares(dave);
-
-        // The reserve the deposit was priced against, from the target the vault held at the time.
         uint256 reserve = _reserveAt(MARK, _cachedTargetBp());
         assertGt(reserve, 0, "sanity: a reserve exists");
         assertLt(reserve, fund - seized, "sanity: the reserve sits inside free capital");
         assertGt(30_000 * BAZAAR_SCALE, fund - seized - reserve, "sanity: the loss exceeds free capital above it");
-        assertApproxEqRel(minted, amount * supply / reserve, 1e12, "priced on the reserve");
+
+        uint256 amount = 1_000 * BAZAAR_SCALE;
+        bytes[] memory pu = _freshPrice();
+        vm.startPrank(dave);
+        usdc.approve(address(pair), amount * USDC_SCALE / BAZAAR_SCALE);
+        vm.expectRevert(InsuranceVaultLib.InsuranceVaultLib__AdlBlocking.selector);
+        pair.depositToInsurance(amount, pu, 0, 0, 0, "", "");
+        vm.stopPrank();
     }
 
     // ============================ deposits, price handling ============================
@@ -224,7 +227,7 @@ contract InsuranceSharePriceTest is IntegrationBase {
     ///         price update works even when the pair's cached price has long aged out.
     function test_deposit_noInventory_needsNoPrice() public {
         _depositInsurance(carol, 30_000 * BAZAAR_SCALE);
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
         uint256 fund = _insuranceBalance();
         uint256 supply = pair.totalInsuranceShares();
 
@@ -239,7 +242,7 @@ contract InsuranceSharePriceTest is IntegrationBase {
     function test_deposit_heldInventory_continuousPair_requiresPrice() public {
         _depositInsurance(carol, 30_000 * BAZAAR_SCALE);
         _stageHeldInventory(60_000 * BAZAAR_SCALE, _insuranceBalance() / 2);
-        vm.warp(vm.getBlockTimestamp() + 3);
+        vm.warp(vm.getBlockTimestamp() + 4);
 
         vm.startPrank(dave);
         usdc.approve(address(pair), 1_000 * USDC_SCALE);
@@ -267,7 +270,7 @@ contract InsuranceSharePriceTest is IntegrationBase {
         uint256 seized = 200 * BAZAAR_SCALE;
         uint256 entry = _stageNet(aaplPair, AAPL_MARK, seized, -50 * int256(BAZAAR_SCALE));
         // Ages the cache past MAX_PRICE_STALENESS: empty calldata now resolves the stale fallback.
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
 
         uint256 amount = 500 * BAZAAR_SCALE;
         vm.startPrank(dave);
@@ -297,7 +300,7 @@ contract InsuranceSharePriceTest is IntegrationBase {
         // Long from 250 with 200 seized: 100 in hand beyond the seizure at the 150 mark. (The
         // staging helper needs entry >= seized to place the bankruptcy notional.)
         _stageNet(aaplPair, AAPL_MARK, 200 * BAZAAR_SCALE, 100 * int256(BAZAAR_SCALE));
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
 
         vm.startPrank(dave);
         usdc.approve(address(aaplPair), 500 * USDC_SCALE);
@@ -313,7 +316,7 @@ contract InsuranceSharePriceTest is IntegrationBase {
     function test_deposit_staleMark_noInventory_clears() public {
         _warmAapl();
         _depositWith(aaplPair, carol, 1_000 * BAZAAR_SCALE, new bytes[](0));
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
 
         uint256 fund = _fundOf(aaplPair);
         uint256 supply = aaplPair.totalInsuranceShares();

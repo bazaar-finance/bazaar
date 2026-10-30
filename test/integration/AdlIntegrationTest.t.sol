@@ -2,6 +2,7 @@
 pragma solidity 0.8.34;
 
 import {Vm} from "forge-std/Vm.sol";
+import {BazaarPair} from "../../src/BazaarPair.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 import {IntegrationBase} from "./IntegrationBase.sol";
 
@@ -10,7 +11,7 @@ import {IntegrationBase} from "./IntegrationBase.sol";
 ///         exposure whose expected loss exceeds the fund's free capital above its reserve → ADL triggers (freezing
 ///         trading) → once the auction's score threshold decays the opposite-side winner is
 ///         deleveraged at the vault's bankruptcy price, insurance funds the credit, the vault
-///         exposure clears, and the margin curve is recomputed on completion.
+///         exposure clears, and the call refreshes the margin curve before it acts.
 contract AdlIntegrationTest is IntegrationBase {
     function test_e2e_Adl_TriggersOnDeepLiquidation_AndDeleveragesWinner() public {
         // Real matched pair: alice long 5 / bob short 5, filled at alice's resting $51k limit.
@@ -38,7 +39,7 @@ contract AdlIntegrationTest is IntegrationBase {
 
         // The same liquidate call re-evaluated vault health → ADL pending, vault holds dave's long.
         assertTrue(pair.isAdlPending(), "ADL triggered by the deep-underwater inheritance");
-        (,,,,,, uint256 pendSize,,,, bool pendIsLong,,,) = pair.pairVault();
+        (,,,,,, uint256 pendSize,,,, bool pendIsLong,,,,,,) = pair.pairVault();
         assertEq(pendSize, size, "vault inherited the 5 BTC");
         assertTrue(pendIsLong, "vault holds the long side");
 
@@ -60,12 +61,16 @@ contract AdlIntegrationTest is IntegrationBase {
         uint256 insBefore = _insuranceBal();
         uint256 bobCollBefore = _posCollateral(bob);
         bytes[] memory pu = _freshPrice();
+        bytes32 pid = pair.pairId();
+        // The release announces itself, tagged with the epoch the trigger announced.
+        vm.expectEmit(true, true, false, true, address(pair));
+        emit BazaarPair.AdlResolved(pid, 1);
         vm.prank(carol);
-        pair.executeAdl(_arr1(bob), pu);
+        pair.executeAdl(_arr1(bob), new address[](0), pu);
         _assertBooks("adl: after winner deleverage");
 
         assertFalse(pair.isAdlPending(), "ADL resolved");
-        (,,,,,, uint256 pendAfter,,,,,,,) = pair.pairVault();
+        (,,,,,, uint256 pendAfter,,,,,,,,,,) = pair.pairVault();
         // Bob alone covers the whole 5 BTC the vault inherited, but the batch is capped at the
         // size that restores the fund: it closes the part the exposure required and leaves the
         // rest with him. Closing all 5 would settle the remainder at the estates' bankruptcy
@@ -76,9 +81,9 @@ contract AdlIntegrationTest is IntegrationBase {
         assertGt(_posCollateral(bob), bobCollBefore, "bob credited settlement PnL at the bankruptcy price");
         assertLt(_insuranceBal(), insBefore, "insurance funded the winner credit");
 
-        // ADL completion also refreshes the margin curve (the MMR-recompute wiring).
-        (,, uint256 lastTs,,) = pair.marginRequirements();
-        assertEq(lastTs, vm.getBlockTimestamp(), "IMR/MMR recomputed on ADL completion");
+        // executeAdl refreshes the margin curve before it acts; past the cooldown the stamp is its own.
+        (,, uint256 lastTs,) = pair.marginRequirements();
+        assertEq(lastTs, vm.getBlockTimestamp(), "IMR/MMR recomputed by the ADL call");
     }
 
     /// @dev Scans the recorded logs for the pair's AdlTriggered event and decodes it.
@@ -132,7 +137,7 @@ contract AdlIntegrationTest is IntegrationBase {
         assertEq(pair.liquidate(_arr1(dave), _freshPrice()), 1, "dave liquidated");
         assertTrue(pair.isAdlPending(), "ADL triggered");
         {
-            (,,,,,, uint256 pend,,,,,,,) = pair.pairVault();
+            (,,,,,, uint256 pend,,,,,,,,,,) = pair.pairVault();
             assertEq(pend, 5 * BAZAAR_SCALE, "vault inherited exactly 5 BTC");
         }
         assertEq(_canceledBlock(tp), 0, "TP untouched by the liquidation");
@@ -140,7 +145,7 @@ contract AdlIntegrationTest is IntegrationBase {
         vm.warp(vm.getBlockTimestamp() + 15 minutes + 1);
         bytes[] memory pu = _freshPrice();
         vm.prank(carol);
-        pair.executeAdl(_arr1(bob), pu);
+        pair.executeAdl(_arr1(bob), new address[](0), pu);
 
         assertEq(pair.settlementPriceFixedTs(), 0, "pair survives the deleverage");
         // The batch is capped at the size that restores the fund, so it takes less than the 5 BTC

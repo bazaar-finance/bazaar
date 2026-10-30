@@ -12,19 +12,19 @@ contract BazaarIntegrationTest is IntegrationBase {
     ///         the insurance fund → the vault inherits the position as pending-liq exposure.
     function test_e2e_LiquidationSeizesToInsuranceAndVaultInherits() public {
         _setupInsolventAlice();
-        (, uint256 aliceSize,,,,,,,) = pair.positionBuckets(alice);
+        (, uint256 aliceSize,,,,,) = pair.positionBuckets(alice);
         assertEq(aliceSize, BAZAAR_SCALE / 10, "alice holds a 0.1 BTC long");
 
-        (,,,,, uint256 insBefore,,,,,,,,) = pair.pairVault();
+        (,,,,, uint256 insBefore,,,,,,,,,,,) = pair.pairVault();
 
         vm.prank(bob);
         assertEq(pair.liquidate(_arr1(alice), _freshPrice()), 1, "alice liquidated");
 
-        (, uint256 aliceSizeAfter,, uint256 aliceColl,,,,,) = pair.positionBuckets(alice);
+        (, uint256 aliceSizeAfter,, uint256 aliceColl,,,) = pair.positionBuckets(alice);
         assertEq(aliceSizeAfter, 0, "position closed");
         assertEq(aliceColl, 0, "collateral fully seized");
 
-        (,,,,, uint256 insAfter, uint256 pendSize,,,, bool pendIsLong,,,) = pair.pairVault();
+        (,,,,, uint256 insAfter, uint256 pendSize,,,, bool pendIsLong,,,,,,) = pair.pairVault();
         assertGt(insAfter, insBefore, "insurance grew from the seizure");
         assertEq(pendSize, BAZAAR_SCALE / 10, "vault inherited the 0.1 BTC");
         assertTrue(pendIsLong, "vault holds the long side");

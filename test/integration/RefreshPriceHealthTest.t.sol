@@ -55,7 +55,7 @@ contract RefreshPriceHealthTest is IntegrationBase {
         // The auction is startable now: the only refusal left is the empty submission, not the latch.
         bytes[] memory pu = _freshPrice();
         vm.expectRevert(AdlLib.AdlLib__EmptySubmission.selector);
-        pair.executeAdl(new address[](0), pu);
+        pair.executeAdl(new address[](0), new address[](0), pu);
     }
 
     /// @notice Under the trigger the refresh leaves no latch behind, so the block above is the
@@ -83,7 +83,7 @@ contract RefreshPriceHealthTest is IntegrationBase {
         mockPyth.updatePriceFeeds{value: mockPyth.getUpdateFee(warm)}(warm);
         aaplPair.refreshPrice(new bytes[](0));
 
-        (,,,,, uint256 fund,,,,,,,,) = aaplPair.pairVault();
+        (,,,,, uint256 fund,,,,,,,,,,,) = aaplPair.pairVault();
         // One unit long at an $8k entry with half the fund seized: at the $150 mark the loss
         // beyond the seizure is $7,850 - fund/2, past the whole free half.
         _stageHeldInventory(aaplPair, 8_000 * BAZAAR_SCALE, fund / 2);
@@ -118,21 +118,22 @@ contract RefreshPriceHealthTest is IntegrationBase {
     /// @notice The refresh that discovers a books-vs-balance shortfall fixes the settlement price
     ///         and is still paid for the fresh mark it stored; the next refresh is not.
     function test_refreshPrice_discoveringShortfall_fixesSettlement_bountyPaidOnce() public {
-        _openPosition(alice, bob, true, BAZAAR_SCALE / 2); // OI notional past the bounty floor
+        _openPosition(alice, bob, true, BAZAAR_SCALE / 2); // a live book for the shortfall to strand
         _depositInsurance(carol, 10_000 * BAZAAR_SCALE); // fund past the bounty floor
-        vm.warp(vm.getBlockTimestamp() + 11 minutes); // stored price older than the bounty gap
+        // The vault holds no inventory, so the bounty's gap is its one-day heartbeat.
+        vm.warp(vm.getBlockTimestamp() + 1 days + 1 minutes);
         vm.prank(address(pair));
         usdc.transfer(makeAddr("driftSink"), 1_000 * USDC_SCALE); // books now exceed cash
 
         _refreshAt(50_000);
 
-        assertEq(_escrowOwed(keeper), 0.25e18, "the refresh that opened the window is paid");
+        assertEq(_escrowOwed(keeper), 0.1e18, "the refresh that opened the window is paid");
         assertEq(pair.settlementPriceFixedTs(), vm.getBlockTimestamp(), "the shortfall fixed the settlement price");
-        assertEq(pair.fixedSettlementPrice(), 50_000 * BAZAAR_SCALE, "at the refreshed mark");
+        assertEq(pair.auxState().settlementPrice, 50_000 * BAZAAR_SCALE, "at the refreshed mark");
         assertFalse(pair.isPairTerminated(), "window open, not finalized");
 
-        vm.warp(vm.getBlockTimestamp() + 11 minutes);
+        vm.warp(vm.getBlockTimestamp() + 1 days + 1 minutes);
         _refreshAt(50_000);
-        assertEq(_escrowOwed(keeper), 0.25e18, "no bounty once the settlement price is fixed");
+        assertEq(_escrowOwed(keeper), 0.1e18, "no bounty once the settlement price is fixed");
     }
 }

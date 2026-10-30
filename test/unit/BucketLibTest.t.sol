@@ -40,8 +40,7 @@ contract BucketLibTest is Test {
         int256 entryFundingIndex,
         int256 globalFundingIndex,
         uint256 imrBp,
-        uint256 mmrBp,
-        uint256 entryMmrBp
+        uint256 mmrBp
     );
 
     function setUp() public {
@@ -58,9 +57,7 @@ contract BucketLibTest is Test {
                 collateral: 3,
                 entryFundingIndex: 4,
                 takeProfitOrderId: 55,
-                stopLossOrderId: 66,
-                entryMmrBp: 7,
-                mmrUpdateTs: 8
+                stopLossOrderId: 66
             })
         );
 
@@ -69,8 +66,6 @@ contract BucketLibTest is Test {
         st.entryValue = 200;
         st.effectiveCollateral = 300;
         st.adjustedEntryFundingIndex = 400;
-        st.entryMmrBp = 500;
-        st.mmrUpdateTs = 600;
         h.applyState(st);
 
         BazaarTypes.PositionBucket memory g = h.bucket();
@@ -79,8 +74,6 @@ contract BucketLibTest is Test {
         assertEq(g.entryValue, 200);
         assertEq(g.collateral, 300);
         assertEq(g.entryFundingIndex, 400);
-        assertEq(g.entryMmrBp, 500);
-        assertEq(g.mmrUpdateTs, 600);
         // preserved (not written by updateFromState)
         assertTrue(g.isLong);
         assertEq(g.takeProfitOrderId, 55);
@@ -96,18 +89,16 @@ contract BucketLibTest is Test {
                 collateral: 300,
                 entryFundingIndex: 400,
                 takeProfitOrderId: 0,
-                stopLossOrderId: 0,
-                entryMmrBp: 500,
-                mmrUpdateTs: 0
+                stopLossOrderId: 0
             })
         );
         BazaarTypes.MarginRequirements memory mr =
-            BazaarTypes.MarginRequirements({imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0, laggedMmrTs: 0});
+            BazaarTypes.MarginRequirements({imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0});
         bytes32 pid = bytes32("PID");
         address user = address(0xABCD);
 
         vm.expectEmit(true, true, false, true);
-        emit PositionBucketUpdated(pid, user, false, 100, 200, 300, 400, 999, 300, 150, 500);
+        emit PositionBucketUpdated(pid, user, false, 100, 200, 300, 400, 999, 300, 150);
         h.emitUpdate(user, 999, mr, pid);
     }
 }

@@ -14,6 +14,7 @@ contract BookkeepingHarness {
     mapping(address => BazaarTypes.PositionBucket) public positionBuckets;
     BazaarTypes.Vault public vault;
     BazaarTypes.FeeEscrow internal feeEscrow;
+    address[] internal deferred;
 
     function setBucket(
         address user,
@@ -75,11 +76,12 @@ contract BookkeepingHarness {
             positionBuckets,
             vault,
             feeEscrow,
+            deferred,
             BazaarTypes.LiquidateParams({
                 currentPrice: price,
                 currentFundingIndex: fundingIndex,
                 marginReqs: BazaarTypes.MarginRequirements({
-                    imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0, laggedMmrTs: 0
+                    imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0
                 }),
                 pairId: bytes32("TEST"),
                 currentBlock: 1
@@ -114,6 +116,10 @@ contract BookkeepingHarness {
 
     function pendingIsLong() external view returns (bool) {
         return vault.pendingLiqIsLong;
+    }
+
+    function pendingSeizedTs() external view returns (uint256) {
+        return vault.pendingLiqSeizedTs;
     }
 
     function insurance() external view returns (uint256) {
@@ -165,15 +171,18 @@ contract LiquidationBookkeepingTest is Test {
         // Opposing short 1 unit entered $49k, $10 collateral -> insolvent at $50k.
         h.setBucket(victim, false, 1 * SCALE, 49_000e18, 10e18, 0);
 
-        BazaarTypes.LiquidateResult memory r = h.liquidate(_arr(victim), PRICE, 0);
+        h.liquidate(_arr(victim), PRICE, 0);
 
         assertEq(h.pendingSize(), 1 * SCALE, "half the aggregate remains");
         assertTrue(h.pendingIsLong(), "side unchanged");
         assertEq(h.pendingEntry(), 50_000e18, "entry notional halved");
         assertEq(h.pendingBankruptcy(), 48_000e18, "bankruptcy notional halved");
         // netPnl = newEntryPortion(49k) - existingPortion(50k) = -1k; seizure +10; reward out.
+        assertEq(h.claimable(address(this)), 10e18, "the reward: 2 bp of the netted unit at $50k");
         assertEq(
-            h.insurance(), 5_000e18 + 10e18 - 1_000e18 - r.totalUpfrontReward, "net loss absorbed, collateral seized"
+            h.insurance(),
+            5_000e18 + 10e18 - 1_000e18 - h.claimable(address(this)),
+            "net loss absorbed, collateral seized"
         );
         // The loss is an I -> D TRANSFER (backing for the survivors' offsetting realized gains),
         // net of the -10 seizure transfer in the other direction.
@@ -191,7 +200,7 @@ contract LiquidationBookkeepingTest is Test {
         int256 currentIdx = 7e18;
         h.setBucket(victim, false, 3 * SCALE, 147_000e18, 10e18, currentIdx);
 
-        BazaarTypes.LiquidateResult memory r = h.liquidate(_arr(victim), PRICE, currentIdx);
+        h.liquidate(_arr(victim), PRICE, currentIdx);
 
         assertEq(h.pendingSize(), 2 * SCALE, "remainder after netting 1 against 1");
         assertFalse(h.pendingIsLong(), "side flipped to the new position's side");
@@ -202,12 +211,90 @@ contract LiquidationBookkeepingTest is Test {
         assertEq(h.pendingBankruptcy(), expectedBk, "remainder bankruptcy prorated");
         assertEq(h.pendingFundingIdx(), currentIdx, "flip stamps the new funding index");
         // Insurance: +10 seizure, -1,000 net entry PnL, -7 realized vault funding on the netted
-        // unit, minus the liquidator's reward.
+        // unit, minus the liquidator's reward: 2 bp of the one unit netted, not of all three.
+        assertEq(h.claimable(address(this)), 10e18, "the reward: 2 bp of the netted unit at $50k");
         assertEq(
-            h.insurance(), 5_000e18 + 10e18 - 1_000e18 - 7e18 - r.totalUpfrontReward, "netting PnL + funding realized"
+            h.insurance(),
+            5_000e18 + 10e18 - 1_000e18 - 7e18 - h.claimable(address(this)),
+            "netting PnL + funding realized"
         );
         // Mirror transfer into the deposits ledger (loss = 1,007), net of the -10 seizure.
         assertEq(h.depositsLedger(), 1_000_000e18 - 10e18 + 1_007e18, "deposits ledger credited by the netting loss");
+    }
+
+    // ---------------- seizure stamp: what the unload floor opens from ----------------
+
+    /// @notice Seeding the aggregate stamps the present instant.
+    function test_seizedTs_seededAtTheSeizure() public {
+        h.setBucket(victim, true, 1 * SCALE, 50_000e18, 10e18, 0);
+        h.liquidate(_arr(victim), PRICE, 0);
+        assertEq(h.pendingSeizedTs(), vm.getBlockTimestamp(), "stamped at the seizure");
+    }
+
+    /// @notice A same-side estate blends the stamp by size: three units seized two minutes after
+    ///         one move it three quarters of the way to now.
+    function test_seizedTs_sameSideJoinBlendsBySize() public {
+        uint256 t0 = vm.getBlockTimestamp();
+        h.setBucket(victim, true, 1 * SCALE, 50_000e18, 10e18, 0);
+        h.liquidate(_arr(victim), PRICE, 0);
+
+        vm.warp(t0 + 120);
+        address second = makeAddr("second");
+        h.setBucket(second, true, 3 * SCALE, 150_000e18, 10e18, 0);
+        h.liquidate(_arr(second), PRICE, 0);
+
+        assertEq(h.pendingSize(), 4 * SCALE, "merged");
+        assertEq(h.pendingSeizedTs(), t0 + 90, "(1 x t0 + 3 x (t0 + 120)) / 4");
+    }
+
+    /// @notice A dust estate joining a large aggregate barely moves the stamp, and the blend
+    ///         rounds up, so the aggregate never reads older than the estates in it.
+    function test_seizedTs_dustJoinBarelyMovesAndRoundsUp() public {
+        uint256 t0 = vm.getBlockTimestamp();
+        h.setBucket(victim, true, 100 * SCALE, 5_000_000e18, 10e18, 0);
+        h.liquidate(_arr(victim), PRICE, 0);
+
+        vm.warp(t0 + 180);
+        address dust = makeAddr("dust");
+        h.setBucket(dust, true, 1 * SCALE, 50_000e18, 10e18, 0);
+        h.liquidate(_arr(dust), PRICE, 0);
+
+        // (100 x t0 + 1 x (t0 + 180)) / 101 = t0 + 1.78, rounded up.
+        assertEq(h.pendingSeizedTs(), t0 + 2, "dust moves the stamp by a rounded-up fraction");
+    }
+
+    /// @notice An opposing estate smaller than the aggregate nets against it and leaves the stamp
+    ///         alone: the remainder is the same inventory, no younger.
+    function test_seizedTs_oppositeSmallerLeavesTheStamp() public {
+        uint256 t0 = vm.getBlockTimestamp();
+        h.setBucket(victim, true, 2 * SCALE, 100_000e18, 10e18, 0);
+        h.liquidate(_arr(victim), PRICE, 0);
+
+        vm.warp(t0 + 100);
+        address opp = makeAddr("opp");
+        h.setBucket(opp, false, 1 * SCALE, 49_000e18, 10e18, 0);
+        h.liquidate(_arr(opp), PRICE, 0);
+
+        assertEq(h.pendingSize(), 1 * SCALE, "netted down");
+        assertTrue(h.pendingIsLong(), "existing side survives");
+        assertEq(h.pendingSeizedTs(), t0, "stamp untouched");
+    }
+
+    /// @notice An opposing estate larger than the aggregate takes it over, and the takeover is a
+    ///         fresh seizure: stamped now.
+    function test_seizedTs_oppositeLargerTakesOverAtNow() public {
+        uint256 t0 = vm.getBlockTimestamp();
+        h.setBucket(victim, true, 1 * SCALE, 50_000e18, 10e18, 0);
+        h.liquidate(_arr(victim), PRICE, 0);
+
+        vm.warp(t0 + 100);
+        address opp = makeAddr("opp");
+        h.setBucket(opp, false, 3 * SCALE, 147_000e18, 10e18, 0);
+        h.liquidate(_arr(opp), PRICE, 0);
+
+        assertEq(h.pendingSize(), 2 * SCALE, "remainder took over");
+        assertFalse(h.pendingIsLong());
+        assertEq(h.pendingSeizedTs(), t0 + 100, "takeover stamped now");
     }
 
     // ---------------- same-side merge: weighted funding index ----------------
@@ -246,12 +333,12 @@ contract LiquidationBookkeepingTest is Test {
         // entry $50,500, collateral $600: equity 100 < minRequired (1.5% of 50k = 750) -> insolvent.
         h.setBucket(victim, true, 1 * SCALE, 50_500e18, 600e18, 0);
 
-        BazaarTypes.LiquidateResult memory r = h.liquidate(_arr(victim), PRICE, 0);
+        h.liquidate(_arr(victim), PRICE, 0);
 
         assertEq(h.pendingBankruptcy(), 49_900e18, "bk = entry - seized collateral");
         assertEq(h.pendingSize(), 1 * SCALE);
         assertTrue(h.pendingIsLong());
-        assertEq(h.insurance(), 5_000e18 + 600e18 - r.totalUpfrontReward, "full collateral seized to insurance");
+        assertEq(h.insurance(), 5_000e18 + 600e18 - h.claimable(address(this)), "full collateral seized to insurance");
     }
 
     /// @notice The funding term enters the long bankruptcy formula with a negative sign.
@@ -293,19 +380,16 @@ contract LiquidationBookkeepingTest is Test {
     }
 
     /// @notice A zero-collateral insolvent victim still liquidates: nothing seized, and the
-    ///         unconditional liquidator reward accrues at the bps rate (above the $0.10 floor),
-    ///         funded by insurance alone.
-    function test_zeroCollateralVictim_liquidatesWithBpsReward() public {
+    ///         unconditional flat liquidator reward accrues, funded by insurance alone.
+    function test_zeroCollateralVictim_liquidatesWithFlatReward() public {
         h.setBucket(victim, true, 1 * SCALE, 55_000e18, 0, 0);
 
         uint256 insBefore = h.insurance();
         BazaarTypes.LiquidateResult memory r = h.liquidate(_arr(victim), PRICE, 0);
 
         assertEq(r.liquidatedCount, 1);
-        // notional 50k x 200 EBP / 1e6 = $10 > $0.10 floor
-        uint256 expected = 50_000e18 * BazaarTypes.LIQUIDATION_FEE_EBP / BazaarTypes.EBP_SCALE;
-        assertEq(r.totalUpfrontReward, expected, "bps reward on notional");
-        assertGt(expected, BazaarTypes.MIN_LIQUIDATOR_REWARD, "sanity: above the floor");
+        uint256 expected = BazaarTypes.MIN_LIQUIDATOR_REWARD;
+        assertEq(r.unloadPrepaid, expected, "nothing netted: the walk is credited with the whole flat reward");
         assertEq(h.insurance(), insBefore - expected, "nothing to seize; only the reward leaves the fund");
         assertEq(h.claimable(address(this)), expected, "reward accrued to the liquidator");
     }

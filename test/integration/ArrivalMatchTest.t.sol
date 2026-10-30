@@ -53,7 +53,7 @@ contract ArrivalMatchTest is IntegrationBase {
         assertEq(_filledSize(a2), BTC / 10, "second level consumed");
 
         // Fills settled at the MAKERS' prices: alice's entry value is 0.1×50200 + 0.1×50400.
-        (, uint256 sz, uint256 entryValue,,,,,,) = pair.positionBuckets(alice);
+        (, uint256 sz, uint256 entryValue,,,,) = pair.positionBuckets(alice);
         assertEq(sz, BTC / 5);
         assertEq(entryValue, (50_200 * BAZAAR_SCALE + 50_400 * BAZAAR_SCALE) / 10, "entry at maker prices");
 
@@ -262,13 +262,13 @@ contract ArrivalMatchTest is IntegrationBase {
         // Bob's ask expires quickly; carol's sits behind it.
         bytes[] memory pu = _freshPrice();
         BazaarTypes.OrderSpec memory s = _limitSpec(false, BTC / 10, 50_100 * BAZAAR_SCALE);
-        s.expirationBlock = uint64(vm.getBlockNumber() + 12); // minimum lifetime
+        s.expirationBlock = uint64(vm.getBlockNumber()) + BazaarTypes.MIN_ORDER_LIFETIME_BLOCKS;
         vm.prank(bob);
         pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
         uint256 expiring = _lastCreatedOrderId(pair);
         uint256 live = _placeLimit(carol, false, BTC / 10, 50_200 * BAZAAR_SCALE);
 
-        _roll(20); // bob's ask is now expired but still linked
+        _roll(BazaarTypes.MIN_ORDER_LIFETIME_BLOCKS + 1); // bob's ask is now expired but still linked
 
         uint256 taker = _placeLimit(alice, true, BTC / 10, 50_300 * BAZAAR_SCALE);
         assertEq(_filledSize(expiring), 0, "expired maker never fills");
@@ -346,7 +346,7 @@ contract ArrivalMatchTest is IntegrationBase {
         assertGt(_canceledBlock(taker), 0, "market remainder canceled in the same tx");
         assertFalse(_inBook(taker), "market orders never rest");
 
-        (, uint256 sz, uint256 entryValue,,,,,,) = pair.positionBuckets(alice);
+        (, uint256 sz, uint256 entryValue,,,,) = pair.positionBuckets(alice);
         assertEq(sz, BTC / 10);
         assertEq(entryValue, 50_100 * BAZAAR_SCALE / 10, "market filled at the maker's price");
     }

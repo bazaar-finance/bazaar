@@ -46,12 +46,12 @@ contract RiskParamsLibTest is Test {
         h.setOI(1_000_000 * SCALE, 1_000_000 * SCALE); // matched book, $1M OI notional per side at PRICE
     }
 
-    /// @notice Base fee endpoints: 0.5 bp (50 EBP) at the 2% target, 2 bp (200 EBP) at the 10% target.
+    /// @notice Base fee endpoints: 0.5 bp (50 EBP) at the 2% target, 4 bp (400 EBP) at the 10% target.
     function test_TakerInsuranceFeeBase_Endpoints() public pure {
         assertEq(RiskParamsLib.getTakerInsuranceFeeBase(200), 50, "0.5 bp at INSURANCE_TARGET_BASE");
-        assertEq(RiskParamsLib.getTakerInsuranceFeeBase(1_000), 200, "2 bp at INSURANCE_TARGET_MAX");
+        assertEq(RiskParamsLib.getTakerInsuranceFeeBase(1_000), 400, "4 bp at INSURANCE_TARGET_MAX");
         // Linear interpolation midway up the target range
-        assertEq(RiskParamsLib.getTakerInsuranceFeeBase(600), 125, "interpolated base fee");
+        assertEq(RiskParamsLib.getTakerInsuranceFeeBase(600), 225, "interpolated base fee");
     }
 
     /// @notice Fund exactly at target → base fee, no deficit multiplier: 50 EBP = 0.5 bp.
@@ -73,11 +73,22 @@ contract RiskParamsLibTest is Test {
         assertEq(h.takerFeeEbp(PRICE), 1_428, "quadratic deficit multiplier");
     }
 
-    /// @notice Worst case — extreme vol, empty fund → uncapped 96 x 50 = 4,800 EBP, capped at 4,500 EBP = 45 bp.
-    function test_TakerInsuranceFee_CapsAt45Bp() public {
-        h.setVariance(100_000_000); // VARIANCE_EXTREME → 4.5% target, fBase = 96 EBP
+    /// @notice Extreme vol on a deeply underfunded fund stays under the cap: a 4.5% target gives
+    ///         fBase = 159 EBP, and at 1% coverage (δ = 0.7777) 159 x (1 + 49 x 0.7777²) =
+    ///         4,871 EBP ≈ 48.7 bp is paid in full. An empty fund at this target reaches the cap
+    ///         (159 x 50 = 7,950 EBP).
+    function test_TakerInsuranceFee_ExtremeVolStaysUnderCap() public {
+        h.setVariance(100_000_000); // VARIANCE_EXTREME → 4.5% target, fBase = 159 EBP
+        h.setInsurance(10_000 * SCALE); // 1% vs 4.5% target → deficit δ = 0.7777
+        assertEq(h.takerFeeEbp(PRICE), 4_871, "below the cap the curve is charged untrimmed");
+    }
+
+    /// @notice Worst case — vol at the multiplier ceiling, empty fund → uncapped 356 x 50 =
+    ///         17,800 EBP, clipped to 5,000 EBP = 50 bp.
+    function test_TakerInsuranceFee_CapsAt50Bp() public {
+        h.setVariance(247_000_000); // VOL_MULTIPLIER_MAX → 9% target, fBase = 356 EBP
         h.setInsurance(0); // full deficit, δ = 1
-        assertEq(h.takerFeeEbp(PRICE), 4_500, "hard cap is 45 bp, not 45%");
+        assertEq(h.takerFeeEbp(PRICE), 5_000, "hard cap is 50 bp, not 50%");
     }
 
     /// @notice No open interest → infinite coverage, which is the above-target arm → base fee.

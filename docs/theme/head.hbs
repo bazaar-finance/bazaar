@@ -1,0 +1,32 @@
+{{!--
+  GoatCounter page-view counting. mdBook appends this file to the <head> of
+  every page, so each page load counts once under its own path; the dashboard
+  sums those into the site totals.
+
+  The path is normalized so one page always lands on one row:
+  - The query string is dropped. Search results link to pages with
+    ?highlight=<term>, which would otherwise split a page across a row per
+    search term.
+  - The .html extension is dropped. GitHub Pages serves /guide/trading and
+    /guide/trading.html as the same page, so counting both forms separately
+    would split it.
+  - A trailing index collapses to its directory, so / and /index.html count
+    as one page.
+
+  GitHub Pages serves 404.html at the missing URL, so a broken link counts
+  under that URL with the title "Page not found", which makes dead inbound
+  links visible on the dashboard.
+
+  The settings object must exist before count.js loads, which is why it sits
+  in its own script tag above the async loader. GoatCounter skips localhost by
+  default, so `mdbook serve` previews are not counted.
+--}}
+<script>
+    window.goatcounter = {
+        path: function () {
+            return location.pathname.replace(/\.html$/, '').replace(/\/index$/, '/');
+        }
+    };
+</script>
+<script data-goatcounter="https://bazaardocs.goatcounter.com/count"
+        async src="//gc.zgo.at/count.js"></script>

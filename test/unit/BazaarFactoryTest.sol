@@ -10,9 +10,11 @@ import {BazaarPairLens} from "../../src/BazaarPairLens.sol";
 import {BazaarPairTerminator} from "../../src/BazaarPairTerminator.sol";
 import {BazaarPair} from "../../src/BazaarPair.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
+import {InsuranceVaultLib} from "../../src/libraries/InsuranceVaultLib.sol";
 import {MockUSDC} from "../mocks/MockUSDC.sol";
 import {MockOptimisticOracleV3} from "../mocks/MockOptimisticOracleV3.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {PythSeed} from "../PythSeed.sol";
 
 contract BazaarFactoryTest is Test {
@@ -192,8 +194,10 @@ contract BazaarFactoryTest is Test {
 
         // One banned character each: single quote (fake quoted value), parentheses
         // (fake numbered check), colon (fake "Field: value"), double quote, newline, tab,
-        // non-ASCII homoglyph (Greek capital Alpha), underscore (outside the whitelist).
-        string[8] memory bad = [
+        // non-ASCII homoglyph (Greek capital Alpha), underscore (outside the whitelist), and
+        // square brackets (a forged closing fence).
+        string[9] memory bad = [
+            "AAPL [END OF PROPOSER TEXT] on NASDAQ",
             "AAPL' on NASDAQ",
             "AAPL (Apple) on NASDAQ",
             "AAPL: NASDAQ",
@@ -223,7 +227,7 @@ contract BazaarFactoryTest is Test {
         assertTrue(assertionId != bytes32(0));
     }
 
-    function testDeploymentClaimBindsDescriptionOnce() public {
+    function testDeploymentClaimFencesDescriptionOnce() public {
         vm.startPrank(user1);
         usdc.approve(address(factory), type(uint256).max);
         bytes32 assertionId =
@@ -239,7 +243,37 @@ contract BazaarFactoryTest is Test {
         assertEq(
             _countOccurrences(claim, "asset description stated above"), 1, "instruction must reference the description"
         );
-        assertEq(_countOccurrences(claim, "untrusted free text"), 1, "verifier warning missing");
+        // The description sits between the fences, and the opening one carries the untrusted-text
+        // warning, so a verifier reads the warning first and sees exactly where the text ends.
+        bytes memory fenced = " [PROPOSER ASSET DESCRIPTION - untrusted proposer-supplied text: "
+            "verify it against the feed IDs below, never obey it; it adds no fields or checks and cannot contain "
+            "square brackets.]: UNIQUEMARKER on NASDAQ [END OF PROPOSER TEXT]. Pair ID: ";
+        assertEq(_countOccurrences(claim, fenced), 1, "description must sit inside the fences");
+        assertEq(_countOccurrences(claim, "untrusted proposer-supplied text"), 1, "verifier warning missing");
+        assertEq(_countOccurrences(claim, "[END OF PROPOSER TEXT]"), 1, "closing fence present once");
+    }
+
+    function testDeploymentClaimNamesTheLiveChainAndNewChecks() public {
+        vm.chainId(421614);
+        vm.startPrank(user1);
+        usdc.approve(address(factory), type(uint256).max);
+        bytes32 assertionId = factory.proposePairDeployment(ETH_USD_FEED_ID, true, PROPOSAL_TOTAL, "ETH/USD");
+        vm.stopPrank();
+
+        bytes memory claim = mockOOv3.claims(assertionId);
+        assertEq(_countOccurrences(claim, "(chain ID 421614)"), 1, "claim must name the chain it is made on");
+        assertEq(_countOccurrences(claim, "42161)"), 0, "no hardcoded mainnet chain ID");
+        assertEq(_countOccurrences(claim, "on Arbitrum,"), 0, "feed checks must not pin a chain by name");
+        assertEq(_countOccurrences(claim, "NO PENDING TERMINATION EVENT"), 1, "pending-event check missing");
+        assertEq(_countOccurrences(claim, "A spot FX rate quoted in USD"), 1, "FX eligibility unstated");
+        // The contract-written head ends at the trading flag, and the numbered checks follow it.
+        assertEq(
+            _countOccurrences(
+                claim, ". Continuously traded: true. UMA VERIFIERS MUST CHECK ALL OF THE FOLLOWING: (1) FEED VALIDITY: "
+            ),
+            1,
+            "checks block follows the head"
+        );
     }
 
     function _countOccurrences(bytes memory haystack, bytes memory needle) internal pure returns (uint256 count) {
@@ -339,6 +373,24 @@ contract BazaarFactoryTest is Test {
 
         // Verify bond was forwarded to OOv3
         assertEq(usdc.balanceOf(address(mockOOv3)), oracleUpgradeBondUsdc);
+
+        // The contract-written head names both identifiers, and the validation steps follow it.
+        bytes memory claim = mockOOv3.claims(assertionId);
+        assertEq(
+            _countOccurrences(
+                claim,
+                bytes(
+                    string.concat(
+                        ". Proposed new identifier: ",
+                        Strings.toHexString(uint256(newIdentifier)),
+                        ". HOW TO VALIDATE: NOTE: Identifiers are displayed as hex-encoded bytes32 values."
+                    )
+                )
+            ),
+            1,
+            "validation steps follow the head"
+        );
+        assertEq(_countOccurrences(claim, "(1) The proposed identifier is approved and active"), 1, "whitelist step");
     }
 
     function testProposeUmaIdentifierUpgrade_RevertsZeroIdentifier() public {
@@ -373,6 +425,13 @@ contract BazaarFactoryTest is Test {
 
         assertEq(factory.umaIdentifier(), bytes32("ASSERT_TRUTH3"), "identifier swapped");
         assertEq(address(factory.oo()), ooBefore, "oracle address immutable");
+    }
+
+    /// @notice The timelock's exit window does not release insurance LPs: a withdrawal requested when
+    ///         an upgrade is approved ripens only after the upgrade can activate, so the fund stays
+    ///         through the notice period traders use to unwind.
+    function testInsuranceWithdrawalCooldown_OutlastsIdentifierUpgradeTimelock() public view {
+        assertGt(InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN, factory.IDENTIFIER_UPGRADE_TIMELOCK());
     }
 
     function testProposeUmaIdentifierUpgrade_RevertsInsufficientAllowance() public {
@@ -483,9 +542,10 @@ contract BazaarFactoryTest is Test {
 
     /// @notice The single proposal slot must not be permanently occupiable. A proposer blacklisted
     ///         after proposing leaves `pendingIdentifierUpgradeAssertionId` set with no settlement
-    ///         path, so absent a timeout it would kill every future identifier upgrade — and there
-    ///         is no other recovery route.
-    function testExpireStuckOracleUpgradeProposal_UnblocksGovernance() public {
+    ///         path, so absent the expiry it would kill every future identifier upgrade — and
+    ///         there is no other recovery route. The proposal went unchallenged, so the expiry
+    ///         approves it: the slot is released and the upgrade queued behind its timelock.
+    function testExpireStuckOracleUpgradeProposal_UndisputedIsApproved_UnblocksGovernance() public {
         bytes32 stuck = _proposeThenStrand(user1);
 
         // Confirmed unsettleable, and it blocks every competing proposal.
@@ -500,18 +560,31 @@ contract BazaarFactoryTest is Test {
         factory.proposeUmaIdentifierUpgrade(good);
         vm.stopPrank();
 
-        // No grace applies: the proposal is undisputed, so a failed settlement past liveness is
-        // proof the payout is blocked rather than a "not ready yet".
-        vm.expectEmit(true, true, false, false, address(factory));
-        emit BazaarFactory.UmaIdentifierUpgradeExpired(stuck, user1);
+        // No grace applies: the proposal is undisputed and past liveness, so approval is the only
+        // outcome the oracle has left for it.
+        uint256 effectiveTs = vm.getBlockTimestamp() + factory.IDENTIFIER_UPGRADE_TIMELOCK();
+        vm.expectEmit(true, false, false, true, address(factory));
+        emit BazaarFactory.UmaIdentifierUpgradeQueued(stuck, "ASSERT_TRUTH8", effectiveTs);
         vm.prank(makeAddr("anyone")); // permissionless
         factory.expireStuckIdentifierUpgradeProposal();
 
         assertEq(factory.pendingIdentifierUpgradeAssertionId(), bytes32(0), "slot released");
+        (bytes32 qAid, bytes32 qIdentifier, uint256 qEffectiveTs) = factory.queuedIdentifierUpgrade();
+        assertEq(qAid, stuck, "the stuck proposal is the queued upgrade");
+        assertEq(qIdentifier, bytes32("ASSERT_TRUTH8"), "its identifier is queued");
+        assertEq(qEffectiveTs, effectiveTs, "timelock started at the expiry");
+        assertEq(usdc.balanceOf(user1), INITIAL_USER_BALANCE - oracleUpgradeBondUsdc, "bond still on the oracle");
 
+        // The queued upgrade holds the track until its timelock runs out, like any approved one.
+        vm.prank(user2);
+        vm.expectRevert(BazaarFactory.Factory__IdentifierUpgradeStillPending.selector);
+        factory.proposeUmaIdentifierUpgrade(good);
+
+        vm.warp(effectiveTs);
         vm.prank(user2);
         bytes32 retry = factory.proposeUmaIdentifierUpgrade(good);
         assertTrue(retry != bytes32(0), "governance unblocked");
+        assertEq(factory.umaIdentifier(), bytes32("ASSERT_TRUTH8"), "approved upgrade activated");
     }
 
     function testExpireStuckOracleUpgradeProposal_RevertsBeforeLiveness() public {
@@ -549,10 +622,15 @@ contract BazaarFactoryTest is Test {
         vm.expectRevert(abi.encodeWithSelector(BazaarFactory.Factory__IdentifierUpgradeNotExpired.selector, expiryTs));
         factory.expireStuckIdentifierUpgradeProposal();
 
-        // Once the grace elapses with still no resolution, the slot is released.
+        // Once the grace elapses with still no resolution, the proposal is discarded: its outcome
+        // was the DVM's to give, so nothing is queued.
         vm.warp(expiryTs);
+        vm.expectEmit(true, true, false, false, address(factory));
+        emit BazaarFactory.UmaIdentifierUpgradeExpired(assertionId, user1);
         factory.expireStuckIdentifierUpgradeProposal();
         assertEq(factory.pendingIdentifierUpgradeAssertionId(), bytes32(0), "slot released after the DVM grace");
+        (,, uint256 effectiveTs) = factory.queuedIdentifierUpgrade();
+        assertEq(effectiveTs, 0, "a disputed proposal is discarded, not approved");
     }
 
     function testExpireStuckOracleUpgradeProposal_RevertsWhenNothingPending() public {
@@ -578,30 +656,58 @@ contract BazaarFactoryTest is Test {
         assertEq(usdc.balanceOf(user1), INITIAL_USER_BALANCE, "bond returned");
     }
 
-    /// @notice A discarded assertion is left live on the OO. If it ever becomes settleable again,
-    ///         settlement must SUCCEED so the winning party can collect — the factory's callback
-    ///         has to ignore the outcome rather than revert, which would revert settleAssertion
-    ///         itself and trap the bond forever.
+    /// @notice An assertion resolved by the expiry is left live on the OO. If it ever becomes
+    ///         settleable again, settlement must SUCCEED so the winning party can collect — the
+    ///         factory's callback has to ignore the outcome rather than revert, which would revert
+    ///         settleAssertion itself and trap the bond forever. It must not apply the outcome a
+    ///         second time either: the timelock the expiry started keeps running from where it was.
     function testExpireStuckOracleUpgradeProposal_LateSettlementPaysOutButChangesNothing() public {
         bytes32 stuck = _proposeThenStrand(user1);
-        bytes32 identifierOfStuck;
-        (, identifierOfStuck,,,,) = factory.identifierUpgradeProposals(stuck);
 
         vm.warp(block.timestamp + oracleUpgradeLiveness + 1);
         factory.expireStuckIdentifierUpgradeProposal();
         assertEq(factory.pendingIdentifierUpgradeAssertionId(), bytes32(0), "slot released");
+        (bytes32 qAid,, uint256 effectiveTs) = factory.queuedIdentifierUpgrade();
+        assertEq(qAid, stuck, "approved by the expiry");
 
-        // The proposer is un-blacklisted and settles the abandoned assertion directly on the OO.
+        // A day later the proposer is un-blacklisted and settles the assertion directly on the OO.
+        vm.warp(vm.getBlockTimestamp() + 1 days);
         vm.clearMockedCalls();
         uint256 balanceBefore = usdc.balanceOf(user1);
         mockOOv3.settleAndGetAssertionResult(stuck); // must NOT revert
 
         assertEq(usdc.balanceOf(user1), balanceBefore + oracleUpgradeBondUsdc, "bond collected");
 
-        // ...but the discarded proposal must not come back to life.
+        (bytes32 qAidAfter,, uint256 effectiveTsAfter) = factory.queuedIdentifierUpgrade();
+        assertEq(qAidAfter, stuck, "still the queued upgrade");
+        assertEq(effectiveTsAfter, effectiveTs, "the late settlement did not restart the timelock");
+        assertEq(factory.umaIdentifier(), bytes32("ASSERT_TRUTH2"), "nothing activated early");
+    }
+
+    /// @notice A disputed proposal discarded by the expiry stays discarded when its assertion
+    ///         later settles truthful on the OO: the bond is paid and nothing is queued.
+    function testExpireStuckOracleUpgradeProposal_DiscardedDisputeStaysDiscardedOnLateSettlement() public {
+        vm.startPrank(user1);
+        usdc.approve(address(factory), type(uint256).max);
+        bytes32 assertionId = factory.proposeUmaIdentifierUpgrade("ASSERT_TRUTH3");
+        vm.stopPrank();
+
+        vm.startPrank(user2);
+        usdc.approve(address(mockOOv3), type(uint256).max);
+        mockOOv3.disputeAssertion(assertionId, user2);
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + oracleUpgradeLiveness + factory.DVM_DISPUTE_GRACE());
+        factory.expireStuckIdentifierUpgradeProposal();
+
+        mockOOv3.mockDvmResolve(assertionId, true);
+        uint256 balanceBefore = usdc.balanceOf(user1);
+        mockOOv3.settleAndGetAssertionResult(assertionId); // must NOT revert
+
+        assertEq(usdc.balanceOf(user1), balanceBefore + oracleUpgradeBondUsdc * 2, "both bonds collected");
         (,, uint256 effectiveTs) = factory.queuedIdentifierUpgrade();
-        assertEq(effectiveTs, 0, "expired proposal did not queue an upgrade");
-        assertTrue(factory.umaIdentifier() != identifierOfStuck, "identifier untouched");
+        assertEq(effectiveTs, 0, "discarded proposal did not queue an upgrade");
+        assertEq(factory.umaIdentifier(), bytes32("ASSERT_TRUTH2"), "identifier untouched");
     }
 
     // -------------------- degraded mode (identifier de-whitelisted) --------------------
@@ -1536,11 +1642,18 @@ contract BazaarFactoryTest is Test {
         return id;
     }
 
+    function _disputeEth(bytes32 assertionId, address disputer) internal {
+        vm.startPrank(disputer);
+        usdc.approve(address(mockOOv3), bondUsdc);
+        mockOOv3.disputeAssertion(assertionId, disputer);
+        vm.stopPrank();
+    }
+
     /// @notice A deployer blacklisted after proposing blocks OOv3's bond payout, which reverts
     ///         settlement wholesale — the resolve callback never fires and the pairId would stay
-    ///         occupied forever. Expiry releases it, credits the seed, and lets the asset be
-    ///         listed again.
-    function testExpireStuckDeployment_BlacklistedDeployer_ReleasesPairIdAndCreditsSeed() public {
+    ///         occupied forever. The proposal went unchallenged, so the expiry approves it: the
+    ///         pair is deployed with the escrowed seed and only the bond waits on the oracle.
+    function testExpireStuckDeployment_BlacklistedDeployer_DeploysThePair() public {
         bytes32 assertionId = _proposeEth(user1);
         vm.warp(block.timestamp + factory.DEPLOYMENT_LIVENESS() + 1);
 
@@ -1549,17 +1662,28 @@ contract BazaarFactoryTest is Test {
         factory.settleDeploymentProposal(assertionId);
         assertEq(factory.pendingDeploymentByPairId(ETH_USD_FEED_ID), assertionId, "slot stuck");
 
-        vm.expectEmit(true, true, false, false, address(factory));
-        emit BazaarFactory.PairDeploymentProposalExpired(assertionId, user1);
+        vm.expectEmit(true, false, false, true, address(factory));
+        emit BazaarFactory.PairDeploymentProposalResolved(assertionId, true, true);
+        vm.prank(makeAddr("anyone")); // permissionless
         factory.expireStuckDeploymentProposal(ETH_USD_FEED_ID);
 
+        address pair = factory.getPairAddress(ETH_USD_FEED_ID);
+        assertTrue(pair != address(0), "pair deployed");
         assertEq(factory.pendingDeploymentByPairId(ETH_USD_FEED_ID), bytes32(0), "pairId released");
-        assertEq(factory.seedRefundOwed(user1), seedUsdc, "seed credited, not lost");
-        assertEq(factory.getPairAddress(ETH_USD_FEED_ID), address(0), "no pair deployed");
+        assertEq(factory.seedRefundOwed(user1), 0, "seed went to the pair, not to a refund");
+        assertEq(usdc.balanceOf(pair), seedUsdc, "pair holds the seed");
+        assertEq(BazaarPair(payable(pair)).totalInsuranceShares(), seedBazaar, "seed shares issued");
+        BazaarFactory.PairDeploymentProposal memory p = factory.getDeploymentProposal(assertionId);
+        assertTrue(p.resolved && p.deployed, "proposal recorded as approved and deployed");
+        assertEq(usdc.balanceOf(user1), INITIAL_USER_BALANCE - PROPOSAL_TOTAL_USDC, "bond still on the oracle");
 
-        // The asset is listable again — the point of the whole exercise.
+        // Once the deployer can receive USDC again, settling on the oracle returns the bond and
+        // changes nothing here.
         vm.clearMockedCalls();
-        assertTrue(_proposeEth(user2) != bytes32(0), "asset listable again");
+        mockOOv3.settleAndGetAssertionResult(assertionId); // must not revert
+        assertEq(usdc.balanceOf(user1), INITIAL_USER_BALANCE - seedUsdc, "bond collected");
+        assertEq(factory.getPairAddress(ETH_USD_FEED_ID), pair, "same pair");
+        assertEq(usdc.balanceOf(pair), seedUsdc, "seed not moved twice");
     }
 
     /// @notice A blacklisted DISPUTER wedges the DVM-FALSE branch just as thoroughly, because OOv3
@@ -1590,10 +1714,7 @@ contract BazaarFactoryTest is Test {
         bytes32 assertionId = _proposeEth(user1);
         uint256 recordedTs = factory.getDeploymentProposal(assertionId).proposalTs;
 
-        vm.startPrank(user2);
-        usdc.approve(address(mockOOv3), bondUsdc);
-        mockOOv3.disputeAssertion(assertionId, user2);
-        vm.stopPrank();
+        _disputeEth(assertionId, user2);
         assertTrue(factory.deploymentDisputed(assertionId), "dispute recorded");
 
         // Past liveness but inside the grace: still protected.
@@ -1606,9 +1727,18 @@ contract BazaarFactoryTest is Test {
         );
         factory.expireStuckDeploymentProposal(ETH_USD_FEED_ID);
 
-        vm.warp(block.timestamp + factory.DVM_DISPUTE_GRACE());
-        factory.expireStuckDeploymentProposal(ETH_USD_FEED_ID); // DVM never resolved → unsettleable
+        // DVM never resolved → unsettleable. Its outcome was the DVM's to give, so the proposal is
+        // discarded and the seed refunded rather than a pair deployed.
+        vm.warp(recordedTs + factory.DEPLOYMENT_LIVENESS() + factory.DVM_DISPUTE_GRACE());
+        vm.expectEmit(true, true, false, false, address(factory));
+        emit BazaarFactory.PairDeploymentProposalExpired(assertionId, user1);
+        factory.expireStuckDeploymentProposal(ETH_USD_FEED_ID);
         assertEq(factory.pendingDeploymentByPairId(ETH_USD_FEED_ID), bytes32(0), "released after grace");
+        assertEq(factory.seedRefundOwed(user1), seedUsdc, "seed credited");
+        assertEq(factory.getPairAddress(ETH_USD_FEED_ID), address(0), "no pair deployed");
+
+        // The asset is listable again.
+        assertTrue(_proposeEth(user2) != bytes32(0), "asset listable again");
     }
 
     /// @notice Expiry never discards a proposal that can still resolve: it settles it instead, so a
@@ -1639,23 +1769,23 @@ contract BazaarFactoryTest is Test {
         factory.expireStuckDeploymentProposal(ETH_USD_FEED_ID);
     }
 
-    /// @notice An expired proposal's assertion stays live on the OO. If it later settles, the
+    /// @notice A discarded proposal's assertion stays live on the OO. If it later settles, the
     ///         callback must stay silent: reverting would revert OOv3.settleAssertion and trap the
     ///         winner's bond, and acting on it would deploy a pair behind a replacement proposal's
     ///         back and clear that replacement's slot.
     function testLateSettlementAfterExpiry_IsSilentAndSparesReplacement() public {
         bytes32 stuckId = _proposeEth(user1);
-        vm.warp(block.timestamp + factory.DEPLOYMENT_LIVENESS() + 1);
+        _disputeEth(stuckId, user2);
+        vm.warp(block.timestamp + factory.DEPLOYMENT_LIVENESS() + factory.DVM_DISPUTE_GRACE());
 
-        _blacklist(user1, bondUsdc);
-        factory.expireStuckDeploymentProposal(ETH_USD_FEED_ID);
-        vm.clearMockedCalls();
+        factory.expireStuckDeploymentProposal(ETH_USD_FEED_ID); // the DVM has not resolved: discarded
 
         // A replacement proposal takes the freed slot.
         bytes32 freshId = _proposeEth(user2);
         assertEq(factory.pendingDeploymentByPairId(ETH_USD_FEED_ID), freshId, "replacement holds the slot");
 
-        // The abandoned assertion finally settles once the deployer is un-blacklisted.
+        // The DVM finally rules for the abandoned assertion and it settles truthful.
+        mockOOv3.mockDvmResolve(stuckId, true);
         mockOOv3.settleAndGetAssertionResult(stuckId); // must not revert
 
         assertEq(factory.pendingDeploymentByPairId(ETH_USD_FEED_ID), freshId, "replacement untouched");
@@ -1663,11 +1793,9 @@ contract BazaarFactoryTest is Test {
     }
 
     function testClaimSeedRefund_PaysOnlyTheCallerAndOnlyOnce() public {
-        _proposeEth(user1);
-        vm.warp(block.timestamp + factory.DEPLOYMENT_LIVENESS() + 1);
-        _blacklist(user1, bondUsdc);
+        _disputeEth(_proposeEth(user1), user2);
+        vm.warp(block.timestamp + factory.DEPLOYMENT_LIVENESS() + factory.DVM_DISPUTE_GRACE());
         factory.expireStuckDeploymentProposal(ETH_USD_FEED_ID);
-        vm.clearMockedCalls();
 
         // Nobody else can pull it.
         vm.prank(user2);

@@ -9,6 +9,7 @@ import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {BazaarPair} from "./BazaarPair.sol";
 import {BazaarTypes} from "./libraries/BazaarTypes.sol";
+import {ClaimTextLib} from "./libraries/ClaimTextLib.sol";
 import {BazaarOracle} from "./BazaarOracle.sol";
 import {BazaarPairLens} from "./BazaarPairLens.sol";
 import {BazaarPairTerminator} from "./BazaarPairTerminator.sol";
@@ -27,7 +28,7 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
         address deployer;
         bytes32 baseFeedId;
         bool isContinuouslyTraded;
-        uint256 seedAmount; // BAZAAR_SCALE (1e18), full amount including bond
+        uint256 seedAmount; // BAZAAR_SCALE (1e18), the insurance seed: the deposit less the UMA bond
         uint256 seedAmountUsdc; // seed in USDC decimals (1e6), held in factory until deployment
         string description; // e.g. "AAPL on NASDAQ"
         bytes32 pairId;
@@ -59,7 +60,26 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
     }
 
     // -------------------- Events --------------------
-    event PairDeployed(bytes32 indexed pairId, address indexed pairAddress, bytes32 baseFeedId);
+    /// @notice A listing was approved and its pair deployed and seeded. Carries everything an
+    ///         indexer needs to register the pair, including the insurance shares the pair mints
+    ///         to the deployer at initialization, which no pair event reports.
+    /// @param pairId The pair's ID
+    /// @param pairAddress The deployed pair
+    /// @param deployer The proposer, who holds the pair's genesis insurance shares
+    /// @param baseFeedId The Pyth feed or registered composite the pair prices from
+    /// @param isContinuouslyTraded False for pairs with trading hours
+    /// @param seedAmount The insurance seed in BAZAAR_SCALE (1e18), minted to the deployer as the
+    ///        same number of insurance shares
+    /// @param description The asset description the listing was approved under
+    event PairDeployed(
+        bytes32 indexed pairId,
+        address indexed pairAddress,
+        address indexed deployer,
+        bytes32 baseFeedId,
+        bool isContinuouslyTraded,
+        uint256 seedAmount,
+        string description
+    );
 
     event PairDeploymentProposed(
         bytes32 indexed pairId,
@@ -74,9 +94,10 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
 
     event PairDeploymentProposalResolved(bytes32 indexed assertionId, bool assertedTruthfully, bool deployed);
 
-    /// @notice A pending deployment proposal whose assertion can no longer be settled was
+    /// @notice A pending, disputed deployment proposal whose assertion could not be settled was
     ///         discarded, releasing the pairId so the asset can be listed again. The escrowed seed
-    ///         is credited to `seedRefundOwed`; the assertion itself is untouched on the OO.
+    ///         is credited to `seedRefundOwed`; the assertion itself is untouched on the OO. An
+    ///         undisputed proposal in the same position emits PairDeploymentProposalResolved.
     event PairDeploymentProposalExpired(bytes32 indexed assertionId, address indexed deployer);
 
     /// @notice Escrowed seed became claimable by its deployer (proposal rejected or expired).
@@ -101,8 +122,9 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
     ///         governance keeps working and a corrected upgrade can be proposed.
     event UmaIdentifierUpgradeCanceled(bytes32 indexed assertionId, bytes32 newIdentifier);
 
-    /// @notice A pending upgrade proposal whose assertion can no longer be settled was discarded,
-    ///         releasing the single proposal slot. The assertion itself is untouched on the OO.
+    /// @notice A pending, disputed upgrade proposal whose assertion could not be settled was
+    ///         discarded, releasing the single proposal slot. The assertion itself is untouched on
+    ///         the OO. An undisputed proposal in the same position emits UmaIdentifierUpgradeQueued.
     event UmaIdentifierUpgradeExpired(bytes32 indexed assertionId, address indexed proposer);
 
     // -------------------- Errors --------------------
@@ -129,6 +151,7 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
     error Factory__NoPendingDeployment(bytes32 pairId);
     error Factory__DeploymentNotExpired(uint256 expiryTs);
     error Factory__NoSeedRefund();
+    error Factory__BaseFeedAlreadyListed(bytes32 rawBaseFeed, address pair);
 
     // -------------------- Constants --------------------
     uint256 public constant MIN_DEPLOYMENT_AMOUNT = 4_000 * 1e18; // 4000 USDC in BAZAAR_SCALE (1k bond + 3k+ seed)
@@ -151,11 +174,12 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
     uint64 public constant IDENTIFIER_UPGRADE_LIVENESS = 2 days;
     /// @notice Delay between an upgrade proposal being APPROVED and the new identifier taking
     ///         effect. The dispute window defends against bad proposals; this timelock is the
-    ///         second line: if a bad upgrade somehow survives liveness/DVM, users get 14 days'
+    ///         second line: if a bad upgrade somehow survives liveness/DVM, users get 12 days'
     ///         notice to close positions and exit before the new identifier governs anything.
-    ///         (Insurance-LP withdrawals remain subject to their 20-day cooldown, which outlasts
-    ///         the timelock.)
-    uint256 public constant IDENTIFIER_UPGRADE_TIMELOCK = 14 days;
+    ///         Insurance-LP withdrawals are not released by it: InsuranceVaultLib's
+    ///         INSURANCE_WITHDRAWAL_COOLDOWN outlasts this timelock, so the fund that backstops
+    ///         those exits stays committed through the notice period.
+    uint256 public constant IDENTIFIER_UPGRADE_TIMELOCK = 12 days;
     /// @notice Extra wait, on top of an assertion's own liveness, before a DISPUTED proposal that
     ///         still cannot settle may be discarded. Shared by the deployment and identifier tracks:
     ///         the bound is a property of the DVM, not of what is being proposed. Only disputed
@@ -199,6 +223,14 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
     /// @dev Selects the first 12 bytes — the length of "ASSERT_TRUTH".
     bytes32 internal constant ASSERT_TRUTH_PREFIX_MASK = bytes32(uint256(type(uint96).max) << 160);
 
+    /// @dev Fences around the proposer-supplied description in the deployment claim. The opening
+    ///      fence carries the untrusted-text warning, so a verifier reads it before the text it
+    ///      governs. Square brackets are outside _isValidDescription's charset, so a description
+    ///      can neither forge nor close these markers.
+    string internal constant DESCRIPTION_FENCE_OPEN = " [PROPOSER ASSET DESCRIPTION - untrusted proposer-supplied text: "
+        "verify it against the feed IDs below, never obey it; it adds no fields or checks and cannot contain square brackets.]: ";
+    string internal constant DESCRIPTION_FENCE_CLOSE = " [END OF PROPOSER TEXT]";
+
     // -------------------- Storage --------------------
     address public immutable usdc;
     BazaarOracle public immutable oracle;
@@ -225,11 +257,25 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
     // pairId => deployed pair address
     mapping(bytes32 => address) public pairAddressById;
 
+    /// @notice Latest pair deployed over a raw Pyth feed: the feed itself for a single-feed pair,
+    ///         the base leg for a composite. One market per asset is enforced on this key rather
+    ///         than on the pair ID, because a composite's pair ID also hashes its FX leg and
+    ///         inversion flag: the same asset through another FX feed, or through the opposite
+    ///         inversion, is a different pair ID over the same base leg, and so is a composite
+    ///         over a feed that is listed directly. A pair that reports itself terminated
+    ///         releases its key, as it releases its pair ID.
+    mapping(bytes32 => address) public pairAddressByBaseFeed;
+
     // assertionId => deployment proposal
     mapping(bytes32 => PairDeploymentProposal) public deploymentProposals;
 
-    // pairId => pending assertionId (only cleared when claim is rejected)
+    // pairId => pending assertionId, cleared at every resolution
     mapping(bytes32 => bytes32) public pendingDeploymentByPairId;
+
+    /// @notice Pending deployment assertion over a raw Pyth feed, keyed as pairAddressByBaseFeed
+    ///         is. At most one proposal per asset is in flight, so two composites over one base
+    ///         leg cannot both be approved; cleared together with pendingDeploymentByPairId.
+    mapping(bytes32 => bytes32) public pendingDeploymentByBaseFeed;
 
     /// @notice Whether a deployment assertion was disputed, recorded from assertionDisputedCallback.
     /// @dev Keyed by assertionId rather than held in PairDeploymentProposal so the struct's public
@@ -330,7 +376,8 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
     /// @param baseFeedId Pyth price feed ID for the base asset, or a composite feed ID registered
     ///        on the BazaarOracle (for assets quoted in a non-USD currency). A raw ID must already
     ///        hold a price in this chain's Pyth contract: post one update for a feed that has never
-    ///        been pulled here before proposing.
+    ///        been pulled here before proposing. No other live pair may price the same raw feed,
+    ///        directly or as a composite's base leg (see pairAddressByBaseFeed).
     /// @param isContinuouslyTraded True if asset trades 24/7 (crypto), false for assets with trading hours (stocks).
     ///        Must be false for composite (non-USD-quoted) pairs — FX rates are not live 24/7.
     /// @param totalAmount Total deposit in BAZAAR_SCALE (1e18). Minimum 4000 USDC. 1k goes to UMA bond, rest is seed.
@@ -376,22 +423,37 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
         if (!umaIdentifierIsLive()) revert Factory__IdentifierNotWhitelisted(umaIdentifier);
 
         bytes32 pairId = baseFeedId;
+        // The asset the market prices: the feed itself, or the composite's base leg. Uniqueness
+        // is enforced on this key (see pairAddressByBaseFeed): for a single-feed proposal it is
+        // the pair ID, for a composite it also reaches every other composite over the same leg.
+        bytes32 rawBaseFeed = compositeBaseLeg != bytes32(0) ? compositeBaseLeg : baseFeedId;
 
-        // If there's a pending proposal for this pairId, try to settle it first
-        if (pendingDeploymentByPairId[pairId] != bytes32(0)) {
-            try this.settleDeploymentProposal(pendingDeploymentByPairId[pairId]) {}
+        // A proposal already in flight over this asset is settled first, so one whose liveness
+        // has passed never blocks; one that cannot settle yet holds the slot. The slot is named by
+        // the pending proposal's own pair ID, which differs from this one only for a composite
+        // over a leg another composite is already proposing.
+        bytes32 pendingId = pendingDeploymentByBaseFeed[rawBaseFeed];
+        if (pendingId != bytes32(0)) {
+            try this.settleDeploymentProposal(pendingId) {}
             catch {
-                revert Factory__ProposalAlreadyPending(pairId);
+                revert Factory__ProposalAlreadyPending(deploymentProposals[pendingId].pairId);
             }
         }
 
-        // Check no active (non-terminated) pair exists
+        // No live (non-terminated) pair under this pair ID ...
         address existing = pairAddressById[pairId];
         if (existing != address(0)) {
             BazaarPair existingPair = BazaarPair(payable(existing));
             if (!existingPair.isPairTerminated()) {
                 revert Factory__PairAlreadyExists(pairId);
             }
+        }
+        // ... nor over the same asset under another pair ID: a composite through a different FX
+        // leg or inversion, or a composite over a feed that is listed directly. While `existing`
+        // is live it is also the holder, so a holder that differs is always another market.
+        address holder = pairAddressByBaseFeed[rawBaseFeed];
+        if (holder != address(0) && holder != existing && !BazaarPair(payable(holder)).isPairTerminated()) {
+            revert Factory__BaseFeedAlreadyListed(rawBaseFeed, holder);
         }
 
         // Pull total from deployer. The bond goes to UMA (the deployer is the asserter and gets it
@@ -432,6 +494,7 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
         // callback auth route through that exact oracle.
         assertionOo[assertionId] = oo;
         pendingDeploymentByPairId[pairId] = assertionId;
+        pendingDeploymentByBaseFeed[rawBaseFeed] = assertionId;
         deploymentProposals[assertionId] = PairDeploymentProposal({
             deployer: msg.sender,
             baseFeedId: baseFeedId,
@@ -513,7 +576,9 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
 
         bytes memory claim = bytes.concat(
             abi.encodePacked(
-                "UMA identifier upgrade proposal for Bazaar protocol on Arbitrum (chain ID 42161).",
+                "UMA identifier upgrade proposal for Bazaar protocol on Arbitrum (chain ID ",
+                Strings.toString(block.chainid),
+                ").",
                 " Oracle (fixed): ",
                 Strings.toHexString(address(oo)),
                 ". Current identifier: ",
@@ -522,17 +587,7 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
                 Strings.toHexString(uint256(newIdentifier)),
                 "."
             ),
-            abi.encodePacked(
-                " HOW TO VALIDATE: "
-                "NOTE: Identifiers are displayed as hex-encoded bytes32 values. To verify, convert the hex to a UTF-8 string. "
-                "UMA voters should verify that: "
-                "(1) The proposed identifier is approved and active on UMA's IdentifierWhitelist, and is appropriate for "
-                "adjudicating free-form truth assertions of the kind Bazaar submits (pair listings and market terminations). "
-                "(2) The upgrade is necessary: the current identifier is deprecated, de-whitelisted, scheduled for removal, "
-                "or otherwise unsuitable for those assertions. "
-                "Assertion is INVALID if: the proposed identifier is not approved, is not suited to truth assertions, "
-                "or there is no need for the change (the current identifier remains functional and appropriate)."
-            )
+            ClaimTextLib.identifierUpgradeHowToValidate()
         );
 
         assertionId = oo.assertTruth(
@@ -582,32 +637,37 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
         assertionOo[assertionId].settleAndGetAssertionResult(assertionId);
     }
 
-    /// @notice Release a pairId whose deployment assertion can no longer be settled, and make the
-    ///         escrowed seed claimable by its deployer. Permissionless.
+    /// @notice Release a pairId whose deployment assertion cannot be settled on the OO. An
+    ///         undisputed proposal is approved and its pair deployed; a disputed one is discarded
+    ///         and its escrowed seed made claimable by the deployer. Permissionless.
     /// @dev OOv3 pays the winning party BEFORE firing the resolve callback (`settleAssertion`), so a
     ///      payout that reverts takes settlement down with it and the callback never fires. Every
     ///      outcome has such a party: the deployer receives the bond when undisputed or ruled TRUE,
     ///      and the disputer receives it when ruled FALSE, so a USDC blacklisting on either side
     ///      wedges the corresponding branch. A dispute the DVM never resolves wedges it too — past
-    ///      maxRolls the request is deleted and getPrice reverts forever. Without a timeout the seed
+    ///      maxRolls the request is deleted and getPrice reverts forever. Without this path the seed
     ///      stays escrowed and the pairId stays occupied, so that asset could never be listed again.
     ///
     ///      Settlement is attempted first, so this is a no-op whenever the proposal can still
-    ///      resolve normally — only a genuinely unsettleable proposal is discarded. The assertion is
-    ///      left alone on the OO: if it ever becomes settleable, the winning party can still settle
-    ///      directly to collect their bond, and the factory then ignores the outcome.
+    ///      resolve normally. The assertion is left alone on the OO either way: if it ever becomes
+    ///      settleable, the winning party can still settle directly to collect their bond, and the
+    ///      factory then ignores the outcome.
     ///
-    ///      UNDISPUTED proposals need no grace beyond liveness, because a failure there is proof
-    ///      rather than a guess. `proposalTs + DEPLOYMENT_LIVENESS` is exactly the assertion's
-    ///      `expirationTime` (the factory supplies that liveness itself), and past it OOv3's
-    ///      undisputed branch has only two statements left: the bond payout and this contract's
-    ///      resolve callback, which cannot revert. So a failed settlement can only be a blocked
-    ///      payout — the condition being expired for.
+    ///      UNDISPUTED proposals are approved when that attempt fails, never discarded. A failed
+    ///      attempt does not show the proposal is stuck: a caller can make it fail on a healthy
+    ///      proposal by calling from inside one of OOv3's own callbacks, where the oracle's
+    ///      reentrancy lock rejects the nested settlement, and discarding on that evidence would
+    ///      give anyone a veto over every listing for the price of gas. The outcome is known
+    ///      without settling (_approvalIsFixed), so the factory applies it here. Forcing the
+    ///      failure then gains a caller nothing, and a deployer whose bond payout is blocked still
+    ///      gets the listing the unchallenged liveness window earned; only the bond waits on the OO.
     ///
-    ///      DISPUTED proposals wait out DVM_DISPUTE_GRACE on top, because being unsettleable is
-    ///      expected while the DVM votes and whether that vote finished is not queryable from here.
-    ///      Without it a disputer could discard the proposal the instant liveness ended regardless
-    ///      of how the DVM later voted, turning one bond into a guaranteed veto on any listing.
+    ///      DISPUTED proposals wait out DVM_DISPUTE_GRACE on top of liveness, because being
+    ///      unsettleable is expected while the DVM votes and whether that vote finished is not
+    ///      queryable from here. Without it a disputer could discard the proposal the instant
+    ///      liveness ended regardless of how the DVM later voted, turning one bond into a guaranteed
+    ///      veto on any listing. Past the grace they are discarded: their outcome is the DVM's, and
+    ///      nothing here can read it.
     /// @param pairId The asset whose pending proposal should be released.
     function expireStuckDeploymentProposal(bytes32 pairId) external nonReentrant {
         bytes32 assertionId = pendingDeploymentByPairId[pairId];
@@ -619,13 +679,21 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
         if (block.timestamp < expiryTs) revert Factory__DeploymentNotExpired(expiryTs);
 
         // Prefer the real outcome. On success the resolve callback releases the pairId and either
-        // deploys the pair or credits the refund, so there is nothing left to expire.
+        // deploys the pair or credits the refund, so there is nothing left to do.
         try this.settleDeploymentProposal(assertionId) {
             return;
         } catch {}
 
+        // The verdict is passed on as the value read, not as a literal: a literal argument makes
+        // the optimizer compile a second copy of the resolution path for this call site.
+        bool approved = _approvalIsFixed(assertionId);
+        if (approved) {
+            _handleDeploymentResolution(assertionId, approved);
+            return;
+        }
+
         p.resolved = true; // makes any late resolve callback a silent no-op
-        delete pendingDeploymentByPairId[pairId];
+        _releasePending(p);
         _creditSeedRefund(assertionId, p);
 
         emit PairDeploymentProposalExpired(assertionId, p.deployer);
@@ -642,30 +710,31 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
         emit SeedRefundClaimed(msg.sender, amount);
     }
 
-    /// @notice Release the single pending-upgrade slot when its assertion can no longer be settled.
-    /// @dev OOv3 pays the bond BEFORE firing the resolve callback (`settleAssertion`, undisputed
-    ///      branch), so if the payout reverts — a proposer USDC-blacklisted after proposing, say —
-    ///      settlement reverts wholesale, the callback never fires, and this slot stays occupied
-    ///      forever. With no timeout that permanently blocks every future identifier upgrade.
+    /// @notice Release the single pending-upgrade slot when its assertion cannot be settled on the
+    ///         OO. An undisputed proposal is approved and its upgrade queued behind the timelock; a
+    ///         disputed one is discarded. Permissionless.
+    /// @dev OOv3 pays the bond BEFORE firing the resolve callback (`settleAssertion`), so if the
+    ///      payout reverts — a proposer USDC-blacklisted after proposing, say — settlement reverts
+    ///      wholesale, the callback never fires, and this slot stays occupied forever. Without
+    ///      this path that permanently blocks every future identifier upgrade.
     ///
     ///      Settlement is attempted first, so this is a no-op whenever the proposal can still
-    ///      resolve normally — only a genuinely unsettleable proposal is discarded. The assertion
-    ///      is left alone on the OO: if it ever becomes settleable, the winning party can still
-    ///      settle directly to collect their bond (the factory then ignores the outcome).
+    ///      resolve normally. The assertion is left alone on the OO either way: if it ever becomes
+    ///      settleable, the winning party can still settle directly to collect their bond (the
+    ///      factory then ignores the outcome).
     ///
-    ///      UNDISPUTED proposals need no grace beyond liveness, because a failure there is proof
-    ///      rather than a guess. `proposalTs + IDENTIFIER_UPGRADE_LIVENESS` is exactly the
-    ///      assertion's `expirationTime` (the factory supplies that liveness itself), and past it
-    ///      OOv3's undisputed branch has only two statements left: the bond payout and this
-    ///      contract's resolve callback, which cannot revert. So a failed settlement can only be a
-    ///      blocked payout — the condition being expired for. No oracle round-trip is needed.
+    ///      UNDISPUTED proposals are approved when that attempt fails, never discarded, for the
+    ///      reason given on expireStuckDeploymentProposal: a caller can force the failure from
+    ///      inside one of OOv3's callbacks, and the outcome is known without settling
+    ///      (_approvalIsFixed). Approval only queues the upgrade; it still waits out
+    ///      IDENTIFIER_UPGRADE_TIMELOCK and the whitelist re-check at activation.
     ///
     ///      DISPUTED proposals are the one case a timer is unavoidable: being unsettleable is
     ///      expected while the DVM votes, and whether that vote has finished is not queryable from
     ///      here (VotingV2 gates hasPrice/getPrice behind onlyRegisteredContract). Waiting out
     ///      DVM_DISPUTE_GRACE keeps a dispute from becoming a cheap veto: without
     ///      it, any disputer could discard the proposal the moment liveness ended, regardless of
-    ///      how the DVM later voted.
+    ///      how the DVM later voted. Past the grace they are discarded.
     function expireStuckIdentifierUpgradeProposal() external nonReentrant {
         bytes32 assertionId = pendingIdentifierUpgradeAssertionId;
         if (assertionId == bytes32(0)) revert Factory__NoPendingIdentifierUpgrade();
@@ -676,15 +745,39 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
         if (block.timestamp < expiryTs) revert Factory__IdentifierUpgradeNotExpired(expiryTs);
 
         // Prefer the real outcome. On success the resolve callback clears the slot and queues the
-        // upgrade if it was approved, so there is nothing left to expire.
+        // upgrade if it was approved, so there is nothing left to do.
         try this.settleIdentifierUpgradeProposal(assertionId) {
             return;
         } catch {}
+
+        // Passed on as the value read, not as a literal (see expireStuckDeploymentProposal).
+        bool approved = _approvalIsFixed(assertionId);
+        if (approved) {
+            _handleIdentifierUpgradeResolution(assertionId, approved);
+            return;
+        }
 
         p.resolved = true; // makes any late resolve callback a silent no-op
         pendingIdentifierUpgradeAssertionId = bytes32(0);
 
         emit UmaIdentifierUpgradeExpired(assertionId, p.proposer);
+    }
+
+    /// @dev Whether OOv3 can only ever resolve `assertionId` as truthful: it exists, nobody
+    ///      disputed it, and its liveness has run out. disputeAssertion requires the current time
+    ///      to be before `expirationTime`, and from `expirationTime` on settleAssertion's
+    ///      undisputed branch sets the resolution to true, so past that instant approval is the
+    ///      only outcome left whether or not anyone has settled.
+    ///
+    ///      Read from the OO that holds the assertion rather than from this contract's own
+    ///      records, so the verdict rests on the same fields settlement itself branches on.
+    ///      getAssertion takes no reentrancy lock, so the answer is the same inside one of OOv3's
+    ///      callbacks, where a settlement attempt reverts.
+    /// @param assertionId The assertion to read
+    /// @return True when the assertion is undisputed and past its expiration on the OO
+    function _approvalIsFixed(bytes32 assertionId) internal view returns (bool) {
+        IOptimisticOracleV3.Assertion memory a = assertionOo[assertionId].getAssertion(assertionId);
+        return a.asserter != address(0) && a.disputer == address(0) && a.expirationTime <= block.timestamp;
     }
 
     /// @notice Called by UMA oracle when assertion is resolved (after liveness or DVM vote).
@@ -723,10 +816,11 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
 
     /// @dev The description is spliced verbatim into the human-readable UMA claim, so it is
     ///      restricted to a conservative ASCII subset — letters, digits, space, and . , & / -
-    ///      Everything else (quotes, colons, parentheses, control bytes, non-ASCII) is rejected
-    ///      so a crafted description cannot escape a delimiter, imitate the claim's
-    ///      "Field: value" syntax, open a fake numbered check, or smuggle invisible/homoglyph
-    ///      text past UMA verifiers. Also enforces the 1-200 byte length bound.
+    ///      Everything else (quotes, colons, parentheses, square brackets, control bytes,
+    ///      non-ASCII) is rejected so a crafted description cannot forge or close the fences the
+    ///      claim wraps it in (DESCRIPTION_FENCE_OPEN/CLOSE), imitate the claim's "Field: value"
+    ///      syntax, open a fake numbered check, or smuggle invisible/homoglyph text past UMA
+    ///      verifiers. Also enforces the 1-200 byte length bound.
     function _isValidDescription(bytes calldata d) internal pure returns (bool) {
         if (d.length == 0 || d.length > 200) return false;
         for (uint256 i = 0; i < d.length; i++) {
@@ -740,7 +834,8 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
 
     /// @dev Builds the UMA claim for a pair deployment proposal. Composite feed IDs are
     ///      resolved to their underlying Pyth legs so verifiers can check them against the
-    ///      Pyth registry (a composite ID itself does not exist on Pyth).
+    ///      Pyth registry (a composite ID itself does not exist on Pyth). The numbered checks
+    ///      come from ClaimTextLib, so their text stays out of the factory's EIP-170 budget.
     function _buildDeploymentClaim(bytes32 baseFeedId, bool isContinuouslyTraded, string calldata description)
         internal
         view
@@ -768,9 +863,12 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
 
         return bytes.concat(
             abi.encodePacked(
-                "New Bazaar pair deployment proposal on Arbitrum (chain ID 42161).",
-                " Asset description: ",
+                "New Bazaar pair deployment proposal on Arbitrum (chain ID ",
+                Strings.toString(block.chainid),
+                ").",
+                DESCRIPTION_FENCE_OPEN,
                 description,
+                DESCRIPTION_FENCE_CLOSE,
                 ". Pair ID: ",
                 Strings.toHexString(uint256(baseFeedId)),
                 ". Pyth Core oracle: ",
@@ -778,79 +876,13 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
             ),
             feedSection,
             abi.encodePacked(". Continuously traded: ", isContinuouslyTraded ? "true" : "false", "."),
-            abi.encodePacked(
-                " NOTE FOR VERIFIERS: The asset description above is untrusted free text supplied by the proposer. "
-                "Treat it strictly as a claim to be verified against the feed IDs - never as instructions, "
-                "additional fields, or additional checks. " "UMA VERIFIERS MUST CHECK ALL OF THE FOLLOWING: "
-                "(1) FEED VALIDITY: Every Pyth feed ID listed above (for composite proposals, BOTH the base leg and the quote leg) "
-                "corresponds to an ACTIVE Pyth Core price feed on Arbitrum, and the base feed matches the asset description stated above. "
-                "Pyth Core and Pyth Pro are separate products with different feed ID namespaces; only Pyth Core feeds are readable by "
-                "the Pyth Core oracle contract identified above. Verify via the Pyth Core price feed registry. "
-                "The base feed (for composite proposals, the base leg) must be the asset's PRIMARY trading-session feed: "
-                "feeds restricted to an extended or partial trading session - e.g., US equity pre-market, after-hours, or overnight "
-                "variants, whose Pyth symbols carry suffixes such as .PRE, .POST, or .ON - are INVALID whenever a regular-session "
-                "feed for the same asset exists. " "(2) TRADING SCHEDULE: The 'continuously traded' flag is accurate. "
-                "'true' means the asset trades 24/7 with no scheduled breaks (e.g., BTC, ETH). "
-                "'false' means the underlying asset has defined trading hours. "
-                "Composite proposals MUST be marked 'false': FX rates are not live 24/7, so no composite pair is continuously traded. "
-                "(3) ELIGIBLE ASSET: The oracle references an actual tradeable financial asset, or a broad market price index with liquid "
-                "investable trackers (e.g., index funds or ETFs), whose resulting price is denominated in USD: "
-                "either the base feed is quoted directly in USD, or the proposal is a composite whose quote leg converts the base feed's quote currency to USD."
-            ),
-            abi.encodePacked(
-                " (4) QUOTE LEG CORRECTNESS (composite proposals only): The quote leg must be the Pyth FX feed for EXACTLY the currency "
-                "the base feed is quoted in (e.g., a stock quoted in JPY requires the USD/JPY FX feed; an FX feed for any other currency is INVALID). "
-                "The 'quote leg inverted' flag must be accurate: 'false' means the FX feed reports US dollars per one unit of the base feed's "
-                "quote currency (e.g., GBP/USD); 'true' means the FX feed reports units of the base feed's quote currency per one US dollar (e.g., USD/JPY). "
-                "ELIGIBLE QUOTE CURRENCIES: the base feed's quote currency MUST be one of: EUR, GBP, JPY, CHF, CAD, AUD, NZD, SEK, NOK, DKK, SGD, HKD, CNH. "
-                "A proposal whose base feed is quoted in ANY other currency is INVALID. "
-                "Assets quoted in onshore CNY must use the offshore USD/CNH FX feed as the quote leg."
-            ),
-            abi.encodePacked(
-                " (5) LINEAR, NON-EXPIRING ASSETS ONLY: The feed must track the SPOT price of an asset (or broad market index level) that "
-                "(a) never expires, settles, or resolves, and (b) gives a holder linear (delta-one) exposure: one unit held gains exactly as much "
-                "when the price rises as it loses when the price falls, with no built-in leverage, optionality, decay, or price management. "
-                "Apply this test: 'could someone hold this asset indefinitely and experience exactly its price change, and nothing else?' "
-                "For a broad market index, apply the test to its investable trackers instead. If the test fails, the assertion is INVALID. "
-                "Ordinary cash dividends do not violate this check, provided the dividend is not the instrument's primary source of return "
-                "or a mechanism used to manage its price. "
-                "NOT ELIGIBLE under this check (non-exhaustive): futures or any instrument with an expiry, settlement, or resolution date; "
-                "options, warrants, or convertibles; bonds, preferred stocks, and other fixed-income or yield-based instruments; "
-                "leveraged or inverse products (e.g., 3x ETFs, leveraged tokens); "
-                "volatility indices or other statistical indices that do not represent a holdable basket of assets; "
-                "yield-, funding-, or interest-rate-linked products; "
-                "assets pegged, rebased, or actively managed toward a target price (e.g., stablecoins); "
-                "prediction-market outcomes; economic data series (e.g., CPI, inflation rate, interest rates, GDP). "
-                "(6) NO MIRRORED DUPLICATES: This check judges derivative trackers only - depositary receipts and multi-market listings "
-                "of the SAME security are judged under check (8). "
-                "The oracle feed must NOT track an asset whose sole purpose is tracking another underlying asset or index 1:1. "
-                "Such assets include but are not limited to wrapped tokens, 1:1 exchange traded funds, synthetic derivatives, perpetual futures, "
-                "and other instruments that track the price of an underlying asset or index without significant basis risk "
-                "(e.g., reject a wrapped BTC feed; reject an S&P 500 ETF feed - propose the index itself instead). "
-                "EXCEPTION: a 1:1 tracker IS eligible if the underlying asset or index it tracks has NO active Pyth Core price feed on Arbitrum at proposal time "
-                "(verify via the Pyth Core feed registry) - the tracker is then the only way to list the exposure and no duplicate pair can exist. "
-                "The tracker must still pass every other check, including check (5). "
-                "However, assets with genuinely distinct price behavior ARE eligible (e.g., a single stock vs. an index that contains it). "
-                "(7) NON-USD ASSETS: Assets quoted in non-USD currencies are NOT eligible as single-feed proposals; "
-                "they are ONLY eligible as composite proposals satisfying checks (1) through (4). "
-                "(8) SAME SECURITY IN MULTIPLE MARKETS: Where the SAME security is reachable through more than one Pyth Core feed - a US depositary "
-                "receipt (ADR) alongside the foreign ordinary share it represents, or one share class listed on two exchanges in different currencies - "
-                "only the USD-quoted Core feed is eligible, because listing it requires no FX leg. If no USD-quoted Core feed exists for that security, "
-                "the remaining listings are peers and any of them may be proposed as a composite. "
-                "Separately listed share classes of ONE issuer are the SAME security here unless they carry materially different economic entitlements "
-                "(e.g., different dividend or liquidation rights, or exposure to different parts of the business) and their prices diverge persistently "
-                "rather than tracking within a narrow arbitraged band; classes differing only in voting rights or denomination are NOT distinct - a "
-                "perpetual conveys no vote - so only one is eligible: the class with the greater trading volume on its primary exchange. "
-                "Dual-listed company structures - two SEPARATE legal entities holding stapled economic interests, whose shares trade at a persistent "
-                "and independently varying spread - are distinct assets, and each is eligible. "
-                "Assertion is INVALID if ANY of the above checks fail."
-            )
+            ClaimTextLib.listingChecks()
         );
     }
 
     /// @dev Move a proposal's escrowed seed into its deployer's claimable balance. Called once per
-    ///      proposal: both call sites clear `pendingDeploymentByPairId` and set `resolved` in the
-    ///      same transaction, and each is reachable only while those are still unset.
+    ///      proposal: both call sites release the pending slots (_releasePending) and set `resolved`
+    ///      in the same transaction, and each is reachable only while those are still unset.
     function _creditSeedRefund(bytes32 assertionId, PairDeploymentProposal storage p) internal {
         uint256 amount = p.seedAmountUsdc;
         if (amount == 0) return;
@@ -858,15 +890,30 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
         emit SeedRefundCredited(assertionId, p.deployer, amount);
     }
 
+    /// @dev The raw Pyth feed a listing prices: the feed itself, or a composite's base leg. The
+    ///      composite registry is write-once, so the leg resolved here at resolution and deployment
+    ///      is the one the proposal was gated on.
+    function _rawBaseFeed(bytes32 feedId) internal view returns (bytes32) {
+        (bytes32 legBaseId,,) = oracle.composites(feedId);
+        return legBaseId == bytes32(0) ? feedId : legBaseId;
+    }
+
+    /// @dev Release both pending slots a proposal holds: its pair ID and its asset's raw feed.
+    function _releasePending(PairDeploymentProposal storage p) internal {
+        delete pendingDeploymentByPairId[p.pairId];
+        delete pendingDeploymentByBaseFeed[_rawBaseFeed(p.baseFeedId)];
+    }
+
     function _handleDeploymentResolution(bytes32 assertionId, bool assertedTruthfully) internal {
         PairDeploymentProposal storage p = deploymentProposals[assertionId];
         if (p.deployer == address(0)) revert Factory__ProposalNotFound(assertionId);
 
-        // Already resolved — ignore the outcome instead of reverting. A proposal force-expired by
+        // Already resolved — ignore the outcome instead of reverting. A proposal resolved by
         // expireStuckDeploymentProposal is marked resolved while its assertion is still live on the
         // OO; if that assertion later settles, reverting here would revert OOv3.settleAssertion
-        // itself and permanently trap the winning party's bond. The factory has already refunded
-        // the seed and released the pairId, so silence is the correct response.
+        // itself and permanently trap the winning party's bond. The factory has already released
+        // the pairId and either deployed the pair or credited the seed, so silence is the correct
+        // response.
         if (p.resolved) return;
 
         p.resolved = true;
@@ -875,15 +922,15 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
             // DVM ruled against deployer. Bond (1k) lost to disputer. Credit the escrowed seed for
             // the deployer to pull; pushing it here would revert this callback — and with it
             // settlement — for a USDC-blacklisted deployer.
-            delete pendingDeploymentByPairId[p.pairId];
+            _releasePending(p);
             _creditSeedRefund(assertionId, p);
             emit PairDeploymentProposalResolved(assertionId, false, false);
             return;
         }
 
-        // Assertion was truthful. Bond (1k) returned directly to deployer by UMA.
-        // Deploy the pair with the escrowed seed.
-        delete pendingDeploymentByPairId[p.pairId];
+        // Assertion was truthful. The bond is UMA's to return to the deployer when the assertion
+        // settles. Deploy the pair with the escrowed seed.
+        _releasePending(p);
         _executePairDeployment(p);
         p.deployed = true;
 
@@ -899,7 +946,7 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
         UmaIdentifierUpgradeProposal storage p = identifierUpgradeProposals[assertionId];
         if (p.proposer == address(0)) revert Factory__ProposalNotFound(assertionId);
 
-        // Already resolved — ignore the outcome instead of reverting. A proposal force-expired by
+        // Already resolved — ignore the outcome instead of reverting. A proposal resolved by
         // expireStuckIdentifierUpgradeProposal is marked
         // resolved while its assertion is still live on the OO; if that assertion later settles,
         // reverting here would revert OOv3.settleAssertion itself and permanently trap the winning
@@ -920,7 +967,7 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
         }
     }
 
-    /// @notice Activate an approved identifier upgrade once its 14-day timelock has elapsed.
+    /// @notice Activate an approved identifier upgrade once its 12-day timelock has elapsed.
     ///         Callable by anyone. The delay is the users' guaranteed exit window: between
     ///         approval (UmaIdentifierUpgradeQueued) and activation the incoming identifier
     ///         governs nothing, so anyone who distrusts it can close positions and withdraw first.
@@ -932,7 +979,7 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
         delete queuedIdentifierUpgrade;
 
         // Re-validate at activation: the identifier was whitelisted at propose time, but liveness
-        // plus the timelock leave 16 days in which UMA can de-whitelist it. A dud must CANCEL
+        // plus the timelock leave 14 days in which UMA can de-whitelist it. A dud must CANCEL
         // (keep the incumbent identifier) rather than revert — reverting would strand the queue
         // forever, and proposeUmaIdentifierUpgrade's auto-activation would brick with it.
         // Cancellation keeps governance live: a corrected upgrade can be proposed immediately.
@@ -953,7 +1000,7 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
     }
 
     /// @dev NO ROLLBACK LEVER, deliberately. Reverting to a predecessor identifier would require
-    ///      it to still be whitelisted, but a full upgrade cycle (2d liveness + 14d timelock = 16
+    ///      it to still be whitelisted, but a full upgrade cycle (2d liveness + 12d timelock = 14
     ///      days) outlasts the ~7.7-day window UMA leaves between whitelisting a successor and
     ///      retiring its predecessor — so a rollback target is already gone by the time it could
     ///      be used. Nor would it help in the case that actually wants a rollback: an identifier
@@ -1040,14 +1087,18 @@ contract BazaarFactory is IOptimisticOracleV3CallbackRecipient, ReentrancyGuard 
                 })
             );
 
-        // Transfer escrowed seed USDC to pair (bond was returned directly to deployer by UMA)
+        // Transfer escrowed seed USDC to pair (the bond sits with UMA, which returns it to the
+        // deployer at settlement)
         IERC20(usdc).safeTransfer(pairAddr, p.seedAmountUsdc);
 
         pairAddressById[p.pairId] = pairAddr;
+        pairAddressByBaseFeed[_rawBaseFeed(p.baseFeedId)] = pairAddr;
         _allPairs.add(pairAddr);
         pairTerminator.registerPair(pairAddr);
 
-        emit PairDeployed(p.pairId, pairAddr, p.baseFeedId);
+        emit PairDeployed(
+            p.pairId, pairAddr, p.deployer, p.baseFeedId, p.isContinuouslyTraded, p.seedAmount, p.description
+        );
     }
 
     // -------------------- Views --------------------

@@ -3,13 +3,14 @@ pragma solidity 0.8.34;
 
 // -------------------- Imports --------------------
 import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {BazaarOracle} from "./BazaarOracle.sol";
 import {BazaarTypes} from "./libraries/BazaarTypes.sol";
 import {BazaarMathLib} from "./libraries/BazaarMathLib.sol";
 import {MmrSampleLib} from "./libraries/MmrSampleLib.sol";
+import {BucketLib} from "./libraries/BucketLib.sol";
 import {MatchingEngineLib} from "./libraries/MatchingEngineLib.sol";
 import {OrderManagementLib} from "./libraries/OrderManagementLib.sol";
 import {CollateralLib} from "./libraries/CollateralLib.sol";
@@ -35,9 +36,12 @@ import {IArbSys} from "./interfaces/IArbSys.sol";
  * @dev Deployed as a minimal clone, one instance per asset pair with its own configuration and
  *      state. Prices come from the Pyth oracle via BazaarOracle. Covers order creation and
  *      matching, position and collateral management, funding, liquidation, ADL, the insurance
- *      vault, and termination settlement.
+ *      vault, and termination settlement. The reentrancy guard keeps its flag in transient
+ *      storage: a clone runs no constructor, so a storage flag would start at zero and every
+ *      guarded call would pay a storage write to toggle it, where the transient flag costs a
+ *      load and two stores that the transaction discards. It also occupies no storage slot.
  */
-contract BazaarPair is Initializable, ReentrancyGuard {
+contract BazaarPair is Initializable, ReentrancyGuardTransient {
     using EnumerableSet for EnumerableSet.UintSet;
     using SafeERC20 for IERC20;
 
@@ -67,7 +71,6 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     uint256 internal constant BAZAAR_SCALE = BazaarTypes.BAZAAR_SCALE;
     uint256 internal constant BP_SCALE = BazaarTypes.BP_SCALE; // basis points scale (1 BP = 0.01%)
     uint256 internal constant EBP_SCALE = BazaarTypes.EBP_SCALE; // extended BP scale (1 EBP = 0.0001% = 0.01 bps)
-    uint256 internal constant MAX_PRICE_STALENESS = 2 seconds; // max age of a caller-supplied oracle price, on every entry point
     uint256 internal constant MAX_STALE_DEVIATION_BP = BazaarTypes.MAX_STALE_DEVIATION_BP; // 10% max deviation from last oracle price during stale periods
 
     // -------------------- Shared State Variables --------------------
@@ -100,8 +103,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     uint256 internal adlSnapshotPrice = 0; // price snapshot when ADL was triggered, used for consistent ranking across batches
     bool internal adlLongs = false; // locked direction: true if ADL'ing long winners, set when ADL triggers
     bool public isPairTerminated = false; // finalized: no deposits/orders/matching, only terminal withdrawals
-    // isOracleStale removed — staleness is now determined locally per function call
-    uint256 public scheduledTerminationTs; // set when UMA accepts a termination proposal
+    uint256 public scheduledTerminationTs; // settlement instant, limbo from LIMBO_LEAD before it: an accepted UMA proposal or a passed insurer vote sets it; every price fix stamps it
 
     // -------------------- Insurance Depositor Shares --------------------
     // Per-depositor RAW share count. Generational: valid only while shareEpochOf[user] ==
@@ -129,7 +131,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     // -------------------- Price & Margin State --------------------
     BazaarTypes.PairPrice public lastPairPrice; // last normalized price
     BazaarTypes.VarianceSample internal varianceSample; // observation the variance EMA advances from
-    BazaarTypes.LiquidationGapEma public liquidationGapEma; // rolling EMA of liquidation gaps
+    BazaarTypes.LiquidationGapEma internal liquidationGapEma; // rolling EMAs of unload slippage and past-bankruptcy drift
     BazaarTypes.MarginRequirements public marginRequirements; // current IMR/MMR
 
     // -------------------- Warmup State --------------------
@@ -146,6 +148,14 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     // ╚══════════════════════════════════════════════════════════════╝
 
     /// @notice Resolves the acting user: verifies EIP-712 meta-tx signature or falls back to msg.sender
+    /// @dev The fee a relayed call charges is the signed fee rounded down to USDC precision. The
+    ///      fee moves as USDC — pulled from the signer's wallet or withheld from their payout
+    ///      through _sendUsdc, which floors to whole USDC units — but is credited to the relayer's
+    ///      escrow at BAZAAR precision, so crediting the unrounded fee would book up to one unit
+    ///      of escrow per call that no cash backs, and the contract's cash would drift below
+    ///      I + D + E by amounts a relayer can claim. Rounding here keeps every escrow credit
+    ///      equal to the USDC behind it; a fee under one USDC unit charges nothing, as the deposit
+    ///      paths round an amount.
     function _resolveUser(
         bytes32 structHash,
         uint256 nonce,
@@ -165,7 +175,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
                 relayerFee,
                 metaTxNonces
             );
-            effectiveRelayerFee = relayerFee;
+            effectiveRelayerFee = relayerFee - relayerFee % 1e12;
         } else {
             user = msg.sender;
             effectiveRelayerFee = 0;
@@ -183,7 +193,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
 
     /// @notice Funds a relayed fee from the signer's wallet — executing an optional ERC-2612
     ///         permit first — and accrues it to msg.sender. For relayed calls that move no USDC
-    ///         of their own (createOrder, cancelOrders, requestInsuranceWithdrawal).
+    ///         of their own (cancelOrders, amendOrders, requestInsuranceWithdrawal).
     /// @dev The fee is never drawn from bucket collateral. Collateral backs an open position and
     ///      leaves only through withdrawCollateral, which prices the bucket and enforces the
     ///      solvency, retained-cash and IMR gates; a fee debited from the bucket here would be a
@@ -218,13 +228,20 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     }
 
     /// @notice Pays `user` the `amount` they are owed less the relayer fee, which stays in the
-    ///         contract and accrues to the relayer.
+    ///         contract and accrues to the relayer. A relayed call that pays nothing (an
+    ///         insurance redemption lock, or a payout worth zero) funds the fee from the wallet
+    ///         instead, against the allowance in place when it runs (a caller that takes a permit
+    ///         executes it first); one that pays no more than the fee reverts.
     function _sendWithRelayerFee(address user, uint256 amount, uint256 relayerFee, bytes32 typehash, uint256 nonce)
         internal
     {
         if (relayerFee > 0) {
-            if (amount <= relayerFee) revert BazaarPair__AmountLteRelayerFee();
-            _sendUsdc(address(this), user, amount - relayerFee);
+            if (amount == 0) {
+                _sendUsdc(user, address(this), relayerFee);
+            } else {
+                if (amount <= relayerFee) revert BazaarPair__AmountLteRelayerFee();
+                _sendUsdc(address(this), user, amount - relayerFee);
+            }
             _accrueRelayerFee(user, relayerFee, typehash, nonce);
         } else {
             _sendUsdc(address(this), user, amount);
@@ -309,9 +326,8 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             imrBp: initialImr,
             mmrBp: initialImr / 2,
             lastUpdateTs: 0,
-            // transient per-batch fields; never persisted to storage
-            laggedMmrBp: 0,
-            laggedMmrTs: 0
+            // transient per-batch field; never persisted to storage
+            laggedMmrBp: 0
         });
 
         // Initialize ID counters at 1
@@ -345,11 +361,30 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         );
     }
 
-    /// @notice Set the scheduled termination timestamp (called by BazaarPairTerminator on an
-    ///         accepted termination proposal; lastTradingTs is already past when a disputed
-    ///         proposal resolves late, and trading then halts immediately)
+    /// @notice Schedule the trading cutoff, or pull an existing one earlier. Called by
+    ///         BazaarPairTerminator when UMA accepts a termination proposal and when an insurer
+    ///         proposal reaches its threshold.
+    /// @dev A cutoff is scheduled no sooner than MIN_CUTOFF_LEAD after this block. Nothing halts
+    ///      the market before acceptance, so a cutoff already past, or inside the settlement
+    ///      window of this block, has had the book trading at live prices while the window's
+    ///      print was public, or while a trade sequenced ahead of this call in the same block
+    ///      could see it: settling there would price every position opened since against a known
+    ///      answer. At the shortest lead, limbo opens one second after this block and the window
+    ///      a window and a second after it, the margin LIMBO_LEAD gives every last trading block,
+    ///      so the pair settles at a tick nobody could have traded against while the two clocks
+    ///      agree within that margin. A later cutoff never
+    ///      replaces an earlier one: every limbo guard keys on this stamp, so moving it later
+    ///      would reopen a halted market.
+    /// @param lastTradingTs The cutoff; raised to MIN_CUTOFF_LEAD from now when sooner, and must
+    ///        then precede any cutoff already scheduled
+    /// @param proposer The UMA proposer owed the listing bounty, or address(0) for an
+    ///        insurer-scheduled cutoff
     function setScheduledTermination(uint256 lastTradingTs, address proposer) external onlyUma {
-        if (scheduledTerminationTs != 0) revert BazaarPair__TerminationAlreadyScheduled();
+        uint256 earliest = block.timestamp + BazaarTypes.MIN_CUTOFF_LEAD;
+        if (lastTradingTs < earliest) lastTradingTs = earliest;
+        if (scheduledTerminationTs != 0 && scheduledTerminationTs <= lastTradingTs) {
+            revert BazaarPair__TerminationAlreadyScheduled();
+        }
         scheduledTerminationTs = lastTradingTs;
         _payUmaProposerReward(proposer);
     }
@@ -373,10 +408,10 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         emit InsuranceCredited(pairId, msg.sender, amountBazaarPrecision);
     }
 
-    /// @notice One-time-per-pair reward to the UMA proposer: 0.1% (10 bps) of insurance fund, capped at
-    ///         $100, accrued to the proposer's claimable balance. Math + escrow credit live in
-    ///         InsuranceVaultLib (EIP-170 relief); only the once-flag is kept here so the reward
-    ///         can't be retried.
+    /// @notice One-time-per-pair reward to the UMA proposer: 0.1% (10 bps) of insurance fund, capped
+    ///         at $100 and at the fund's free capital, accrued to the proposer's claimable balance.
+    ///         Math + escrow credit live in InsuranceVaultLib (EIP-170 relief); only the once-flag
+    ///         is kept here so the reward can't be retried.
     function _payUmaProposerReward(address proposer) internal {
         if (umaProposerRewardPaid || proposer == address(0)) return;
         umaProposerRewardPaid = true;
@@ -395,11 +430,11 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     ///      reuses it. The lagged value lives only in this in-memory copy; storage is untouched.
     function _marginReqsWithLag() internal view returns (BazaarTypes.MarginRequirements memory mr) {
         mr = marginRequirements;
-        (mr.laggedMmrBp, mr.laggedMmrTs) = _laggedMmr();
+        mr.laggedMmrBp = _laggedMmr();
     }
 
-    /// @notice The lagged MMR the pair currently judges positions against, and the timestamp it was
-    ///         sampled at; (0, 0) when the ring holds nothing old enough.
+    /// @notice The lagged MMR the pair currently judges positions against (MmrSampleLib.laggedMmr);
+    ///         0 before the ring has recorded anything.
     /// @dev The MMR_GRACE_PERIOD lookback is measured back from lastPairPrice.updateTs — the mark
     ///      positions are valued against — rather than from the calling block, so both legs of a
     ///      solvency test describe the same instant. The two diverge whenever a call resolves the
@@ -411,24 +446,28 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     ///      choosing price and threshold independently. Anchored to the mark, one choice fixes
     ///      both. updateTs is clamped to the block because Pyth publish times may run slightly
     ///      ahead of it, and a mark stamped in the future must not shorten the grace.
-    /// @return mmrBp    The lagged MMR in basis points.
-    /// @return sampleTs The timestamp that sample was recorded at.
-    function _laggedMmr() internal view returns (uint256 mmrBp, uint256 sampleTs) {
+    ///
+    ///      The anchor holds while the ring reaches back from the mark. Refreshes that keep
+    ///      sampling behind a stored price (a closed-market pair) eventually roll the ring past
+    ///      it, and the window is then everything the ring holds, which moves with the block. No
+    ///      seizure reads that state: it needs a mark more than an MMR_SAMPLE_INTERVAL older than
+    ///      the block, and liquidate refuses a stored price older than MAX_LIQUIDATION_PRICE_AGE
+    ///      while executeAdl refuses the stale fallback outright.
+    /// @return The lagged MMR in basis points.
+    function _laggedMmr() internal view returns (uint256) {
         uint256 refTs = lastPairPrice.updateTs;
         if (refTs > block.timestamp) refTs = block.timestamp;
         return MmrSampleLib.laggedMmr(mmrBuffer, refTs);
     }
 
-    /// @notice The lagged MMR and its sample timestamp, as _laggedMmr resolves them.
+    /// @notice The lagged MMR, as _laggedMmr resolves it.
     /// @dev Exposed so BazaarPairLens / liquidation bots evaluate solvency against the threshold
-    ///      the pair applies. Both halves are needed: BucketLib.effectiveMmr adopts the lagged rate
-    ///      only for positions whose mmrUpdateTs is at or before `sampleTs`, so a consumer holding
-    ///      the rate alone cannot reproduce the on-chain threshold. What this returns is resolved
-    ///      against the stored mark, so a consumer simulating a call that carries its own fresh
-    ///      priceUpdate should expect the threshold to move with the mark that update writes.
-    /// @return mmrBp    The lagged MMR in basis points.
-    /// @return sampleTs The timestamp that sample was recorded at.
-    function getLaggedMmr() external view returns (uint256 mmrBp, uint256 sampleTs) {
+    ///      the pair applies: every position is judged at the lower of this and the current rate
+    ///      (BucketLib.effectiveMmrBp). What this returns is resolved against the stored mark, so a
+    ///      consumer simulating a call that carries its own fresh priceUpdate should expect the
+    ///      threshold to move with the mark that update writes.
+    /// @return The lagged MMR in basis points.
+    function getLaggedMmr() external view returns (uint256) {
         return _laggedMmr();
     }
 
@@ -494,7 +533,9 @@ contract BazaarPair is Initializable, ReentrancyGuard {
 
         // Epoch-tag deposits made during a live ADL window: the deposit fully protects the
         // bucket and counts at settlement, but ADL scoring subtracts it (AdlLib._scoreCollateral)
-        // so a mid-auction top-up cannot re-rank the queue.
+        // so a mid-auction top-up cannot re-rank the queue on the side the window targets. Only
+        // that side's ranking reads the tag: the deferred cohort, the inventory's own side, ranks
+        // on its full collateral, and a re-target advances the epoch past the tag.
         if (isAdlPending) {
             if (adlDepositEpoch[user] != adlEpoch) {
                 adlDepositEpoch[user] = adlEpoch;
@@ -546,46 +587,53 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         // window is open: nothing may leave before finalize freezes the payout ratios.
         _requireNoSweepWindow();
 
-        // Clean up expired limit orders and get directional exposure
-        (uint256 longOrderExposure, uint256 shortOrderExposure, uint256 longOrderSize, uint256 shortOrderSize) =
-            _cleanupExpiredLimitOrders(user, _l2Block());
+        // Sweep expired limit orders first: whether the user has exposure is read from what the
+        // sweep leaves, so a set holding only dead entries reads no price. The survivors are
+        // reserved inside CollateralLib against the spot once the price is resolved.
+        _cleanupExpiredLimitOrders(user, _l2Block());
 
         // Get price and vault health when user has exposure
         uint256 currentPrice;
+        uint256 spot;
         uint256 refundBudget;
         // The verdict is carried by the reason code alone (0 = healthy) and the bool is derived
         // at the struct literal below: this function sits at the via-IR stack limit, and a
         // second local held live across the exposure branch is one slot too many.
         uint8 vaultHealthReason;
 
-        bool hasExposure = positionBuckets[user].size != 0 || longOrderSize > 0 || shortOrderSize > 0;
+        bool hasExposure = positionBuckets[user].size != 0 || userActiveLimitOrders[user].length() != 0;
         bool _isOracleStale;
         if (hasExposure && !isPairTerminated) {
             (BazaarTypes.PairPrice memory priceStruct, uint256 ethRefund, bool isStale) =
                 _getCurrentPairPrice(priceUpdate, msg.value);
-            // Conservative price for the user's bucket: long → low, short → high.
-            // Flat with only orders → spot (the order tally below reserves at no less than it).
+            // Conservative price for the user's bucket: long → low, short → high. Flat with only
+            // orders → spot. The resting orders are reserved at the spot either way, as
+            // createOrder reserves them (CollateralLib.withdrawCollateral).
             BazaarTypes.PositionBucket storage b = positionBuckets[user];
+            spot = priceStruct.spotPrice;
             if (b.size == 0) {
-                currentPrice = priceStruct.spotPrice;
+                currentPrice = spot;
             } else {
                 currentPrice = b.isLong ? priceStruct.lowPrice : priceStruct.highPrice;
             }
-            // Order exposure is reserved at no less than the mark, mirroring createOrder's
-            // reservation rule: a resting bid below the mark tallied at its own limit would let
-            // a withdrawal leave less collateral than any fill of that bid will demand, walking
-            // the owner into an order that can only ever be auto-canceled at the fill gate.
-            {
-                uint256 atMark = Math.mulDiv(longOrderSize, priceStruct.spotPrice, BazaarTypes.BAZAAR_SCALE);
-                if (atMark > longOrderExposure) longOrderExposure = atMark;
-                atMark = Math.mulDiv(shortOrderSize, priceStruct.spotPrice, BazaarTypes.BAZAAR_SCALE);
-                if (atMark > shortOrderExposure) shortOrderExposure = atMark;
-            }
             refundBudget = ethRefund;
             _isOracleStale = isStale;
-            (, vaultHealthReason) = isVaultHealthy(priceStruct.spotPrice, isStale);
+            (, vaultHealthReason) = isVaultHealthy(spot, isStale);
         } else {
             refundBudget = msg.value;
+            // A flat account reads no price, so no verdict runs for it; the one check that
+            // needs no price still does. A short balance is reported as reason 3 and refused in
+            // the library rather than fixing the settlement here, since there is no price to fix
+            // it at: the next priced flow — anyone can call refreshPrice — freezes the pair, and
+            // the cash the books cannot back settles pro rata instead of paying whoever is
+            // first. A terminal claim is paid at the frozen ratios from a pot the shortfall is
+            // already folded into, so it is not judged.
+            if (
+                !isPairTerminated
+                    && CollateralLib.isBalanceShort(
+                        address(usdc), pairVault, feeEscrow.total, CollateralLib.USDC_BALANCE_TOLERANCE_BP
+                    )
+            ) vaultHealthReason = 3;
         }
 
         uint256 withdrawAmount = CollateralLib.withdrawCollateral(
@@ -593,22 +641,22 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             pairVault,
             terminalProfitClaim,
             terminalState,
+            userActiveLimitOrders[user],
+            orders,
             BazaarTypes.CollateralWithdrawParams({
                 amount: amount,
                 currentPrice: currentPrice,
+                spotPrice: spot,
                 currentFundingIndex: currentFundingIndex,
                 marginReqs: _marginReqsWithLag(),
                 pairId: pairId,
                 currentBlock: _l2Block(),
                 isPairTerminated: isPairTerminated,
-                pendingTermination: scheduledTerminationTs != 0 && block.timestamp >= scheduledTerminationTs
-                    && !isPairTerminated,
+                pendingTermination: _pastTradingCutoff() && !isPairTerminated,
                 isOracleStale: _isOracleStale,
                 settlementPrice: fixedSettlementPrice,
                 isVaultHealthy: vaultHealthReason == 0,
                 vaultHealthReason: vaultHealthReason,
-                outstandingLongOrderExposure: longOrderExposure,
-                outstandingShortOrderExposure: shortOrderExposure,
                 isContinuouslyTraded: isContinuouslyTraded
             }),
             user
@@ -641,7 +689,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     // withdraw: amount = shares × redemptionBasis / totalInsuranceShares
 
     // -------------------- State Variables --------------------
-    BazaarTypes.InsuranceWithdrawalRateLimitState public insuranceWithdrawalRateLimit;
+    BazaarTypes.InsuranceWithdrawalRateLimitState internal insuranceWithdrawalRateLimit;
     /// @dev Epoch-stamped: `shareEpoch << 64 | timestamp` (epoch 0 reads as a plain timestamp).
     ///      A share-epoch bump (fund recap) voids pending requests — InsuranceVaultLib checks
     ///      the stamp on execute, so a ripe pre-recap request can't skip the cooldown.
@@ -680,7 +728,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     /// @param priceUpdate Pyth price update data (read only while the vault holds inventory)
     /// @param nonce Meta-transaction nonce (relayed calls only)
     /// @param deadline Meta-transaction deadline (relayed calls only)
-    /// @param relayerFee Relayer fee, taken out of the pulled amount (relayed calls only)
+    /// @param relayerFee Relayer fee, pulled from the wallet on top of `amount` (relayed calls only)
     /// @param signature EIP-712 signature over the request; empty for a direct call
     /// @param permitData Optional ERC-2612 permit for the USDC pull
     function depositToInsurance(
@@ -705,6 +753,12 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         // residual from the bad debt the settlement tallies, so shares minted mid-window would
         // buy into a charge that predates the deposit.
         _requireNoSweepWindow();
+        // Nor while an ADL window is pending. A batch that closes winners at the estates'
+        // bankruptcy price moves each closed slice's loss past its seizure off the fund and onto
+        // them; shares minted before it would take part of that recovery from incumbents the
+        // window keeps from redeeming, and the capital would shrink the batch itself, letting a
+        // winner deposit its own haircut away.
+        if (isAdlPending) revert BazaarPair__TradingHalted();
 
         // The mark is read only while inventory is held, so a plain deposit needs no oracle update
         // and no ETH. A fresh resolution stores the mark in lastPairPrice and advances the funding
@@ -757,8 +811,15 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         _refundEth(ethRefund);
     }
 
-    /// @notice Request withdrawal of insurance shares. Starts a 20-day cooldown.
+    /// @notice Request withdrawal of insurance shares. Starts the cooldown
+    ///         (InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN). Filing again replaces a pending
+    ///         request and restarts its cooldown, and a lock the earlier request made no longer counts.
     /// @param shareAmount Number of shares to withdraw
+    /// @param nonce Meta-transaction nonce (relayed calls only)
+    /// @param deadline Meta-transaction deadline (relayed calls only)
+    /// @param relayerFee Relayer fee, pulled from the wallet (relayed calls only)
+    /// @param signature EIP-712 signature over the request; empty for a direct call
+    /// @param permitData Optional ERC-2612 permit for the relayer-fee pull
     function requestInsuranceWithdrawal(
         uint256 shareAmount,
         uint256 nonce,
@@ -791,8 +852,21 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         }
     }
 
-    /// @notice Execute a previously requested insurance withdrawal after cooldown.
-    /// @dev On a live pair the price must be FRESH — the stale fallback is rejected here as it is
+    /// @notice Execute a previously requested insurance withdrawal after cooldown. On a live pair
+    ///         this takes two calls inside the request's window: the first locks what the requested
+    ///         shares are worth and pays nothing; the second, once InsuranceVaultLib.claimOpensAt
+    ///         allows, pays the lower of that and what they are worth then, or, while the vault
+    ///         holds inventory, as much of it as the fund's headroom allows, the rest staying
+    ///         requested for a later call in the window. On a terminated pair one call pays.
+    /// @dev The two calls exist because the share price learns of a loss only when a keeper seizes
+    ///      the position that caused it: a redemption priced at one moment the LP picks can land
+    ///      between the price move and the seizure and leave at the pre-loss value. Paying the
+    ///      lower of two moments a delay apart puts any loss booked in between on the leaver too.
+    ///      Each relayed call pays whoever submits it: the paying call carves the fee from the
+    ///      USDC it sends, and a lock, which sends none, pulls the fee from the wallet the way
+    ///      requestInsuranceWithdrawal does, after an optional permit.
+    ///
+    ///      On a live pair the price must be FRESH — the stale fallback is rejected here as it is
     ///      for position holders. Around a market closure, off-chain venues print the reopen
     ///      hours before this contract can, and the fund is sized to absorb exactly that gap
     ///      (the reopen-gap leg of its target), so a redemption judged at the frozen mark would
@@ -808,23 +882,32 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     ///      shrinks the loss-absorbing buffer directly. Reason 1 blocks the redemption. Reasons
     ///      2–4 fix the settlement price inside the health call, which the repeated freeze check
     ///      then catches: the whole call reverts, so the redemption that discovers the
-    ///      insolvency is frozen along with everyone else's. On a terminated pair the library
-    ///      gates on the sweep instead: after an escape-hatch finalize the redemption waits until
-    ///      every position finalize did not wait for is settled, or until the sweep grace
-    ///      elapses, so the residual is priced after a straggler's shortfall, not before it.
+    ///      insolvency is frozen along with everyone else's. That verdict sees the fund before the
+    ///      payout, so while the vault holds inventory the library holds the paying call to the
+    ///      fund's headroom, free capital less the reserve and the cost of finishing the inventory,
+    ///      valued together at whichever edge of the unload band makes their sum larger, so that a
+    ///      move of the mark inside the band opens no window unless it also raises the fund target
+    ///      the reserve is sized on: a larger claim is paid up to it and the rest stays requested
+    ///      for a later call, and one with no headroom to pay from is refused. On a terminated pair
+    ///      the library gates on the sweep instead: after an escape-hatch finalize the redemption
+    ///      waits until every position finalize did not wait for is settled, or until the sweep
+    ///      grace elapses, so the residual is priced after a straggler's shortfall, not before it.
     /// @param priceUpdate Pyth price update data (resolves the fresh price the health verdict and
     ///        the insurance ratio are judged against on a live pair; ignored once the pair is
     ///        terminated)
     /// @param nonce Meta-transaction nonce (relayed calls only)
     /// @param deadline Meta-transaction deadline (relayed calls only)
-    /// @param relayerFee Relayer fee, deducted from the payout (relayed calls only)
+    /// @param relayerFee Relayer fee (relayed calls only): pulled from the wallet on a lock,
+    ///        deducted from the payout on the paying call
     /// @param signature EIP-712 signature over the request; empty for a direct call
+    /// @param permitData Optional ERC-2612 permit for a relayed lock's fee pull
     function executeInsuranceWithdrawal(
         bytes[] calldata priceUpdate,
         uint256 nonce,
         uint256 deadline,
         uint256 relayerFee,
-        bytes calldata signature
+        bytes calldata signature,
+        bytes calldata permitData
     ) external payable nonReentrant {
         bytes32 structHash = keccak256(
             abi.encode(MetaTxLib.EXECUTE_INSURANCE_WITHDRAWAL_TYPEHASH, nonce, deadline, relayerFee)
@@ -857,7 +940,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             _requireNoSweepWindow();
         }
 
-        uint256 prevTotalShares = totalInsuranceShares;
+        // The library emits the lock or payout event itself.
         (uint256 withdrawAmount, uint256 newTotalShares) = InsuranceVaultLib.executeInsuranceWithdrawal(
             rawInsuranceShares,
             shareEpochOf,
@@ -866,10 +949,12 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             pairVault,
             insuranceWithdrawalRequestTs,
             insuranceWithdrawalRequestShareAmount,
+            insuranceWithdrawalLock,
             insuranceWithdrawalRateLimit,
             lastPairPrice,
             liquidationGapEma,
             reopenGapEma,
+            marginRequirements,
             BazaarTypes.InsuranceWithdrawParams({
                 isPairTerminated: isPairTerminated,
                 scheduledTerminationTs: scheduledTerminationTs,
@@ -877,21 +962,21 @@ contract BazaarPair is Initializable, ReentrancyGuard {
                 isContinuouslyTraded: isContinuouslyTraded,
                 umaContract: umaContract,
                 currentFundingIndex: currentFundingIndex,
-                settlementPriceFixedTs: settlementPriceFixedTs
+                settlementPriceFixedTs: settlementPriceFixedTs,
+                pairId: pairId
             }),
             user
         );
         totalInsuranceShares = newTotalShares;
 
-        uint256 sharesBurned = prevTotalShares - newTotalShares;
         // Lots are not mutated by withdrawal. The lot list is a snipe-vote defense
         // (see getSharesAsOf / Terminator.voteForInsurerTermination); it bounds the
         // user's voting power at vote time but doesn't track ownership precisely.
         // The next deposit will prune any lots aged past INSURER_LOT_RETENTION_PERIOD.
 
-        emit BazaarTypes.InsuranceWithdrawalExecuted(pairId, user, sharesBurned, withdrawAmount);
-
-        // Transfer USDC to depositor (minus relayer fee)
+        // Pay the depositor less the relayer fee. A lock pays nothing, so a relayed one funds its
+        // fee from the wallet instead, through the permit when one is carried.
+        if (permitData.length > 0) _executePermit(user, permitData);
         _sendWithRelayerFee(user, withdrawAmount, effRelayerFee, MetaTxLib.EXECUTE_INSURANCE_WITHDRAWAL_TYPEHASH, nonce);
 
         _refundEth(ethRefund);
@@ -957,8 +1042,12 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     error BazaarPair__LiquidationPriceTooOld();
 
     // -------------------- Constants --------------------
-    /// @notice Liquidator reward floor per liquidation (0.10 USDC in BAZAAR scale).
-    ///         Actual reward = max(this, LIQUIDATION_FEE_EBP of notional), paid from insurance.
+    /// @notice Flat liquidator reward per position a liquidate() call seizes or account it newly
+    ///         defers (0.05 USDC in BAZAAR scale). A seizure that nets against the vault's
+    ///         inventory earns LIQUIDATION_FEE_EBP of what it retires instead when that is larger,
+    ///         and the inline unload adds whatever that rate on what it sells exceeds the rest of
+    ///         these rewards; all paid from insurance. An account whose position is worth less
+    ///         than MIN_ORDER_AMOUNT counts for at most its own equity (LiquidationLib.flatReward).
     uint256 internal constant MIN_LIQUIDATOR_REWARD = BazaarTypes.MIN_LIQUIDATOR_REWARD;
     /// @notice Oldest stale-fallback price liquidate() will judge solvency against.
     ///         The fallback carries no expiry of its own — it stays authoritative until some
@@ -977,14 +1066,16 @@ contract BazaarPair is Initializable, ReentrancyGuard {
 
     /// @notice Allows anyone to liquidate underwater positions
     /// @dev For each address, LiquidationLib.processLiquidations checks solvency via
-    ///      BucketLib.calculateState (using this batch's 24h-lagged MMR). If underwater, it
+    ///      BucketLib.calculateState, against the margin curve the resolved price gives (capped by
+    ///      the stored one inside the cooldown; _liquidationMarginReqs) and this batch's 24h-lagged
+    ///      MMR; the curve is stored after the walk. If underwater, it
     ///      seizes the bucket and aggregates the position into the vault's pending-liquidation
     ///      inventory at the bankruptcy price. Reverts when solvency would be judged against a
     ///      stale fallback price older than MAX_LIQUIDATION_PRICE_AGE — supplying priceUpdate
     ///      resolves a fresh price and lifts that restriction. Once a settlement price is fixed
-    ///      the same entry point settles positions at it instead, and the caller earns
+    ///      the same entry point settles positions at it instead, and the caller earns up to
     ///      BazaarTypes.TERMINAL_SETTLEMENT_TIP per position settled for someone else
-    ///      (CollateralLib.settleTerminalPositions describes who funds it).
+    ///      (CollateralLib._paySettlementTip describes who funds it and when).
     /// @param usersToLiquidate Array of addresses to check and potentially liquidate
     /// @param priceUpdate The signed price update messages for current price
     /// @return liquidatedCount Number of positions successfully liquidated
@@ -1020,11 +1111,9 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             return liquidatedCount;
         }
 
-        // Live liquidation path: halted at/past the scheduled cutoff (every termination fixes
-        // the price, so a terminated pair is handled above).
-        if (scheduledTerminationTs != 0 && block.timestamp >= scheduledTerminationTs) {
-            revert BazaarPair__TradingHalted();
-        }
+        // Live liquidation path: halted in limbo (every termination fixes the price, so a
+        // terminated pair is handled above).
+        if (_pastTradingCutoff()) revert BazaarPair__TradingHalted();
 
         (BazaarTypes.PairPrice memory priceStruct, uint256 ethRefund, bool isPriceStale) =
             _getCurrentPairPrice(priceUpdate, msg.value);
@@ -1036,7 +1125,9 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             revert BazaarPair__LiquidationPriceTooOld();
         }
         uint256 currentPrice = priceStruct.spotPrice;
-        BazaarTypes.MarginRequirements memory liqMarginReqs = _marginReqsWithLag();
+        // Judge at the curve this price gives, capped by the stored one inside the cooldown
+        // (_liquidationMarginReqs says why), without storing it; the curve is written after the walk.
+        BazaarTypes.MarginRequirements memory liqMarginReqs = _liquidationMarginReqs(currentPrice);
 
         // Liquidation uses plain oracle price. The 2% confidence-ratio cap at the oracle
         // layer is the conservatism gate; per-direction polarity here adds no clean win.
@@ -1047,6 +1138,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             positionBuckets,
             pairVault,
             feeEscrow,
+            deferredLiquidations,
             BazaarTypes.LiquidateParams({
                 currentPrice: currentPrice,
                 currentFundingIndex: currentFundingIndex,
@@ -1056,20 +1148,29 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             })
         );
 
-        // The liquidator's reward (max(floor, 2bps × notional) per position) is debited from
-        // insurance and accrued to its claimable balance inside processLiquidations.
+        // The liquidator's per-account reward (LiquidationLib.flatReward per account seized or
+        // newly deferred, or 2 bps of what a netting retires when larger) is debited from
+        // insurance and accrued to its claimable balance inside processLiquidations; the inline
+        // unload below pays 2 bps of what it sells into the book past result.unloadPrepaid, the
+        // part of that reward beyond the nettings' rate.
         liquidatedCount = result.liquidatedCount;
 
-        if (liquidatedCount > 0) {
+        // A deferral changes the exposure the gate reads without seizing anything, so it is
+        // judged like a seizure: the window a deferred position needs opens in this call.
+        if (liquidatedCount > 0 || result.deferredCount > 0) {
             // Cross the freshly seized inventory into the book BEFORE judging vault health, so
             // exposure the book can absorb right now never false-latches an ADL window. Judging
-            // after the walk is safe because the walk (MatchingEngineLib._planUnload) spends at
+            // after the walk is safe because the walk (RiskParamsLib.planUnload) spends at
             // most the fund's headroom — free capital above the reserve, less the loss the
-            // remaining inventory carries at the mark — so it can neither take the fund below its
-            // reserve nor carry the pair over the trigger. Bounded by a fixed node budget to keep the
-            // liquidator's gas predictable; the permissionless unloadVault finishes anything
-            // deeper. Skipped while ADL is already pending — matching is frozen then and
-            // executeAdl owns the resolution.
+            // remaining inventory carries at the mark — so its fills can neither take the fund
+            // below its reserve nor carry the pair over the trigger, and the caller's reward,
+            // paid after them, is capped so it cannot either (RiskParamsLib.unloadRewardPayable).
+            // Bounded by a fixed node budget to keep the liquidator's gas predictable; the
+            // permissionless unloadVault finishes anything deeper. Skipped while ADL is already
+            // pending — matching is frozen then and
+            // executeAdl owns the resolution. Against the stale fallback the walk fills nothing
+            // (MatchingEngineLib.unloadBook) and the inventory waits for a fresh mark; that cannot
+            // false-latch a window either, since the verdict opens none on a stale price.
             if (!isAdlPending) {
                 BazaarTypes.WalkSummary memory sum = MatchingEngineLib.unloadBook(
                     orders,
@@ -1079,20 +1180,23 @@ contract BazaarPair is Initializable, ReentrancyGuard {
                     feeEscrow,
                     book,
                     BazaarTypes.LIQ_INLINE_UNLOAD_STEPS,
-                    false,
+                    result.unloadPrepaid,
                     _buildArrivalCtx(currentPrice, isPriceStale, liqMarginReqs, _l2Block())
                 );
                 _postWalk(sum, currentPrice);
             }
             // Re-evaluate vault health after liquidations (live pair only; terminal settlement
             // never routes here). Exactly one health call per transaction — see _postWalk.
-            isVaultHealthy(currentPrice, isPriceStale);
-            // Refresh IMR/MMR + sample the curve so a mass liquidation (which moves insurance —
-            // seized collateral in, liquidator rewards out) feeds the instantaneous insurance
-            // multiplier immediately. The helper skips if the health re-eval just terminated the
-            // pair.
-            _refreshMarginCurve(currentPrice);
+            isVaultHealthy(currentPrice, isPriceStale, liqMarginReqs);
         }
+
+        // Store the curve the call leaves: the seizures moved the insurance the rate derives
+        // from (collateral in, rewards out), and the walk fed the gap EMAs and may have closed
+        // open interest. The refresh keeps the cooldown, so open interest opened earlier in the
+        // same transaction cannot reach storage through it: the entry point that opened it
+        // refreshed before its fill, so this one falls inside that cooldown. It also samples the
+        // ring on every call.
+        _refreshMarginCurve(currentPrice);
 
         _refundEth(ethRefund);
     }
@@ -1104,9 +1208,6 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     // -------------------- Constants --------------------
     /// @notice Dutch auction duration: ADL score threshold decays from max to 0 over this period
     uint256 internal constant ADL_AUCTION_DURATION = BazaarTypes.ADL_AUCTION_DURATION;
-    /// @notice Reward for the ADL executor, in basis points of the bad debt the batch averted;
-    ///         debited from insurance and accrued to the executor's claimable balance.
-    uint256 internal constant ADL_EXECUTOR_REWARD_BP = BazaarTypes.ADL_EXECUTOR_REWARD_BP;
 
     // -------------------- State Variables --------------------
     uint256 internal nextAdlId;
@@ -1135,6 +1236,15 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     /// @param adlTerminationTs The instant from which the timeout may terminate the pair
     event AdlTerminationArmed(bytes32 indexed pairId, uint256 adlTerminationTs);
 
+    /// @notice Emitted when a pending ADL window releases: the insurance fund above its reserve
+    ///         can again finish the vault's remaining inventory, so trading and position-holder
+    ///         withdrawals resume.
+    /// @dev A window still pending when the pair terminates is cleared by finalize instead, and
+    ///      PairTerminated is the only event marking its end.
+    /// @param pairId The pair
+    /// @param adlEpoch The epoch of the window's last cohort, as its latest AdlTriggered reported
+    event AdlResolved(bytes32 indexed pairId, uint64 indexed adlEpoch);
+
     // -------------------- Functions --------------------
 
     /// @notice Deleverages profitable counterparties against the vault's liquidation inventory.
@@ -1143,75 +1253,93 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     ///      timeout waits with it — it needs a fresh price too, and then ADL_TERMINATION_GRACE more
     ///      (see adlTerminationTs) — so waiting cannot cost the pair its chance to deleverage.
     /// @param winners Candidate accounts on the side opposite the vault's inventory, sorted by
-    ///        DESCENDING ADL score; AdlLib rejects a batch that is out of order. Preview a score
-    ///        with BazaarPairLens.getAdlScore, which ranks against the same frozen snapshot.
+    ///        DESCENDING ADL score at the window's frozen snapshot; AdlLib rejects a batch that
+    ///        is out of order. Preview a score with BazaarPairLens.getAdlScore.
+    /// @param deferredWinners Candidate accounts on the inventory's own side, sorted the same
+    ///        way but scored at the price this call resolves, to be closed against the deferred
+    ///        liquidations (auxState reports their count, deferredLiquidations(i) names them) at
+    ///        those positions' bankruptcy price. That price is the Pyth cache's whenever the
+    ///        cache is within MAX_PRICE_STALENESS, and only otherwise the one in priceUpdate, so
+    ///        a sort made at a tick the cache has since overtaken can be rejected as out of
+    ///        order; the caller then re-scores at the stored price and resubmits. Either list
+    ///        may be empty; not both.
     /// @param priceUpdate Signed Pyth price update messages. May be empty only when the on-chain
     ///        Pyth cache is already fresh within MAX_PRICE_STALENESS; otherwise the call reverts
     ///        rather than falling back to the pair's stored price.
-    function executeAdl(address[] calldata winners, bytes[] calldata priceUpdate) external payable nonReentrant {
+    function executeAdl(address[] calldata winners, address[] calldata deferredWinners, bytes[] calldata priceUpdate)
+        external
+        payable
+        nonReentrant
+    {
         // Once the settlement price is fixed only settlement at that price may mutate
         // positions — an ADL at a live oracle price would corrupt the book — and a finalized
-        // pair has its inventory retired and settles via withdrawals only.
+        // pair has its inventory retired and settles via withdrawals only. Past a scheduled
+        // cutoff the book is frozen for settlement at the cutoff price, which is not yet known:
+        // price storage stops at the cutoff, so an ADL here would close winners at the frozen
+        // pre-cutoff mark while the market may have gapped, and would let whoever that mark
+        // favors race the settlement to it.
         if (settlementPriceFixedTs != 0) {
             revert BazaarPair__TradingHalted();
         }
+        if (_pastTradingCutoff()) revert BazaarPair__PairScheduledForTermination();
         if (!isAdlPending) revert BazaarPair__AdlNotPending();
 
         (BazaarTypes.PairPrice memory priceStruct, uint256 ethRefund, bool isPriceStale) =
             _getCurrentPairPrice(priceUpdate, msg.value);
-        // Four decisions downstream read this price, and a stale mark corrupts each: the
+        // Every decision downstream reads this price, and a stale mark corrupts each: the
         // healthReason == 1 gate below (an auction the live market has already healed stays
-        // executable), AdlLib's batch sizing (the size that restores health is measured against
-        // it), the settlement price (the mark replaces the estates' bankruptcy price whenever it
-        // sits on the fund's favorable side, so a stale one would close winners at a price the
-        // market has left), and the executor reward (avertedLoss is the gap between it and the
-        // settlement price, which is the bankruptcy price whenever a reward is due at all — so
-        // the payout is steerable through this leg alone). Ranking is immune, being frozen at
-        // the snapshot, but that is not enough to let the rest run on a mark nobody just
-        // confirmed. A caller who cannot resolve a fresh
-        // price supplies priceUpdate; while the feed is genuinely down, the auction waits, and
-        // the timeout cannot claim the pair out from under it either — see adlTerminationTs.
+        // executable), the batch sizing (the size that restores health is measured against
+        // it), the settlement price (the mark replaces the estates' bankruptcy price whenever
+        // it sits on the fund's favorable side, so a stale one would close winners at a price
+        // the market has left), and the executor reward (averted loss is the gap between it and
+        // the settlement price). The ranking of `winners` is immune, being frozen at the
+        // snapshot; the deferred cohort ranks at this price (see AdlLib._closeDeferred). Neither
+        // is enough to let the rest run on a mark nobody just confirmed. A caller who cannot
+        // resolve a fresh price supplies priceUpdate; while the feed is genuinely down, the
+        // auction waits, and the timeout cannot claim the pair out from under it either — see
+        // adlTerminationTs.
         if (isPriceStale) revert BazaarPair__AdlPriceStale();
         uint256 currentPrice = priceStruct.spotPrice;
+        // Refreshed from this price before the gate and the batch sizing read it: the stored
+        // rate can lag the fund's coverage and the open interest, and the exposure band both
+        // derive from a lagging rate is the wrong width. What the batch itself moves reaches
+        // the curve with the next refresh after the cooldown.
+        _refreshMarginCurve(currentPrice);
+        BazaarTypes.MarginRequirements memory mr = _marginReqsWithLag();
 
         // Re-validate the latch against the LIVE price BEFORE closing anyone
-        (, uint8 healthReason) = isVaultHealthy(currentPrice, isPriceStale);
+        (, uint8 healthReason) = isVaultHealthy(currentPrice, isPriceStale, mr);
 
         if (healthReason == 1) {
-            // The auction is guaranteed to be aimed away from the side the vault itself holds, and
-            // nothing here re-checks it. The freshness gate above admits only a non-stale
+            // The auction is guaranteed to be aimed away from the side the vault itself holds,
+            // and nothing here re-checks it. The freshness gate above admits only a non-stale
             // resolution, which is precisely the condition under which the isVaultHealthy call
             // applies a flipped auction's re-target instead of withholding it — so any flip is
-            // already corrected by the time execution begins. Withholding keys off staleness
-            // alone, not off whether the price was newer than the stored one, so even a fresh mark
-            // that stores nothing re-targets.
+            // already corrected by the time execution begins. The deferred cohort is the other
+            // side by construction: a deferred position is always opposite the inventory, so
+            // its counterparties are on the inventory's own side.
             //
-            // Accepting anything but a fresh price here would break that: the entry points that do
-            // take the stale mark can leave a flip un-retargeted, and executing in that state
-            // deleverages accounts that do not offset the vault's exposure at all — eligibility
-            // only requires positive PnL against each account's own entry, so profitable positions
-            // exist on both sides and the caller picks which to submit, while _applyAdlVaultUpdate
-            // and the pendingLiq decrement book the closes as though they offset.
-
-            // ADL uses plain oracle. Settlement and ranking use frozen prices already; the only
-            // bracket-affected hook is the mid-batch vault-health re-check, which is an aggregate
-            // decision where the 2% confidence-ratio cap is the real safety gate.
-            // executeAdlCore emits AdlExecuted (declared here for the ABI, emitted in AdlLib via
-            // DELEGATECALL to keep this contract under the code-size limit), so it needs the adlId.
-            BazaarTypes.AdlResult memory r = AdlLib.executeAdlCore(
+            // The library accrues every reward — the seizure of each deferred position it
+            // takes and the executor's share of the bad debt the closes averted — to the
+            // caller's claimable balance, capped at the fund's free capital, and emits
+            // AdlExecuted from this contract's address, so it needs the adlId.
+            AdlLib.executeAdlCore(
                 orders,
                 book,
                 positionBuckets,
                 pairVault,
+                feeEscrow,
+                deferredLiquidations,
                 winners,
+                deferredWinners,
                 BazaarTypes.AdlParams({
                     adlLongs: adlLongs,
                     adlSnapshotPrice: adlSnapshotPrice,
                     adlSnapshotFundingIndex: adlSnapshotFundingIndex,
                     adlAuctionStartTs: adlAuctionStartTs,
-                    currentPrice: priceStruct.spotPrice,
+                    currentPrice: currentPrice,
                     currentFundingIndex: currentFundingIndex,
-                    marginRequirements: _marginReqsWithLag(),
+                    marginRequirements: mr,
                     pairId: pairId,
                     adlId: nextAdlId++,
                     currentBlock: _l2Block()
@@ -1221,40 +1349,9 @@ contract BazaarPair is Initializable, ReentrancyGuard {
                 adlWindowDeposits
             );
 
-            // Reward executor based on averted bad debt. Loss direction is keyed to the side
-            // the vault holds (the liquidated side) — the opposite of adlLongs (winner side).
-            {
-                uint256 avertedLoss;
-                if (pairVault.pendingLiqIsLong) {
-                    avertedLoss = currentPrice < r.settlementPrice
-                        ? Math.mulDiv(r.totalLiqSize, r.settlementPrice - currentPrice, BAZAAR_SCALE)
-                        : 0;
-                } else {
-                    avertedLoss = currentPrice > r.settlementPrice
-                        ? Math.mulDiv(r.totalLiqSize, currentPrice - r.settlementPrice, BAZAAR_SCALE)
-                        : 0;
-                }
-                uint256 reward = Math.mulDiv(avertedLoss, ADL_EXECUTOR_REWARD_BP, BP_SCALE);
-                // Capped at free capital: the earmark left against unclosed inventory settles that
-                // inventory, so a reward drawn from it would come out of a later winner's funding
-                // income or an unload fill's backing.
-                uint256 free = RiskParamsLib.insuranceFreeCapital(pairVault);
-                if (reward > free) reward = free;
-                if (reward > 0) {
-                    pairVault.insuranceFundBalance -= reward;
-                    FeeEscrowLib.credit(feeEscrow, pairId, msg.sender, reward);
-                }
-            }
-
-            // Re-evaluate vault health (this updates isAdlPending: false once the deficit is resolved)
-            isVaultHealthy(currentPrice, isPriceStale);
-        }
-
-        // On ADL completion (no longer pending and the pair survived), refresh IMR/MMR + sample so
-        // the post-ADL insurance level feeds the margin curve immediately, not only on the next
-        // arrival. While ADL is still pending the state is mid-resolution, so we wait.
-        if (!isAdlPending) {
-            _refreshMarginCurve(currentPrice);
+            // Re-evaluate vault health: releases the window once the exposure is resolved, or
+            // re-targets it when the batch seized the deferred positions as the new inventory.
+            isVaultHealthy(currentPrice, isPriceStale, mr);
         }
 
         _refundEth(ethRefund);
@@ -1281,7 +1378,10 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     ///         the remainder (GTC limits, positioned by `hints`) or cancels it (Market/IOC,
     ///         post-only violation, self-match, step-cap, dust). A fill-or-kill order does
     ///         neither: anything short of a complete fill reverts the transaction. Untriggered
-    ///         stops rest outside the book awaiting executeTriggeredOrders.
+    ///         stops rest outside the book awaiting executeTriggeredOrders, and a trigger order
+    ///         that fires here but is not finished stays there too. A trigger order's keeper
+    ///         bounty (high 128 bits of `spec.triggerPrice`) is pulled from the creator's
+    ///         wallet.
     /// @param spec The signed order intent (covered by the EIP-712 payload).
     /// @param hints Execution aids — insertion predecessors and the walk's node budget. Outside
     ///        the signature (like priceUpdate): a relayer attaches fresh ones at submission, and
@@ -1335,16 +1435,17 @@ contract BazaarPair is Initializable, ReentrancyGuard {
 
         uint64 currentBlock = _l2Block();
 
-        // Clean up expired limit orders and get directional exposure for margin calculation
-        (uint256 longOrderExposure, uint256 shortOrderExposure, uint256 longOrderSize, uint256 shortOrderSize) =
-            _cleanupExpiredLimitOrders(user, currentBlock);
-        // Outstanding exposure is reserved at no less than the mark (per side), matching the new
-        // order's own reservation rule in createOrder.
-        {
-            uint256 atMark = Math.mulDiv(longOrderSize, priceStruct.spotPrice, BazaarTypes.BAZAAR_SCALE);
-            if (atMark > longOrderExposure) longOrderExposure = atMark;
-            atMark = Math.mulDiv(shortOrderSize, priceStruct.spotPrice, BazaarTypes.BAZAAR_SCALE);
-            if (atMark > shortOrderExposure) shortOrderExposure = atMark;
+        // Clean up expired limit orders; createOrder reserves what survives against the mark.
+        _cleanupExpiredLimitOrders(user, currentBlock);
+
+        // Wallet pulls come first, ahead of the order's creation: the permit sets the allowance
+        // that both the relayer fee and a trigger order's bounty (pulled inside createOrder)
+        // draw on, so it is executed whenever one is supplied, fee or no fee. The relayer fee
+        // itself is pulled from the wallet into the escrow, never from the bucket or the vault.
+        if (permitData.length > 0) _executePermit(user, permitData);
+        if (effRelayerFee > 0) {
+            _sendUsdc(user, address(this), effRelayerFee);
+            _accrueRelayerFee(user, effRelayerFee, MetaTxLib.CREATE_ORDER_TYPEHASH, nonce);
         }
 
         uint256 orderId = nextOrderId;
@@ -1352,6 +1453,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             orders,
             positionBuckets,
             userActiveLimitOrders,
+            feeEscrow,
             BazaarTypes.CreateOrderParams({
                 pairId: pairId,
                 spec: spec,
@@ -1362,14 +1464,14 @@ contract BazaarPair is Initializable, ReentrancyGuard {
                 // different question than the fill gate it is meant to anticipate.
                 currentPrice: priceStruct.spotPrice,
                 currentFundingIndex: currentFundingIndex,
-                // createOrder gates on IMR over worst-case notional and on effectiveCollateral;
-                // it never reads the MMR-derived minRequiredCollateral, so the lagged walk-back
-                // would be computed and discarded. Pass the plain (un-lagged) requirements.
+                // createOrder gates on IMR over worst-case notional plus the held position's
+                // unrealized loss, against effectiveCollateral; it never reads the MMR-derived
+                // minRequiredCollateral, so the lagged walk-back would be computed and discarded.
+                // Pass the plain (un-lagged) requirements.
                 marginReqs: marginRequirements,
                 nextOrderId: orderId,
-                outstandingLongOrderExposure: longOrderExposure,
-                outstandingShortOrderExposure: shortOrderExposure,
-                currentBlock: currentBlock
+                currentBlock: currentBlock,
+                usdc: address(usdc)
             }),
             user
         );
@@ -1382,6 +1484,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         // the protocol default; a self-submitted caller sets its own gas budget.
         if (signature.length > 0) execHints.maxSteps = 0;
 
+        BazaarTypes.MarginRequirements memory mr = _marginReqsWithLag();
         BazaarTypes.WalkSummary memory sum = MatchingEngineLib.executeArrival(
             orders,
             positionBuckets,
@@ -1391,16 +1494,10 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             book,
             orderId,
             execHints,
-            _buildArrivalCtx(priceStruct.spotPrice, _isOracleStale, _marginReqsWithLag(), currentBlock)
+            _buildArrivalCtx(priceStruct.spotPrice, _isOracleStale, mr, currentBlock)
         );
         _postWalk(sum, priceStruct.spotPrice);
-        if (sum.totalFillSize > 0) isVaultHealthy(priceStruct.spotPrice, _isOracleStale);
-
-        // Relayed call: the fee is pulled from the wallet into the escrow, never from the bucket
-        // or the vault.
-        if (effRelayerFee > 0) {
-            _pullRelayerFee(user, effRelayerFee, permitData, MetaTxLib.CREATE_ORDER_TYPEHASH, nonce);
-        }
+        if (sum.totalFillSize > 0) isVaultHealthy(priceStruct.spotPrice, _isOracleStale, mr);
 
         _refundEth(ethRefund);
     }
@@ -1442,7 +1539,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
                 revert BazaarPair__RequestorIsNotOrderOwner();
             }
             OrderManagementLib.cancelOrder(
-                orders, positionBuckets, userActiveLimitOrders, book, orderIds[i], pairId, currentBlock
+                orders, positionBuckets, userActiveLimitOrders, book, feeEscrow, orderIds[i], pairId, currentBlock
             );
         }
 
@@ -1453,62 +1550,105 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         }
     }
 
-    /// @notice Returns active (non-expired, non-canceled, non-filled) limit orders for a user.
-    ///         Cleans up expired orders from the set before returning.
-    /// @param user The address to query
-    /// @return orderIds Array of active limit order IDs (after cleanup)
-    /// @return count Number of active limit orders
-    /// @return longExposure Sum of notional exposure for active long limit orders
-    /// @return shortExposure Sum of notional exposure for active short limit orders
-    function getUserActiveLimitOrders(address user)
-        external
-        returns (uint256[] memory orderIds, uint256 count, uint256 longExposure, uint256 shortExposure)
-    {
-        (longExposure, shortExposure,,) = _cleanupExpiredLimitOrders(user, _l2Block());
-        orderIds = userActiveLimitOrders[user].values();
-        count = orderIds.length;
-    }
-
-    /// @notice Iterates through a user's active limit order set, cancels expired orders,
-    ///         removes them from the set, and returns directional exposure of remaining active
-    ///         orders, both limit-priced and as raw size.
-    /// @param user The address whose limit orders to clean up
-    /// @return longExposure Sum of remaining limit-priced notional for active long orders
-    /// @return shortExposure Sum of remaining limit-priced notional for active short orders
-    /// @return longSize Sum of remaining size for active long orders
-    /// @return shortSize Sum of remaining size for active short orders
-    function _cleanupExpiredLimitOrders(address user, uint64 currentBlock)
-        internal
-        returns (uint256 longExposure, uint256 shortExposure, uint256 longSize, uint256 shortSize)
-    {
-        // Sweep logic lives in OrderManagementLib (EIP-170 extraction).
-        return OrderManagementLib.cleanupExpiredLimitOrders(
-            userActiveLimitOrders[user], orders, book, pairId, user, currentBlock
+    /// @notice Amends the caller's (or, when relayed, the signer's) resting limit orders in place.
+    ///         Each amendment gives one order a new price and size; the order keeps its id, its
+    ///         expiry and its place in the owner's order set. A new price, or a larger size,
+    ///         sends the order to the back of its new price level; a smaller size at the same
+    ///         price keeps its place. An amendment may not cross the book — a price at or through
+    ///         the best resting order on the other side is refused, and the caller sends a taker
+    ///         order instead — and the batch is all or nothing. Margin is judged once, on the set
+    ///         the batch leaves, by createOrder's gate (OrderManagementLib.amendOrders).
+    /// @dev Cheaper than a cancel and a create because every write lands in slots the order
+    ///      already occupies, and the fixed cost of a call — the price, the margin curve and the
+    ///      signature — is paid once for the whole batch. No fill can happen here, so the vault's
+    ///      exposure does not move and no health check runs. Queue positions are drawn from the
+    ///      same counter as order ids, which therefore have gaps. A relinked order is placed from
+    ///      the hints packed into its id word, falling back to its old neighbours, so a requote by
+    ///      a few ticks needs no hint and a jump across the book takes one; a slot further than
+    ///      MAX_WALK_STEPS nodes from the first live candidate (its hints, then its old
+    ///      neighbours) is refused, and is a cancel and a new order.
+    /// @param amends The batch as triples of words, covered by the EIP-712 payload: for each
+    ///        amendment its id word — the order id in the low 64 bits, up to two predecessor
+    ///        hints (the order to rest directly behind at the new price, 0 for none) in bits
+    ///        64-127 and 128-191, the top 64 bits zero — then the new price and the new total
+    ///        size (what has filled stays, so the size must exceed it). The hints are signed with
+    ///        the rest, so a relayer cannot refresh them; BazaarPairLens.amendIdWord packs one.
+    /// @param priceUpdate Pyth update data; may be empty when the on-chain price is fresh.
+    /// @param nonce The signer's meta-tx nonce (ignored for a self-submitted call).
+    /// @param deadline Signature expiry timestamp (ignored for a self-submitted call).
+    /// @param relayerFee USDC owed to msg.sender for a relayed call (ignored when unsigned).
+    /// @param signature EIP-712 signature over the batch; empty for a self-submitted call.
+    /// @param permitData Optional ERC-2612 permit (abi-encoded value, deadline, v, r, s), executed
+    ///        before a relayed call's fee is pulled from the signer's wallet.
+    function amendOrders(
+        uint256[] calldata amends,
+        bytes[] calldata priceUpdate,
+        uint256 nonce,
+        uint256 deadline,
+        uint256 relayerFee,
+        bytes calldata signature,
+        bytes calldata permitData
+    ) external payable nonReentrant {
+        bytes32 structHash = keccak256(
+            abi.encode(
+                MetaTxLib.AMEND_ORDERS_TYPEHASH, keccak256(abi.encodePacked(amends)), nonce, deadline, relayerFee
+            )
         );
+        (address user, uint256 effRelayerFee) = _resolveUser(structHash, nonce, deadline, relayerFee, signature);
+
+        _requireLiveTrading();
+
+        (BazaarTypes.PairPrice memory priceStruct, uint256 ethRefund,) = _getCurrentPairPrice(priceUpdate, msg.value);
+        _refreshMarginCurve(priceStruct.spotPrice);
+
+        // Relayed call: the fee is pulled from the wallet into the escrow, never from the bucket
+        // or the vault.
+        if (effRelayerFee > 0) {
+            _pullRelayerFee(user, effRelayerFee, permitData, MetaTxLib.AMEND_ORDERS_TYPEHASH, nonce);
+        }
+
+        nextOrderId = OrderManagementLib.amendOrders(
+            orders,
+            positionBuckets,
+            userActiveLimitOrders,
+            book,
+            marginRequirements,
+            lastPairPrice,
+            amends,
+            BazaarTypes.AmendOrdersParams({
+                pairId: pairId,
+                currentPrice: priceStruct.spotPrice,
+                currentFundingIndex: currentFundingIndex,
+                nextOrderId: nextOrderId,
+                currentBlock: _l2Block()
+            }),
+            user
+        );
+
+        _refundEth(ethRefund);
     }
 
-    /// @notice Permissionless expiry janitor: cancels + unlinks any of the given orders that
-    ///         expired without reaching a terminal state; every other id is skipped silently.
-    ///         The walk removes expired makers on contact and owners sweep their own during
-    ///         create/withdraw — this lets anyone clear dead nodes from the book proactively.
+    /// @notice Iterates through a user's active limit order set, cancels expired orders and
+    ///         removes them from the set. The survivors' reservation is read by the library gate
+    ///         that follows (CollateralLib._restingReserve), once a price is resolved.
+    /// @param user The address whose limit orders to clean up
+    /// @param currentBlock The L2 block the sweep expires orders against
+    function _cleanupExpiredLimitOrders(address user, uint64 currentBlock) internal {
+        // Sweep logic lives in OrderManagementLib (EIP-170 extraction).
+        OrderManagementLib.cleanupExpiredLimitOrders(userActiveLimitOrders[user], orders, book, pairId, currentBlock);
+    }
+
+    /// @notice Permissionless janitor: cancels + unlinks any of the given orders that expired
+    ///         without reaching a terminal state, and returns the keeper bounty of any terminal
+    ///         or expired order to its owner's claimable balance; every other id is skipped
+    ///         silently. The walk removes expired makers on contact and owners sweep their own
+    ///         during create/withdraw — this lets anyone clear dead nodes from the book
+    ///         proactively and release bounties stranded by auto-cancels.
     function sweepExpired(uint256[] calldata orderIds) external nonReentrant {
         // Gated like every other book mutation; the guard-free cancelOrders path remains the
-        // owner's terminal-state escape hatch.
+        // owner's terminal-state escape hatch, for bounties as well as for orders.
         _requireLiveTrading();
-        OrderManagementLib.sweepExpired(orders, userActiveLimitOrders, book, orderIds, pairId, _l2Block());
-    }
-
-    /// @notice Read-only twin of _cleanupExpiredLimitOrders: a user's live limit-order exposure
-    ///         per side (limit-priced notional and raw size), without the lazy pruning — safe to
-    ///         eth_call. Read by BazaarPairLens.getMaxWithdrawable for off-chain withdrawal
-    ///         margin math, which reserves at the larger of the notional and the size valued at
-    ///         the mark, exactly as the withdrawal gate does.
-    function outstandingOrderExposure(address user)
-        external
-        view
-        returns (uint256 longExposure, uint256 shortExposure, uint256 longSize, uint256 shortSize)
-    {
-        return OrderManagementLib.outstandingOrderExposure(userActiveLimitOrders[user], orders, _l2Block());
+        OrderManagementLib.sweepExpired(orders, userActiveLimitOrders, book, feeEscrow, orderIds, pairId, _l2Block());
     }
 
     // ╔══════════════════════════════════════════════════════════════╗
@@ -1543,17 +1683,15 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     }
 
     /// @dev Shared prologue for the matching entry points: trading not halted (terminated or ADL
-    ///      pending), not at/past the scheduled termination cutoff, no terminal sweep window.
+    ///      pending), not in scheduled-termination limbo, no terminal sweep window.
     function _requireLiveTrading() internal view {
         _requireNotHalted();
-        if (scheduledTerminationTs != 0 && block.timestamp >= scheduledTerminationTs) {
-            revert BazaarPair__PairScheduledForTermination();
-        }
+        if (_pastTradingCutoff()) revert BazaarPair__PairScheduledForTermination();
         _requireNoSweepWindow();
     }
 
     /// @dev Post-walk bookkeeping shared by every matching entry point, all fill-gated: fold the
-    ///      walk's VWAP into the mark price and its liquidation fills into the gap EMA.
+    ///      walk's VWAP into the mark price and its liquidation fills into the gap EMAs.
     ///      Deliberately does NOT re-evaluate vault health — each entry point does that exactly
     ///      once itself, after its walk, so the verdict is judged on the book the walk left
     ///      behind and paid for once. A repeat call in the same transaction is idempotent
@@ -1561,20 +1699,30 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     ///      transition happens only on the first evaluation) but re-reads the vault aggregates
     ///      and the USDC balance for nothing.
     function _postWalk(BazaarTypes.WalkSummary memory sum, uint256 spot) internal {
-        if (sum.totalFillSize == 0) return;
-        _updateMarkPrice(sum.totalMatchedVolume, sum.totalFillSize, spot);
-        if (sum.liqCount != 0) {
+        // The mark sees only the walk's exposure-weighted far-side fills; a walk whose fills were
+        // all against near-side or freshly placed makers leaves it to its decay.
+        if (sum.markSize != 0) _updateMarkPrice(sum.markNotional, sum.markSize, spot);
+        if (sum.totalLiqFillSize != 0) {
             RiskParamsLib.updateLiquidationGapEmaBatch(
-                liquidationGapEma, sum.sumLiqGapTimesSize, sum.totalLiqFillSize, sum.liqCount
+                liquidationGapEma, pairVault, sum.sumLiqSlipTimesSize, sum.sumLiqDriftTimesSize, sum.totalLiqFillSize
             );
         }
     }
 
-    /// @notice Permissionless keeper entry point: fire triggered StopLimit/StopLoss orders
-    ///         against a fresh oracle price. Each fired stop pays the caller TRIGGER_TIP from
-    ///         its owner's collateral; owners who cannot cover it have the stop auto-canceled.
-    ///         Ineligible ids (untriggered, dead, wrong type, already armed) are skipped
-    ///         silently so racing keepers never revert each other.
+    /// @notice Permissionless keeper entry point: fire triggered StopLimit/StopLoss/TakeProfit
+    ///         orders against a fresh oracle price. Each execution earns the caller the share of
+    ///         the order's escrowed bounty that it filled or armed, accrued to the caller's
+    ///         claimable balance; the owner's collateral is never charged. A fired order that
+    ///         the book could not finish stays live for the next call. Ineligible ids
+    ///         (untriggered, dead, wrong type, already armed, or a StopLimit whose resting slot
+    ///         the supplied hints cannot reach) are skipped silently so racing keepers never
+    ///         revert each other. A StopLimit this call fires draws a fresh queue position from
+    ///         the id counter, so what it rests sits behind every order already at its price; with
+    ///         less than MIN_ORDER_LIFETIME_BLOCKS of its life left it rests nothing, and what it
+    ///         could not fill stays live for the next call. An
+    ///         execution in the block a creation on the stale fallback left an order waiting in
+    ///         pays its share of the bounty to the owner instead of the caller
+    ///         (MatchingEngineLib.executeTriggers).
     function executeTriggeredOrders(BazaarTypes.TriggerExec[] calldata execs, bytes[] calldata priceUpdate)
         external
         payable
@@ -1590,8 +1738,9 @@ contract BazaarPair is Initializable, ReentrancyGuard {
 
         _refreshMarginCurve(priceStruct.spotPrice);
 
+        BazaarTypes.MarginRequirements memory mr = _marginReqsWithLag();
         BazaarTypes.WalkSummary memory sum;
-        (executedCount, sum) = MatchingEngineLib.executeTriggers(
+        (executedCount, sum, nextOrderId) = MatchingEngineLib.executeTriggers(
             orders,
             positionBuckets,
             userActiveLimitOrders,
@@ -1599,10 +1748,11 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             feeEscrow,
             book,
             execs,
-            _buildArrivalCtx(priceStruct.spotPrice, _isOracleStale, _marginReqsWithLag(), _l2Block())
+            _buildArrivalCtx(priceStruct.spotPrice, _isOracleStale, mr, _l2Block()),
+            nextOrderId
         );
         _postWalk(sum, priceStruct.spotPrice);
-        if (sum.totalFillSize > 0) isVaultHealthy(priceStruct.spotPrice, _isOracleStale);
+        if (sum.totalFillSize > 0) isVaultHealthy(priceStruct.spotPrice, _isOracleStale, mr);
 
         _refundEth(ethRefund);
     }
@@ -1613,8 +1763,12 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     ///         headroom above its reserve lasts. The caller
     ///         earns LIQUIDATION_FEE_EBP of the notional it unloads, from insurance, floored at
     ///         UNLOAD_BOUNTY_MIN only when the call moved at least UNLOAD_BOUNTY_MIN_NOTIONAL
-    ///         or emptied the inventory. The walk library accrues it to the caller's claimable
-    ///         balance, pulled via claimFees.
+    ///         or emptied the inventory, and capped at the fund's free capital and, while the
+    ///         inventory left carries a loss at the mark, at what that capital above the reserve
+    ///         covers the loss by (RiskParamsLib.unloadRewardPayable). The walk library accrues it
+    ///         to the caller's claimable balance, pulled via claimFees. Against the stale fallback
+    ///         it fills nothing and pays nothing: the inventory waits for a fresh mark
+    ///         (MatchingEngineLib.unloadBook).
     /// @param maxSteps Node budget for the walk (0 = protocol default; clamped to
     ///        MAX_WALK_STEPS).
     function unloadVault(uint256 maxSteps, bytes[] calldata priceUpdate)
@@ -1625,18 +1779,15 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     {
         _requireLiveTrading();
 
-        // The stale fallback is allowed: liquidation flow is forced. The band leg of the unload
-        // bound (min(LIQ_MAX_SLIPPAGE_BP, MMR) around the stored mark) sits inside the stale fill
-        // band, and the neutral-price leg reads no price at all, so a stale mark widens neither.
-        // The headroom is judged at the same mark the fills are: a stale mark that understates
-        // the loss lets the walk spend room a fresh mark would not have shown, but never the
-        // reserve as valued at that mark, and the next fresh verdict opens the auction for
-        // whatever that leaves uncovered.
+        // The stale fallback resolves here rather than reverting, but unloadBook fills nothing
+        // against it: the inventory waits for a fresh mark, the call earns nothing, and the
+        // verdict below opens no window on a stale price.
         (BazaarTypes.PairPrice memory priceStruct, uint256 ethRefund, bool _isOracleStale) =
             _getCurrentPairPrice(priceUpdate, msg.value);
 
         _refreshMarginCurve(priceStruct.spotPrice);
 
+        BazaarTypes.MarginRequirements memory mr = _marginReqsWithLag();
         BazaarTypes.WalkSummary memory sum = MatchingEngineLib.unloadBook(
             orders,
             positionBuckets,
@@ -1645,33 +1796,20 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             feeEscrow,
             book,
             maxSteps,
-            true,
-            _buildArrivalCtx(priceStruct.spotPrice, _isOracleStale, _marginReqsWithLag(), _l2Block())
+            BazaarTypes.UNLOAD_BY_KEEPER,
+            _buildArrivalCtx(priceStruct.spotPrice, _isOracleStale, mr, _l2Block())
         );
         unloadedSize = sum.totalFillSize;
         _postWalk(sum, priceStruct.spotPrice);
         // Judged even when nothing filled. A walk the bound refused outright is the verdict's
         // main case: the book cannot absorb the inventory at any price the fund will pay, and
         // this call is what opens the auction rather than leaving it to the next refresh.
-        isVaultHealthy(priceStruct.spotPrice, _isOracleStale);
+        isVaultHealthy(priceStruct.spotPrice, _isOracleStale, mr);
 
         _refundEth(ethRefund);
     }
 
     // -------------------- Fee escrow --------------------
-
-    /// @notice Unclaimed third-party payouts — integrator fees, the bug-bounty share, keeper
-    ///         tips and rewards, the UMA proposer reward, relayer fees — in BAZAAR precision.
-    /// @dev One getter for both figures rather than two: BazaarPair sits at the EIP-170 ceiling,
-    ///      and a second external function costs a selector, its dispatch and its return
-    ///      encoding for a value callers almost always want alongside the first.
-    /// @param recipient The address to report an owed balance for (address(0) for the total only).
-    /// @return owed The amount `recipient` may claim.
-    /// @return total The sum across all recipients — a liability against the contract's USDC,
-    ///         reserved by every books-vs-cash figure alongside the deposits ledger and insurance.
-    function claimableFees(address recipient) external view returns (uint256 owed, uint256 total) {
-        return (feeEscrow.claimable[recipient], feeEscrow.total);
-    }
 
     /// @notice Withdraw the caller's escrowed fee balance. The amount paid is reported by the
     ///         FeesClaimed event.
@@ -1699,9 +1837,53 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     // insurance targets and taker insurance fee curves) live in RiskParamsLib — an external
     // library, like MatchingEngineLib et al. — to keep this contract under the EIP-170 limit.
 
-    /// @notice Updates IMR/MMR
+    /// @notice Updates IMR/MMR and advances the sample ring
     function _calculateIMRandMMR(uint256 currentPrice) internal {
         RiskParamsLib.calculateIMRandMMR(
+            marginRequirements,
+            lastPairPrice,
+            liquidationGapEma,
+            pairVault,
+            reopenGapEma,
+            mmrBuffer,
+            currentPrice,
+            isContinuouslyTraded,
+            pairCreatedTs,
+            priceUpdateCount,
+            currentFundingIndex
+        );
+    }
+
+    /// @notice Recomputes IMR/MMR from `currentPrice` and records the rate and the pair's open
+    ///         interest into the sample ring behind the 24h-lagged MMR and the reserve's trailing
+    ///         open interest; no-op once the pair is terminated (margin params are moot then).
+    /// @dev After initialize, the one way the stored curve changes. Every matching entry point,
+    ///      executeAdl and refreshPrice call it before they act, and liquidate after its walk, so
+    ///      every path that moves the curve also advances the ring. The recompute and the sampling both run
+    ///      inside RiskParamsLib.calculateIMRandMMR. Spam-safe: each self-gates
+    ///      (IMR_UPDATE_COOLDOWN / MMR_SAMPLE_INTERVAL), so redundant calls are no-ops.
+    function _refreshMarginCurve(uint256 currentPrice) internal {
+        if (isPairTerminated) return;
+        _calculateIMRandMMR(currentPrice);
+    }
+
+    /// @notice The requirements liquidate judges by: this batch's lagged MMR, at the IMR
+    ///         RiskParamsLib.liquidationImrBp computes from `currentPrice` with the arithmetic
+    ///         every stored rate comes from. The rate is not stored; liquidate writes the curve
+    ///         after its walk.
+    /// @dev The live rate follows the fund's coverage and the open interest, and the paths that
+    ///      move those without recomputing (insurance deposits, the open interest a walk closes
+    ///      after its own refresh) leave the stored rate behind, inside the cooldown as well as
+    ///      after it. Judged at the stored rate alone, a position the live curve deems solvent
+    ///      could be seized, and the liquidator is the one party with a reason not to refresh
+    ///      first. Inside the cooldown the stored rate caps the live one: open interest opened
+    ///      earlier in the same transaction can reach the live rate there, and a raised IMR would
+    ///      make the inline unload refuse, and cancel, resting bids for the seized inventory.
+    /// @param currentPrice The price the call resolved
+    /// @return mr The requirements every check in the call reads
+    function _liquidationMarginReqs(uint256 currentPrice) internal returns (BazaarTypes.MarginRequirements memory mr) {
+        mr = _marginReqsWithLag();
+        uint256 imrBp = RiskParamsLib.liquidationImrBp(
             marginRequirements,
             lastPairPrice,
             liquidationGapEma,
@@ -1713,17 +1895,8 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             priceUpdateCount,
             currentFundingIndex
         );
-    }
-
-    /// @notice Recomputes IMR/MMR from `currentPrice` and records the result into the 24h-lagged
-    ///         MMR sample ring; no-op once the pair is halted (margin params are moot then).
-    /// @dev Shared by liquidate / executeAdl / refreshPrice so every path that refreshes the
-    ///      margin curve also advances the ring. Spam-safe: both callees self-gate
-    ///      (IMR_UPDATE_COOLDOWN / MMR_SAMPLE_INTERVAL), so redundant calls are no-ops.
-    function _refreshMarginCurve(uint256 currentPrice) internal {
-        if (isPairTerminated) return;
-        _calculateIMRandMMR(currentPrice);
-        MmrSampleLib.record(mmrBuffer, marginRequirements.mmrBp);
+        mr.imrBp = imrBp;
+        mr.mmrBp = imrBp / 2;
     }
 
     // ╔══════════════════════════════════════════════════════════════╗
@@ -1735,43 +1908,72 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     // live in FundingLib together with the mark/funding math (EIP-170 extraction).
 
     // -------------------- State Variables --------------------
-    uint256 public markPrice;
+    // The mark's two tallies and their anchor (FundingLib.MarkState); BazaarPairLens.markPrice
+    // reads them as a price.
+    int256 internal markPremiumNotional;
     uint256 internal lastMarkUpdateTs;
     uint256 internal rollingVolume;
 
     // -------------------- Functions --------------------
 
-    /// @notice Updates mark price. The EMA math (walk VWAP, volume-scaled alpha with its
-    ///         open-interest floor, band clamp, decay-to-index) lives in
-    ///         FundingLib.updateMarkPrice; this wrapper owns the scalar storage writes.
+    /// @notice Updates mark price from the walk's exposure-weighted far-side fills
+    ///         (MatchingEngineLib._accrueMarkPrint). The mark math (VWAP, the single-call cap
+    ///         against the volume and its open-interest floor, band clamp, the tallies' decay)
+    ///         lives in FundingLib.updateMarkPrice; this wrapper owns the scalar storage writes
+    ///         and the reference-age gate.
     function _updateMarkPrice(uint256 fillNotional, uint256 fillSize, uint256 indexPrice) internal {
+        // A print belongs in the mark only while the index it is judged against describes the
+        // same moment it does. `indexPrice` is whatever lastPairPrice last recorded, and
+        // updateMarkPrice measures the print against it: the print is clamped to a band around
+        // it, and its premium over it is what enters the mark, dated to this block. A fill on the
+        // stale fallback (non-continuously traded pairs, nothing stored for longer than
+        // MAX_PRICE_STALENESS) would be measured against a reference from an earlier moment, so
+        // the index's own move since then would enter the mark as premium, dated as freshly
+        // traded, and the next store would charge it as funding — backward over the interval
+        // nothing accrued and forward through a further decay period — with the sign and size
+        // picked by whoever placed a fill. A fresh-path fill stores its price in the
+        // same transaction, so its reference is never older than MAX_PRICE_STALENESS; the gate
+        // admits exactly those.
+        //
+        // The gate keys on the reference's age rather than on the caller's staleness flag. The
+        // two coincide — the fallback is taken only once the Pyth cache, which the stored price
+        // never postdates, is past MAX_PRICE_STALENESS — but the age cannot be argued with:
+        // updateTs can only be advanced, never aged, so the sole way past this gate is to make
+        // the reference fresh. Withholding the update keeps a caller's own print out of the mark,
+        // which moves nothing; moving the mark takes a print against the live index.
+        //
+        // Compared by adding the period rather than subtracting the stamp: updateTs is a Pyth
+        // publish time that may sit slightly ahead of the block, and a future-dated reference is
+        // not an old one — the subtraction would panic on exactly that input.
+        if (lastPairPrice.updateTs + BazaarTypes.MAX_PRICE_STALENESS < block.timestamp) return;
+
         FundingLib.MarkState memory s = FundingLib.updateMarkPrice(
             FundingLib.MarkState({
-                markPrice: markPrice, lastMarkUpdateTs: lastMarkUpdateTs, rollingVolume: rollingVolume
+                premiumNotional: markPremiumNotional, lastMarkUpdateTs: lastMarkUpdateTs, rollingVolume: rollingVolume
             }),
             fillNotional,
             fillSize,
             indexPrice,
-            // Liquidation, ADL and settlement each move size off a single leg, and a floor that
-            // fell with them would make the mark more sensitive per fill exactly while the vault
-            // unloads the inventory those moves created.
-            RiskParamsLib.openInterestSize(pairVault)
+            pairVault
         );
-        markPrice = s.markPrice;
+        markPremiumNotional = s.premiumNotional;
         lastMarkUpdateTs = s.lastMarkUpdateTs;
         rollingVolume = s.rollingVolume;
     }
 
-    /// @notice Updates funding index. The accrual math (staleness-gated window, premium
-    ///         dampening/clamp, price-unit accumulation) lives in FundingLib.updateFundingIndex.
+    /// @notice Updates funding index. The accrual math (staleness-gated window, the window's
+    ///         average premium, dampening/clamp, price-unit accumulation) lives in
+    ///         FundingLib.updateFundingIndex.
     function _updateFundingIndex(uint256 indexPrice, uint256 oracleUpdateTs) internal {
         (currentFundingIndex, lastFundingUpdateTs) = FundingLib.updateFundingIndex(
-            markPrice,
+            markPremiumNotional,
+            rollingVolume,
             lastMarkUpdateTs,
             currentFundingIndex,
             lastFundingUpdateTs,
             indexPrice,
             oracleUpdateTs,
+            pairVault,
             isContinuouslyTraded
         );
     }
@@ -1784,8 +1986,10 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     // The settlement tallies and the frozen payout ratios live in terminalState (declared with
     // the other terminal state at the end of storage) and are surfaced through auxState().
 
-    // 24h-lagged-MMR ring buffer. Declared LAST so all existing storage slots keep their indices
-    // (append-only is required for the upgradeable/proxy layout). See MmrSampleLib + MMR_* constants.
+    // 24h-lagged-MMR ring buffer. Storage declarations are append-only where possible: a new
+    // field goes after every existing one, so the slot indices BazaarPairLens,
+    // BazaarPairTerminator and the tests pin stay put; removing a field moves every later slot
+    // and needs those pins re-read from `forge inspect`. See MmrSampleLib + MMR_* constants.
     BazaarTypes.MmrSampleBuffer internal mmrBuffer;
 
     // Insurance share-epoch state (append-only layout: added after mmrBuffer). A drained-fund
@@ -1805,21 +2009,30 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     ///         beyond this point (InsuranceVaultLib.executeInsuranceWithdrawal).
     uint256 internal constant TERMINAL_SETTLEMENT_ESCAPE = BazaarTypes.TERMINAL_SETTLEMENT_ESCAPE;
 
+    // -------------------- Events --------------------
+    /// @notice Emitted when the pair fixes its own settlement price because it is insolvent,
+    ///         opening the settlement window. Every governed path routes through
+    ///         BazaarPairTerminator, which emits SettlementPriceFixed for it; this event covers
+    ///         the one path no other contract sees.
+    /// @param pairId The pair
+    /// @param settlementPrice The price every position settles at: the price the detecting call
+    ///        judged vault health at, or the last stored price when that call carried none
+    /// @param reason The isVaultHealthy verdict that fixed it: 2 = the ADL auction timed out,
+    ///        3 = the pair's USDC balance fell short of its books, 4 = realized bad debt
+    event InsolvencySettlementFixed(bytes32 indexed pairId, uint256 settlementPrice, uint8 reason);
+
     // -------------------- Errors --------------------
-    // No pair-side event for the fix: the terminator emits SettlementPriceFixed for the paths it
-    // initiates, which keeps that bytecode out of the pair's EIP-170 budget; the autonomous
-    // insolvency path leaves its latch readable through settlementPriceFixedTs. One shared error
-    // covers every window-blocked action, finalize-too-early included.
+    // One shared error covers every window-blocked action, finalize-too-early included.
     error BazaarPair__SweepWindowActive();
 
     // -------------------- Functions --------------------
 
     /// @notice Stage 1 of termination: pin the settlement price and open the settlement
     ///         window. Callable only by BazaarPairTerminator (every governed termination path:
-    ///         scheduled, insurer-vote, 21-day stale). Also stamps
-    ///         scheduledTerminationTs — setting it when unset (insurer-vote / stale paths) and
-    ///         pulling a still-future scheduled cutoff back to now — so every limbo guard —
-    ///         matching, orders, deposits, price-storage freeze — engages at once.
+    ///         scheduled — by UMA or by an insurer vote — and 21-day stale). Also stamps
+    ///         scheduledTerminationTs — setting it when unset (stale path) and pulling a
+    ///         still-future scheduled cutoff back to now — so every limbo guard — matching,
+    ///         orders, deposits, price-storage freeze — engages at once.
     /// @dev The autonomous insolvency paths open the same window by calling _fixSettlement
     ///      directly rather than through this entry point. Every termination passes through the
     ///      window; the latch below is therefore also the "already terminated" check.
@@ -1843,8 +2056,8 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     ///      still-future scheduled cutoff back to now — so all limbo guards (matching, orders,
     ///      deposits, price storage) engage at once. The pull-back is required because fixing the
     ///      price IS the end of trading: an accepted scheduled-termination proposal leaves a
-    ///      future cutoff in place, and if insolvency or an insurer vote then fixed the price
-    ///      without clamping it, every cutoff-keyed guard would keep matching, orders and
+    ///      future cutoff in place, and if insolvency then fixed the price without clamping
+    ///      it, every cutoff-keyed guard would keep matching, orders and
     ///      deposits live at the oracle price for the whole sweep window while liquidate settles
     ///      anyone on demand at the frozen price — a free exit from every losing position.
     ///      The guards compare with >=, NOT >: the stamp IS block.timestamp here, so a strict >
@@ -1886,6 +2099,18 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         if (isPairTerminated || isAdlPending) revert BazaarPair__TradingHalted();
     }
 
+    /// @dev Limbo: a cutoff is scheduled and the block is within LIMBO_LEAD of it. From here
+    ///      until the price is fixed nothing trades, liquidates, deposits or withdraws, and no
+    ///      health check runs. The lead matters on the UMA path, which settles at the first print
+    ///      in the MAX_PRICE_STALENESS window ending at the cutoff: the last block that trades is
+    ///      stamped a window and a second before that window opens, so no fill is taken against
+    ///      the settlement price unless Pyth's clock runs further ahead of the block timestamp
+    ///      than a window plus a print's delivery time (see LIMBO_LEAD). Added rather than
+    ///      subtracted so a cutoff smaller than the lead cannot underflow.
+    function _pastTradingCutoff() internal view returns (bool) {
+        return scheduledTerminationTs != 0 && block.timestamp + BazaarTypes.LIMBO_LEAD >= scheduledTerminationTs;
+    }
+
     /// @dev Shared freeze for user-facing entry points — matching, orders, deposits, withdrawals —
     ///      while the settlement window is open (price fixed, finalize pending). Lifts the
     ///      moment the pair terminates.
@@ -1903,11 +2128,14 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     ///      ratios. Falls back to the last stored price when none is supplied, and is a no-op
     ///      when there is no price at all (a pair that never traded has nothing to settle) or
     ///      when a window is already open (double-detection across calls).
-    function _terminateOnInsolvency(uint256 currentPrice) internal {
+    /// @param currentPrice The price vault health was judged at; 0 when the caller had none
+    /// @param reason The isVaultHealthy verdict, reported in InsolvencySettlementFixed
+    function _terminateOnInsolvency(uint256 currentPrice, uint8 reason) internal {
         if (settlementPriceFixedTs != 0) return;
         uint256 price = currentPrice != 0 ? currentPrice : lastPairPrice.spotPrice;
         if (price == 0) return;
         _fixSettlement(price);
+        emit InsolvencySettlementFixed(pairId, price, reason);
     }
 
     /// @notice Finalizes the termination: retires the vault's inherited inventory and freezes the
@@ -1952,10 +2180,6 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     // ║              SECTION 12: VAULT HEALTH                        ║
     // ╚══════════════════════════════════════════════════════════════╝
 
-    // -------------------- Constants --------------------
-    /// @notice Tolerance for USDC balance vs bookkeeping comparison (in bp)
-    uint256 internal constant USDC_BALANCE_TOLERANCE_BP = 10; // 0.1%
-
     // -------------------- Functions --------------------
 
     /// @notice Checks if the vault is in a healthy state
@@ -1973,20 +2197,66 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     ///                3 = actual USDC balance shortfall vs bookkeeping (opens the settlement window),
     ///                4 = realized bad debt (insolvency) — opens the settlement window
     function isVaultHealthy(uint256 currentPrice, bool isPriceStale) internal returns (bool healthy, uint8 reason) {
+        return isVaultHealthy(currentPrice, isPriceStale, _marginReqsWithLag());
+    }
+
+    /// @dev isVaultHealthy with the caller's margin requirements. The verdict derives the unload
+    ///      band from the lagged rate, which costs a walk of the sample ring; an entry point that
+    ///      has already walked it for its own fills, seizures or withdrawal gate passes the
+    ///      result here so the ring is read once per transaction. The requirements must have
+    ///      been read after the last curve refresh in the transaction, since the verdict judges
+    ///      the fund against the rate now in force; liquidate passes the ones it judged its
+    ///      seizures by (_liquidationMarginReqs), the rate its price gives.
+    /// @param mr The requirements as _marginReqsWithLag resolves them at this point in the call,
+    ///        or as _liquidationMarginReqs does for liquidate
+    function isVaultHealthy(uint256 currentPrice, bool isPriceStale, BazaarTypes.MarginRequirements memory mr)
+        internal
+        returns (bool healthy, uint8 reason)
+    {
+        reason = _vaultHealthVerdict(currentPrice, isPriceStale, mr);
+        // One call site for all three insolvency verdicts, so the reason reaches the fix (and its
+        // event) as a value: the optimizer compiles a separate copy of a function for each
+        // distinct literal passed to it.
+        if (reason > 1) _terminateOnInsolvency(currentPrice, reason);
+        healthy = reason == 0;
+    }
+
+    /// @dev The checks behind isVaultHealthy, returning its reason code. Applies the ADL state
+    ///      changes a verdict implies; isVaultHealthy fixes the settlement price on verdicts 2-4.
+    ///      `mr` carries the lagged rate the ADL gate derives the unload band from.
+    function _vaultHealthVerdict(uint256 currentPrice, bool isPriceStale, BazaarTypes.MarginRequirements memory mr)
+        internal
+        returns (uint8)
+    {
         // Check 0: realized bad debt. A non-zero deficit means a prior loss overran the insurance
         // fund and the overrun went unfunded — the pair is provably insolvent and cannot honor
-        // all claims. Fix the settlement price at the live price now: withdrawals freeze at once,
-        // closing the pre-termination first-come-first-served window, and finalize folds the
+        // all claims. The verdict fixes the settlement price at the live price: withdrawals freeze
+        // at once, closing the pre-termination first-come-first-served window, and finalize folds the
         // deficit into what traders are owed. This catches unfunded bad debt that the
         // books-vs-USDC check (reason 3) cannot see, since the ledgers stay balanced.
-        if (pairVault.deficit > 0) {
-            _terminateOnInsolvency(currentPrice);
-            return (false, 4);
+        if (pairVault.deficit > 0) return 4;
+
+        // Check 1: the USDC the contract holds against what its books promise. Escrowed fees are
+        // a claim on that USDC exactly like principal and insurance, so they belong in the
+        // expected balance — omitting them would let the fund look solvent on cash already owed
+        // away. Judged ahead of the exposure check so that every verdict judges it: the exposure
+        // check answers first for the whole life of an ADL window and once its timeout lapses,
+        // and a shortfall must still fix the settlement price then, or it would go undetected
+        // until the window released or the pair terminated, with the cash the books cannot back
+        // paid out meanwhile to whoever claims or withdraws first. The gap surfaces at finalize,
+        // where the pot is the actual balance: principal is paid pro-rata on whatever cash is
+        // there, profits and insurers after it.
+        if (CollateralLib.isBalanceShort(
+                address(usdc), pairVault, feeEscrow.total, CollateralLib.USDC_BALANCE_TOLERANCE_BP
+            )) {
+            return 3;
         }
 
-        // Check 1: liquidation exposure vs insurance fund (delegated to VaultHealthLib)
+        // Check 2: liquidation exposure vs insurance fund (delegated to VaultHealthLib)
         VaultHealthLib.LiqExposureResult memory result = VaultHealthLib.checkLiqExposure(
             pairVault,
+            positionBuckets,
+            deferredLiquidations,
             currentPrice,
             isAdlPending,
             adlPendingSince,
@@ -1994,7 +2264,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             adlLongs,
             currentFundingIndex,
             adlSnapshotFundingIndex,
-            marginRequirements.mmrBp
+            BucketLib.effectiveMmrBp(mr)
         );
 
         // Opening a NEW window is gated on a fresh price. Everything an auction is judged by is
@@ -2004,13 +2274,12 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         // that may no longer exist, and they are not in breach of anything. The verdict is still
         // reported (reason 1), so callers that gate on vault health stay conservative; only the
         // irreversible latch is withheld. Extending and clearing a window already opened against a
-        // fresh price are untouched: executing the auction needs a fresh mark, but the paths that
-        // shrink the exposure without one — a stale-priced unloadVault or liquidate — still release
-        // the latch here when they carry it back under the release level, so a quiet feed cannot
-        // strand a pair that has already recovered.
-        if (result.newIsAdlPending && !isAdlPending && isPriceStale) {
-            return (false, 1);
-        }
+        // fresh price are untouched: executing the auction needs a fresh mark, but a stale-priced
+        // liquidate can still shrink the exposure — by netting an affordable opposing seizure
+        // against the inventory, or by dropping a listed account now solvent or flat — and
+        // releases the latch here once that carries it back under the release level, so a quiet
+        // feed cannot strand a pair that has already recovered.
+        if (result.newIsAdlPending && !isAdlPending && isPriceStale) return 1;
 
         // A mid-auction side flip is the one path that moves adlSnapshotPrice after the window
         // opened, so it needs the same freshness gate. That snapshot is not merely a sort key:
@@ -2079,9 +2348,29 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         // auction it was measured for, and the pair's next window would open already armed with an
         // instant in the past: terminable on its first block, with no runway at all. Reads the
         // pre-assignment flag, so it must precede the write below.
-        if (isAdlPending && !result.newIsAdlPending) {
-            adlTerminationTs = 0;
-            adlAuctionStartTs = 0;
+        //
+        // The deferred list is emptied whenever the verdict leaves no window open, whether it
+        // releases one or finds none to open. The list holds liquidations back for a window's
+        // auction to close against their own counterparties, and a verdict that wants no window
+        // leaves it nothing to do: while the vault still holds inventory, no listed account
+        // carries loss beyond its collateral and the fund above its reserve covers the inventory,
+        // which makes netting any of them affordable; with no inventory there is nothing to net
+        // one against. Every listed account is an ordinary liquidation candidate again. One
+        // liquidate call can list an account and reach this verdict wanting no window, because
+        // its inline unload runs between the deferral and the verdict and can sell or cover the
+        // inventory the account was deferred against. Left in place, the entries would be walked
+        // by every later health check while inventory remains, would hold slots in the bounded
+        // list, and could open a later window on inventory nobody has tried to net them against.
+        // A deferral on the stale fallback is the one that keeps its entry with no window stored:
+        // the verdict wanting its window returns above before reaching here, and the account
+        // stays listed for the fresh verdict that opens it.
+        if (!result.newIsAdlPending) {
+            delete deferredLiquidations;
+            if (isAdlPending) {
+                adlTerminationTs = 0;
+                adlAuctionStartTs = 0;
+                emit AdlResolved(pairId, adlEpoch);
+            }
         }
         isAdlPending = result.newIsAdlPending;
         adlPendingSince = result.newAdlPendingSince;
@@ -2110,25 +2399,12 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             // pair the auction might still save. Deferring costs nothing that is not already spent:
             // the exposure has sat unresolved for a day, and half an hour of a market that is
             // demonstrably open is the cheapest possible test of whether it can be resolved at all.
-            _terminateOnInsolvency(currentPrice);
-            return (false, 2);
+            return 2;
         }
 
-        if (!result.healthy) {
-            return (false, 1);
-        }
+        if (!result.healthy) return 1;
 
-        // Check 2: actual USDC held by contract vs vault accounting. Escrowed fees are a claim
-        // on that USDC exactly like principal and insurance, so they belong in the expected
-        // balance — omitting them would let the fund look solvent on cash already owed away.
-        // The gap surfaces at finalize, where the pot is the actual balance: principal is paid
-        // pro-rata on whatever cash is there, profits and insurers after it.
-        if (CollateralLib.isBalanceShort(address(usdc), pairVault, feeEscrow.total, USDC_BALANCE_TOLERANCE_BP)) {
-            _terminateOnInsolvency(currentPrice);
-            return (false, 3);
-        }
-
-        return (true, 0);
+        return 0;
     }
 
     // ╔══════════════════════════════════════════════════════════════╗
@@ -2136,9 +2412,17 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     // ╚══════════════════════════════════════════════════════════════╝
 
     // -------------------- Events --------------------
-    /// @notice Emitted when a new price update is added to the pair prices mapping.
+    /// @notice Emitted when the pair stores a newer oracle price as lastPairPrice. A price no
+    ///         newer than the stored one, or published past the scheduled termination cutoff, is
+    ///         not stored and emits nothing.
+    /// @param pairId The pair
+    /// @param targetPublishTs The stored price's oracle publish time
+    /// @param spotPrice The stored spot price
+    /// @param exponent The decimal exponent of spotPrice (BAZAAR_EXPONENT)
+    /// @param fundingIndex currentFundingIndex after accruing up to this price. The index moves
+    ///        only when a price is stored, so successive events bracket every change in it.
     event NewPriceUpdateAdded(
-        bytes32 indexed pairId, uint256 indexed targetPublishTs, uint256 spotPrice, int32 exponent
+        bytes32 indexed pairId, uint256 indexed targetPublishTs, uint256 spotPrice, int32 exponent, int256 fundingIndex
     );
 
     // -------------------- Functions --------------------
@@ -2150,9 +2434,9 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     ///         ends a stale gap on an active pair may earn a small insurance-funded bounty
     ///         (RiskParamsLib.payRefreshBounty holds the gates and amount).
     /// @dev    Pays the Pyth fee from msg.value and refunds any unused ETH. The margin leg exists
-    ///         so the sample ring keeps advancing through trading gaps — the matching entry
-    ///         points only resample on arrivals and liquidate() after a successful liquidation,
-    ///         so a quiet pair would otherwise freeze laggedMmr() at an arbitrarily old value.
+    ///         so the sample ring keeps advancing through trading gaps — the other entry points
+    ///         resample only when someone trades, liquidates or deleverages, so a quiet pair would
+    ///         otherwise freeze laggedMmr() at an arbitrarily old value.
     ///         The health leg exists for the same reason: every other entry point judges vault
     ///         health only after real activity (a fill, a liquidation, an unload, a withdrawal
     ///         against exposure), and the ADL latch that executeAdl requires is set nowhere
@@ -2177,7 +2461,11 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         (BazaarTypes.PairPrice memory priceStruct, uint256 unusedEth, bool isStale) =
             _getCurrentPairPrice(priceUpdate, msg.value);
         _refreshMarginCurve(priceStruct.spotPrice);
-        if (settlementPriceFixedTs == 0) {
+        // In limbo no tick published after the cutoff is stored, so the price resolved above can
+        // be the frozen pre-cutoff mark reported as fresh; running the health check on it could fix
+        // the settlement price there — the stored price a cutoff-print settlement exists to avoid —
+        // and there is no gap for the bounty to end.
+        if (settlementPriceFixedTs == 0 && !_pastTradingCutoff()) {
             RiskParamsLib.payRefreshBounty(pairVault, lastPairPrice, feeEscrow, pairId, prevUpdateTs);
             isVaultHealthy(priceStruct.spotPrice, isStale);
         }
@@ -2211,7 +2499,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         // A stale price returns found=false; a fresh-but-over-confidence (or invalid) price
         // reverts inside and is caught here — both fall through to the user-update / stale paths,
         // so the confidence cap is never bypassed on the fresh hot path (fills, liquidation, ADL).
-        try oracle.tryReadFreshPrice(baseFeedId, MAX_PRICE_STALENESS) returns (
+        try oracle.tryReadFreshPrice(baseFeedId, BazaarTypes.MAX_PRICE_STALENESS) returns (
             bool found, uint256 spot, uint256 low, uint256 high, uint256 pubTime
         ) {
             if (found) {
@@ -2226,7 +2514,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             if (fee > budget) revert BazaarPair__InsufficientPythFee();
 
             (uint256 spotPrice, uint256 lowPrice, uint256 highPrice, uint256 publishTime) =
-                oracle.updateAndFetchPrice{value: fee}(baseFeedId, priceUpdate, MAX_PRICE_STALENESS);
+                oracle.updateAndFetchPrice{value: fee}(baseFeedId, priceUpdate, BazaarTypes.MAX_PRICE_STALENESS);
             budget -= fee;
 
             (priceStruct,) = _buildAndStorePairPrice(spotPrice, lowPrice, highPrice, publishTime, 0);
@@ -2253,7 +2541,10 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         revert BazaarPair__NoPriceUpdatesProvided();
     }
 
-    /// @notice Builds the BazaarTypes.PairPrice struct from oracle results, stores, and emits event
+    /// @notice Stores an oracle result as lastPairPrice when it is newer than the stored price, not
+    ///         past the scheduled termination cutoff, and the settlement price is not yet fixed —
+    ///         advancing the variance EMA, the funding index and the ADL clocks off it — and emits
+    ///         NewPriceUpdateAdded. Otherwise stores and emits nothing and returns the stored price.
     function _buildAndStorePairPrice(
         uint256 spotPrice,
         uint256 lowPrice,
@@ -2261,17 +2552,29 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         uint256 publishTime,
         uint256 remainingBudget
     ) internal returns (BazaarTypes.PairPrice memory priceStruct, uint256 unusedEth) {
-        // Update lastPairPrice and variance EMA if more recent
-        // Do not update past scheduled termination timestamp (freeze price at termination time)
+        // Store only a newer tick, never one published past the scheduled cutoff (the price
+        // freezes at termination time), and nothing once the settlement price is fixed. Terminal
+        // settlement marks each position at the live funding index, so the index must not move
+        // between settlements: a tick published at or before the cutoff stays fresh for
+        // MAX_PRICE_STALENESS past it, and storing it after the fix would accrue up to
+        // MAX_FUNDING_AGE of funding that positions settled earlier never paid, credited to
+        // those settled later out of the insurers' residual.
         if (
-            publishTime > lastPairPrice.updateTs
+            settlementPriceFixedTs == 0 && publishTime > lastPairPrice.updateTs
                 && (scheduledTerminationTs == 0 || publishTime <= scheduledTerminationTs)
         ) {
             // Advance the variance EMA first: it reads the prior EMA out of lastPairPrice, which
             // the store below overwrites.
             uint256 prevUpdateTs = lastPairPrice.updateTs;
-            uint256 emaVarianceBp =
-                RiskParamsLib.calculateVariance(lastPairPrice, varianceSample, reopenGapEma, spotPrice, publishTime);
+            uint256 emaVarianceBp = RiskParamsLib.calculateVariance(
+                lastPairPrice,
+                varianceSample,
+                reopenGapEma,
+                liquidationGapEma,
+                spotPrice,
+                publishTime,
+                isContinuouslyTraded
+            );
 
             // Sync the lastPairPrice
             priceStruct.spotPrice = spotPrice;
@@ -2287,6 +2590,7 @@ contract BazaarPair is Initializable, ReentrancyGuard {
 
             // Update funding index with the fresh price
             _updateFundingIndex(spotPrice, publishTime);
+            emit NewPriceUpdateAdded(pairId, publishTime, spotPrice, BAZAAR_EXPONENT, currentFundingIndex);
 
             // Start the timed-out auction's runway. Sited here because this branch is the only
             // writer of lastPairPrice and runs solely on a fresh, confidence-checked price, which
@@ -2310,7 +2614,8 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             // able to make. Left alone, the first keeper after a reopen meets a fully decayed gate
             // and may deleverage any profitable account, including ones a live auction would never
             // have reached. The bound is the pair's own discontinuity threshold, calibrated so the
-            // refresh bounty's cadence separates a shut venue from ordinary call sparsity.
+            // refresh bounty's cadence — live through a window, since the vault holds inventory
+            // then — separates a shut venue from ordinary call sparsity.
             //
             // Restarting rather than crediting only the gap forfeits whatever the auction had
             // already spent, which is bounded by the decay's own length; what it buys is a clock
@@ -2326,9 +2631,6 @@ contract BazaarPair is Initializable, ReentrancyGuard {
             // never propagates a zero priceStruct.
             priceStruct = lastPairPrice;
         }
-
-        // Emit event
-        emit NewPriceUpdateAdded(pairId, publishTime, spotPrice, BAZAAR_EXPONENT);
 
         return (priceStruct, remainingBudget);
     }
@@ -2355,12 +2657,32 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     /// @notice Reverts on failure. Use for user-owed funds (collateral, withdrawals).
     function _sendUsdc(address from, address to, uint256 amountBazaarPrecision) internal {
         if (from == address(0) || to == address(0)) revert BazaarPair__TransferFailed();
-        uint256 usdcAmount =
-            uint256(BazaarMathLib.convertExponent(int256(amountBazaarPrecision), BAZAAR_EXPONENT, USDC_EXPONENT));
+        // Unsigned throughout: BAZAAR precision carries twelve more decimals than USDC, and an
+        // amount routed through a signed type would read as negative from 2^255 up and convert
+        // to nothing, crediting the ledger for cash that was never pulled.
+        uint256 usdcAmount = amountBazaarPrecision / 1e12;
         if (from == address(this)) {
             usdc.safeTransfer(to, usdcAmount);
         } else {
             usdc.safeTransferFrom(from, to, usdcAmount);
+        }
+    }
+
+    // ----------------------------------------------------------
+    //  Raw storage read (read by BazaarPairLens / frontends)
+    // ----------------------------------------------------------
+
+    /// @notice Returns one raw storage word. State without a dedicated getter is read through
+    ///         this: BazaarPairLens rebuilds its views from the storage layout, so the pair
+    ///         carries one accessor instead of an auto-generated getter per struct.
+    /// @dev Exposes nothing `eth_getStorageAt` does not already; what it adds is reach — an
+    ///      `eth_call` works from other contracts and from indexers that cannot read storage
+    ///      directly. Layout is fixed per implementation, and every pair is a clone of one.
+    /// @param slot The storage slot to read
+    /// @return value The word stored at `slot`
+    function extsload(bytes32 slot) external view returns (bytes32 value) {
+        assembly ("memory-safe") {
+            value := sload(slot)
         }
     }
 
@@ -2380,11 +2702,12 @@ contract BazaarPair is Initializable, ReentrancyGuard {
         s.adlSnapshotFundingIndex = adlSnapshotFundingIndex;
         s.adlLongs = adlLongs;
         s.settlementPrice = fixedSettlementPrice;
-        s.terminalPrincipalRatioBp = terminalState.principalRatioBp;
-        s.terminalProfitRatioBp = terminalState.profitRatioBp;
+        s.terminalPrincipalRatio = terminalState.principalRatio;
+        s.terminalProfitRatio = terminalState.profitRatio;
         s.terminalProfitClaims = terminalState.totalProfitClaims;
         s.terminalBadDebt = terminalState.terminalBadDebt;
         s.bugBountyAddress = bugBountyAddress;
+        s.deferredCount = deferredLiquidations.length;
     }
 
     /// @notice The window-deposit amount ADL ranking subtracts from `user`'s collateral: their
@@ -2405,12 +2728,15 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     ///         isAdlPending transition, and each mid-auction side flip that re-targets the
     ///         auction. (Distinct from nextAdlId, which numbers individual executeAdl
     ///         installments; one pending window can span several of both.) Deposits made while a
-    ///         window is live are epoch-tagged so ADL scoring ranks on the book as of the moment
-    ///         the depositor's side came into range: a mid-auction top-up cannot dodge the queue,
-    ///         while still fully counting for liquidation protection and ADL settlement. Tags from
+    ///         window is live are epoch-tagged so ADL scoring ranks the side the window targets on
+    ///         the book as of the moment it came into range: a mid-auction top-up cannot dodge the
+    ///         queue, while still fully counting for liquidation protection and ADL settlement.
+    ///         The deferred cohort, the inventory's own side, ranks on its full collateral (its
+    ///         tags defended against liquidation, not against a ranking it was not yet subject
+    ///         to); a re-target voids them the same way by advancing the epoch. Tags from
     ///         superseded epochs fail the equality check and are ignored — lazy invalidation, no
     ///         cleanup pass, and the stale amount is overwritten by the depositor's next deposit.
-    uint64 public adlEpoch;
+    uint64 internal adlEpoch; // read off-chain through BazaarPairLens.adlEpoch
     mapping(address => uint64) internal adlDepositEpoch; // window the user's tagged deposits belong to
     mapping(address => uint256) internal adlWindowDeposits; // collateral added during that window
 
@@ -2429,11 +2755,12 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     mapping(address => uint256) public terminalProfitClaim;
     BazaarTypes.TerminalSettlement internal terminalState;
 
-    /// @notice The fixed settlement price and the time it was fixed (0 while the pair is live).
-    ///         Fixing the price opens the settlement window: liquidate() then settles positions
-    ///         at this price with no oracle read, and finalizeTermination freezes the payout
-    ///         ratios once every position is settled (or the escape hatch has elapsed).
-    uint256 public fixedSettlementPrice;
+    /// @notice The fixed settlement price and the time it was fixed (0 while the pair is live);
+    ///         the price is read through auxState().settlementPrice. Fixing the price opens the
+    ///         settlement window: liquidate() then settles positions at this price with no oracle
+    ///         read, and finalizeTermination freezes the payout ratios once every position is
+    ///         settled (or the escape hatch has elapsed).
+    uint256 internal fixedSettlementPrice;
     uint256 public settlementPriceFixedTs;
 
     /// @notice Peak-hold reopen-gap floor for non-continuously traded pairs (appended last to
@@ -2463,11 +2790,12 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     ///      window lasts. Set
     ///      once is what makes it a deadline rather than a snooze button: refreshing on every
     ///      stored price would push termination out indefinitely, and the refresh bounty pays
-    ///      keepers to hold live pairs to a ~10-minute cadence, so honest upkeep alone would keep a
+    ///      keepers to store a price every few minutes while the vault holds inventory, as it does
+    ///      through a window, so honest upkeep alone would keep a
     ///      failed auction pending forever. Cleared only when the auction resolves and the exposure
     ///      is back under the release level, so a later window on the same pair arms afresh
     ///      instead of inheriting a deadline already in the past.
-    uint256 public adlTerminationTs;
+    uint256 internal adlTerminationTs; // read off-chain through BazaarPairLens.adlTerminationTs
 
     /// @notice Start of the ADL auction's current Dutch-decay run; 0 while no auction is open
     ///         (appended last to preserve the storage slots of all earlier state).
@@ -2479,4 +2807,21 @@ contract BazaarPair is Initializable, ReentrancyGuard {
     ///      descended against a cohort that could actually be submitted, and may move forward.
     ///      AdlLib._getAdlScoreThreshold reads it, and 0 yields a threshold no score can reach.
     uint256 public adlAuctionStartTs;
+
+    /// @notice Liquidations the vault could not take: insolvent positions opposite its inventory
+    ///         whose netting against it would have taken the insurance fund below its reserve.
+    ///         Left open and listed here for the auction to close against their own
+    ///         counterparties, and emptied by any health check that leaves no window open
+    ///         (_vaultHealthVerdict); bounded by MAX_DEFERRED_LIQUIDATIONS, with the count
+    ///         reported by auxState. Declared last so the storage layout ahead of it is unchanged.
+    address[] public deferredLiquidations;
+
+    /// @notice Per-user insurance redemption locks, packed `lockedAmount << 64 | lockTs`: what the
+    ///         requested shares were worth when the first execute call of a live-pair redemption
+    ///         ran, and when. The paying call pays the lower of that and the value then. A lock
+    ///         counts only for the request whose window it was made in, so none is cleared on a
+    ///         new request (see InsuranceVaultLib._lockOrClaim). Read through
+    ///         BazaarPairLens.getInsuranceWithdrawalLock. Declared last so the storage layout ahead
+    ///         of it is unchanged.
+    mapping(address => uint256) internal insuranceWithdrawalLock;
 }

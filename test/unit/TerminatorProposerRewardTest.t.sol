@@ -18,6 +18,13 @@ contract PayRewardHarness {
         vault.insuranceFundBalance = b;
     }
 
+    /// @dev Collateral seized alongside inventory the vault still holds, which the fund holds but
+    ///      may not spend.
+    function setEarmark(uint256 amount) external {
+        vault.pendingLiqSeized = amount;
+        vault.pendingLiqSize = amount == 0 ? 0 : 1e18;
+    }
+
     function insurance() external view returns (uint256) {
         return vault.insuranceFundBalance;
     }
@@ -36,9 +43,9 @@ contract PayRewardHarness {
 }
 
 /// @notice `payUmaProposerReward` debits the insurance fund mid-termination. These pin the 1-bps
-///         computation, the $100 cap, the zero-reward early return, and the escrow booking: the
-///         debit and the proposer's claimable credit must move together, or the I + D + escrow
-///         books drift during the termination flow.
+///         computation, the $100 cap, the free-capital cap, the zero-reward early return, and the
+///         escrow booking: the debit and the proposer's claimable credit must move together, or the
+///         I + D + escrow books drift during the termination flow.
 contract TerminatorProposerRewardTest is Test {
     uint256 constant SCALE = 1e18;
     bytes32 constant PAIR_ID = bytes32("TEST");
@@ -107,6 +114,37 @@ contract TerminatorProposerRewardTest is Test {
 
         assertEq(h.insurance(), 50_000 * SCALE - 50 * SCALE, "fund debited despite a hostile recipient");
         assertEq(h.claimable(hostile), 50 * SCALE, "credit recorded for the hostile recipient");
+    }
+
+    /// @notice The reward takes only free capital. With most of the fund earmarked against
+    ///         inventory the vault still holds, the proposer is paid what sits above that earmark
+    ///         and no more — the earmark settles the inventory, and both the netting affordability
+    ///         test and an auction slice's settlement have already counted it as cash the fund
+    ///         holds.
+    function test_reward_cappedAtFreeCapital() public {
+        h.setInsurance(50_000 * SCALE); // 1 bps = $50
+        h.setEarmark(50_000 * SCALE - 30 * SCALE); // only $30 is free
+
+        h.pay(proposer);
+
+        assertEq(h.claimable(proposer), 30 * SCALE, "paid the free capital, not the 1-bps figure");
+        assertEq(h.insurance(), 50_000 * SCALE - 30 * SCALE, "fund debited exactly that");
+        assertEq(h.escrowTotal(), 30 * SCALE, "escrow liability matches the debit");
+    }
+
+    /// @notice A fully earmarked fund pays nothing at all rather than dipping into the earmark.
+    ///         Spending it would leave the fund short of a settlement the netting test and the
+    ///         auction have already committed to, and the gap would surface as realized bad debt
+    ///         on the next close — which fixes the settlement price and ends the pair.
+    function test_reward_fullyEarmarkedFund_paysNothing() public {
+        h.setInsurance(50_000 * SCALE);
+        h.setEarmark(50_000 * SCALE);
+
+        h.pay(proposer);
+
+        assertEq(h.claimable(proposer), 0, "nothing owed");
+        assertEq(h.insurance(), 50_000 * SCALE, "the earmark is untouched");
+        assertEq(h.escrowTotal(), 0, "no liability recorded");
     }
 }
 

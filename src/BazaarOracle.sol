@@ -25,6 +25,8 @@ contract BazaarOracle {
     error BazaarOracle__InvalidPrice(bytes32 feedId, int64 price, int32 expo);
     error BazaarOracle__ConfidenceTooHigh(uint256 confidence, uint256 price);
     error BazaarOracle__InvalidCompositeLegs(bytes32 baseId, bytes32 quoteId);
+    error BazaarOracle__SampleCountMismatch(uint256 updates, uint256 expected);
+    error BazaarOracle__SampleFeeMismatch(uint256 supplied, uint256 required);
 
     // -------------------- Events --------------------
     event CompositeFeedRegistered(
@@ -39,6 +41,18 @@ contract BazaarOracle {
         bytes32 baseId;
         bytes32 quoteId;
         bool invertQuote;
+    }
+
+    /// @dev A chained sample set's legs and its running target, held in memory so the parse loop
+    ///      stays shallow (see fetchChainedMedian).
+    struct SampleChain {
+        bytes32 baseId;
+        bytes32 quoteId;
+        bool invertQuote;
+        uint256 legs;
+        bytes32[] feedIds;
+        uint64 target;
+        uint64 maxPublishTime;
     }
 
     // -------------------- Constants --------------------
@@ -196,6 +210,21 @@ contract BazaarOracle {
         return pyth.getUpdateFee(priceUpdate);
     }
 
+    /// @notice Returns the ETH fee fetchChainedMedian charges for `priceUpdate`. Each sample is
+    ///         parsed in a Pyth call of its own, so this is the sum of Pyth's fee for each
+    ///         sample's updates, read as consecutive groups of one update per leg of
+    ///         `baseFeedId`; a trailing group short of a leg adds nothing.
+    /// @param baseFeedId The Pyth feed ID for the base asset, or a registered composite ID
+    /// @param priceUpdate The sample set, one update per leg for each sample in turn
+    /// @return fee The total fee in wei
+    function getSampleSetFee(bytes32 baseFeedId, bytes[] calldata priceUpdate) external view returns (uint256 fee) {
+        (, bytes32 quoteId,) = _resolve(baseFeedId);
+        uint256 legs = quoteId == bytes32(0) ? 1 : 2;
+        for (uint256 i = 0; i + legs <= priceUpdate.length; i += legs) {
+            fee += pyth.getUpdateFee(_sampleUpdates(priceUpdate, i, legs));
+        }
+    }
+
     // ================================================================
     //                        Write functions (payable, needs ETH)
     // ================================================================
@@ -219,9 +248,33 @@ contract BazaarOracle {
         return _composeSafe(baseId, basePrice, pyth.getPriceNoOlderThan(quoteId, maxStaleness), quoteId, invertQuote);
     }
 
-    /// @notice Parse historical price updates and return the USD price within a time window.
-    /// @dev For composite feeds, priceUpdate must contain updates for both legs within the window.
-    function fetchHistoricalPrice(
+    /// @notice Parse a price update and return the USD price of the first tick published at or
+    ///         after `minPublishTime`, provided that tick was published no later than
+    ///         `maxPublishTime`.
+    /// @dev Pyth checks the update's embedded previous publish time against `minPublishTime`, so
+    ///      the returned tick is provably the first one at or after it: whoever supplies the update
+    ///      cannot choose among later prints, and a window that opens while the feed is quiet
+    ///      resolves to the feed's next print rather than to anything stored. When that first
+    ///      print falls after `maxPublishTime` no update qualifies and the call reverts with
+    ///      Pyth's PriceFeedNotFoundWithinRange. This is Pyth's `parsePriceFeedUpdatesUnique`
+    ///      spelled out through the configurable parser (uniqueness on, extra feeds in the payload
+    ///      tolerated, nothing stored), so the test mock enforces the same uniqueness check the
+    ///      live contract does. For composite feeds each leg is its own first print: an FX leg
+    ///      that trades around the clock resolves within seconds of `minPublishTime` while an
+    ///      equity leg may resolve at its next session open.
+    ///
+    ///      The confidence cap is deliberately NOT applied. There is exactly one qualifying print,
+    ///      so a cap could never redirect to a better one — it could only refuse, which leaves the
+    ///      caller only its stored-price fallback, after whatever wait that fallback carries, even
+    ///      though a genuine print exists. The first print after a closed session is routinely
+    ///      wide, so a cap would push every off-hours cutoff onto that fallback. Only a
+    ///      non-positive price is rejected.
+    /// @param baseFeedId The Pyth feed ID for the base asset, or a registered composite ID
+    /// @param priceUpdate The update(s) to parse, one per leg
+    /// @param minPublishTime Earliest acceptable publish time; the returned tick is the first at or after it
+    /// @param maxPublishTime Latest acceptable publish time for that first tick
+    /// @return spotPrice The USD price normalized to BAZAAR_SCALE
+    function fetchFirstPriceAtOrAfter(
         bytes32 baseFeedId,
         bytes[] calldata priceUpdate,
         uint64 minPublishTime,
@@ -229,21 +282,147 @@ contract BazaarOracle {
     ) external payable returns (uint256 spotPrice) {
         (bytes32 baseId, bytes32 quoteId, bool invertQuote) = _resolve(baseFeedId);
 
-        PythStructs.PriceFeed[] memory priceFeeds = pyth.parsePriceFeedUpdates{value: msg.value}(
-            priceUpdate, _feedIdArray(baseId, quoteId), minPublishTime, maxPublishTime
+        (PythStructs.PriceFeed[] memory priceFeeds,) = pyth.parsePriceFeedUpdatesWithConfig{value: msg.value}(
+            priceUpdate, _feedIdArray(baseId, quoteId), minPublishTime, maxPublishTime, true, false, false
         );
 
         if (quoteId == bytes32(0)) {
-            (spotPrice,,,) = _normalizeBase(baseId, priceFeeds[0].price);
+            (spotPrice,,,) = _normalizeBaseUnsafe(baseId, priceFeeds[0].price);
             return spotPrice;
         }
 
-        (spotPrice,,,) = _composeSafe(baseId, priceFeeds[0].price, priceFeeds[1].price, quoteId, invertQuote);
+        (spotPrice,,,) = _composeUnsafe(baseId, priceFeeds[0].price, quoteId, priceFeeds[1].price, invertQuote);
+    }
+
+    /// @notice Parse a chained sample set and return the median of its USD prices. The first
+    ///         sample is the first print at or after `firstTarget`; each later sample is the first
+    ///         print at or after `spacing` past the publish time of the sample before it (the
+    ///         later of its two legs' for a composite). Every sample must be published no later
+    ///         than `maxPublishTime`, and the set must hold exactly `count` samples.
+    /// @dev Every sample is pinned the way fetchFirstPriceAtOrAfter pins its one print: Pyth checks
+    ///      each update's embedded previous publish time against that sample's own target, so the
+    ///      sample is provably the first print at or after it, and every target after the first is
+    ///      computed here from the publish time Pyth verified for the sample before, never taken
+    ///      from the caller. The whole set is therefore fixed by the feed's history alone: a set
+    ///      built from any other prints, in any other order, or with a sample short reverts, so
+    ///      whoever submits it chooses nothing. Measuring each target from the previous sample
+    ///      rather than from the first keeps the samples apart whatever the feed does: a target
+    ///      that falls in a quiet stretch resolves to the feed's next print, and the target after
+    ///      it moves past that print, so a cutoff at a session's close yields the close and then
+    ///      prints from the reopen onward instead of the reopen's first print over and over. The
+    ///      median of an odd count is its middle sample, so moving it means moving more than half
+    ///      of the samples.
+    ///
+    ///      Each sample is parsed in a Pyth call of its own, carrying that sample's fee, and
+    ///      `msg.value` must equal their sum (getSampleSetFee), so no ETH is left here. As in
+    ///      fetchFirstPriceAtOrAfter the confidence cap is not applied, since each sample has
+    ///      exactly one qualifying print and a cap could only refuse it; only a non-positive price
+    ///      is rejected.
+    /// @param baseFeedId The Pyth feed ID for the base asset, or a registered composite ID
+    /// @param priceUpdate The sample set: for each sample in turn, one update per leg, the legs of
+    ///        a sample in either order
+    /// @param firstTarget The first sample's target
+    /// @param maxPublishTime Latest acceptable publish time for every sample
+    /// @param spacing How far after a sample's publish time the next sample's target lies
+    /// @param count How many samples the set must hold
+    /// @return medianPrice The median sample price, normalized to BAZAAR_SCALE
+    function fetchChainedMedian(
+        bytes32 baseFeedId,
+        bytes[] calldata priceUpdate,
+        uint64 firstTarget,
+        uint64 maxPublishTime,
+        uint64 spacing,
+        uint256 count
+    ) external payable returns (uint256 medianPrice) {
+        SampleChain memory chain = _sampleChain(baseFeedId, firstTarget, maxPublishTime);
+        uint256 expected = count * chain.legs;
+        if (count == 0 || priceUpdate.length != expected) {
+            revert BazaarOracle__SampleCountMismatch(priceUpdate.length, expected);
+        }
+        uint256[] memory prices = new uint256[](count);
+        uint256 spent;
+        for (uint256 k = 0; k < count; k++) {
+            uint256 fee;
+            (prices[k], fee) = _parseSample(chain, _sampleUpdates(priceUpdate, k * chain.legs, chain.legs), spacing);
+            spent += fee;
+        }
+        if (spent != msg.value) revert BazaarOracle__SampleFeeMismatch(msg.value, spent);
+        medianPrice = _median(prices);
     }
 
     // ================================================================
     //                         Internal helpers
     // ================================================================
+
+    /// @dev A sample chain over `baseFeedId`'s legs, its first target `firstTarget`.
+    function _sampleChain(bytes32 baseFeedId, uint64 firstTarget, uint64 maxPublishTime)
+        internal
+        view
+        returns (SampleChain memory chain)
+    {
+        (chain.baseId, chain.quoteId, chain.invertQuote) = _resolve(baseFeedId);
+        chain.legs = chain.quoteId == bytes32(0) ? 1 : 2;
+        chain.feedIds = _feedIdArray(chain.baseId, chain.quoteId);
+        chain.target = firstTarget;
+        chain.maxPublishTime = maxPublishTime;
+    }
+
+    /// @dev Parses one sample of `chain`: every leg's first print at or after the chain's target
+    ///      and no later than its maximum, composed to a USD price. Then moves the target to
+    ///      `spacing` past the later leg's publish time, where the next sample starts.
+    /// @param chain The chain's legs, its current target and its maximum publish time; the target
+    ///        is advanced in place
+    /// @param updates The sample's updates, one per leg
+    /// @param spacing How far after this sample's publish time the next sample's target lies
+    /// @return price The sample's USD price, normalized to BAZAAR_SCALE
+    /// @return fee The Pyth fee the parse paid
+    function _parseSample(SampleChain memory chain, bytes[] memory updates, uint64 spacing)
+        internal
+        returns (uint256 price, uint256 fee)
+    {
+        fee = pyth.getUpdateFee(updates);
+        (PythStructs.PriceFeed[] memory feeds,) = pyth.parsePriceFeedUpdatesWithConfig{value: fee}(
+            updates, chain.feedIds, chain.target, chain.maxPublishTime, true, false, false
+        );
+        uint256 publishTime = feeds[0].price.publishTime;
+        if (chain.legs == 1) {
+            (price,,,) = _normalizeBaseUnsafe(chain.baseId, feeds[0].price);
+        } else {
+            (price,,,) = _composeUnsafe(chain.baseId, feeds[0].price, chain.quoteId, feeds[1].price, chain.invertQuote);
+            if (feeds[1].price.publishTime > publishTime) publishTime = feeds[1].price.publishTime;
+        }
+        // Pyth refused any leg published after maxPublishTime, a uint64, so the cast is exact; a
+        // target past the uint64 range reverts here rather than wrapping to an earlier one.
+        chain.target = uint64(publishTime) + spacing;
+    }
+
+    /// @dev The updates of one sample in a flat sample set: `legs` updates from index `start`.
+    function _sampleUpdates(bytes[] calldata priceUpdate, uint256 start, uint256 legs)
+        internal
+        pure
+        returns (bytes[] memory updates)
+    {
+        updates = new bytes[](legs);
+        for (uint256 j = 0; j < legs; j++) {
+            updates[j] = priceUpdate[start + j];
+        }
+    }
+
+    /// @dev The middle value of `values` once sorted, sorting them in place: the median of an odd
+    ///      count, and the upper of the two middle values of an even one.
+    function _median(uint256[] memory values) internal pure returns (uint256) {
+        uint256 n = values.length;
+        for (uint256 i = 1; i < n; i++) {
+            uint256 v = values[i];
+            uint256 j = i;
+            while (j > 0 && values[j - 1] > v) {
+                values[j] = values[j - 1];
+                j--;
+            }
+            values[j] = v;
+        }
+        return values[n / 2];
+    }
 
     /// @dev Resolve a feed ID into its legs. Raw Pyth IDs resolve to themselves with no quote leg.
     function _resolve(bytes32 feedId) internal view returns (bytes32 baseId, bytes32 quoteId, bool invertQuote) {

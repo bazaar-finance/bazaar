@@ -117,10 +117,19 @@ abstract contract IntegrationBase is Test {
         view
         returns (bytes[] memory pu)
     {
+        return _priceUpdateFor(feedId, priceUsd, publishTime, publishTime > 0 ? publishTime - 1 : 0);
+    }
+
+    /// @dev As above, with the predecessor publish time Pyth's uniqueness check reads.
+    function _priceUpdateFor(bytes32 feedId, uint256 priceUsd, uint64 publishTime, uint64 prevPublishTime)
+        internal
+        view
+        returns (bytes[] memory pu)
+    {
         int64 pythPrice = int64(int256(priceUsd * 1e8));
         uint64 conf = uint64(priceUsd * 1e8 / 1000);
         bytes memory data = mockPyth.createPriceFeedUpdateData(
-            feedId, pythPrice, conf, PYTH_EXPO, pythPrice, conf, publishTime, publishTime > 0 ? publishTime - 1 : 0
+            feedId, pythPrice, conf, PYTH_EXPO, pythPrice, conf, publishTime, prevPublishTime
         );
         pu = new bytes[](1);
         pu[0] = data;
@@ -162,32 +171,53 @@ abstract contract IntegrationBase is Test {
         vm.stopPrank();
     }
 
+    // ---------------------------- insurance redemption ----------------------------
+
+    /// @dev One executeInsuranceWithdrawal call on `p` by `user` carrying `pu`, forwarding the Pyth
+    ///      fee. Build `pu` before calling: the Pyth helper's external call would consume a prank.
+    function _executeRedemption(BazaarPair p, address user, bytes[] memory pu) internal {
+        uint256 fee = oracle.getUpdateFee(pu);
+        vm.deal(user, fee);
+        vm.prank(user);
+        p.executeInsuranceWithdrawal{value: fee}(pu, 0, 0, 0, "", "");
+    }
+
+    /// @dev Warps to the moment `user`'s locked redemption on `p` accepts its paying call.
+    function _warpToRedemptionClaim(BazaarPair p, address user) internal {
+        (bool isLocked,,, uint256 opensTs,) = lens.getInsuranceWithdrawalLock(address(p), user);
+        assertTrue(isLocked, "redemption is locked");
+        if (opensTs > vm.getBlockTimestamp()) vm.warp(opensTs);
+    }
+
+    /// @dev A BTC-pair redemption end to end at `priceUsd`: the lock, a warp to the paying call's
+    ///      opening, and the paying call, each carrying an update stamped when it runs.
+    function _redeemAt(address user, uint256 priceUsd) internal {
+        _executeRedemption(pair, user, _priceAt(priceUsd));
+        _warpToRedemptionClaim(pair, user);
+        _executeRedemption(pair, user, _priceAt(priceUsd));
+    }
+
     // ---------------------------- orders ----------------------------
 
     /// @dev Zeroed execution aids: head-insert-or-repair positioning, protocol-default walk cap.
     function _hintsNone() internal pure returns (BazaarTypes.MatchHints memory m) {}
 
-    /// @dev Per-pair probe watermark for _lastCreatedOrderId.
-    mapping(address => uint256) internal _idProbe;
-
-    /// @dev The newest orderId a pair has assigned. Ids are a gapless monotonic counter from 1,
-    ///      so probing forward from a per-pair watermark finds the last created order without
-    ///      reading events — createOrder has no id return, and the order may already be terminal
-    ///      (filled or canceled in its own transaction) so the active-set is no source either.
-    function _lastCreatedOrderId(BazaarPair p) internal returns (uint256) {
-        uint256 w = _idProbe[address(p)];
-        if (w == 0) w = 1;
-        while (true) {
-            if (OrderView.order(p, w).creator == address(0)) break;
-            ++w;
+    /// @dev The newest orderId a pair has assigned: the counter's last value, skipping any an
+    ///      amendment or a keeper arming a StopLimit consumed as a queue position (those name no
+    ///      order). createOrder has no id
+    ///      return, and the order may already be terminal (filled or canceled in its own
+    ///      transaction) so the active-set is no source either.
+    function _lastCreatedOrderId(BazaarPair p) internal view returns (uint256) {
+        uint256 id = lens.nextOrderId(address(p));
+        while (id > 1) {
+            --id;
+            if (OrderView.order(p, id).creator != address(0)) return id;
         }
-        _idProbe[address(p)] = w;
-        require(w > 1, "no orders created yet");
-        return w - 1;
+        revert("no orders created yet");
     }
 
     function _newestLimitOrderId(address user) internal returns (uint256) {
-        (uint256[] memory ids,,,) = pair.getUserActiveLimitOrders(user);
+        (uint256[] memory ids,,,) = lens.getUserActiveLimitOrders(address(pair), user);
         require(ids.length > 0, "no active limit orders");
         return ids[ids.length - 1];
     }
@@ -211,14 +241,14 @@ abstract contract IntegrationBase is Test {
         return _lastCreatedOrderId(pair);
     }
 
-    /// @dev Place a limit while the oracle prints `oraclePriceUsd` (warps +3s so the update is
+    /// @dev Place a limit while the oracle prints `oraclePriceUsd` (warps +4s so the update is
     ///      strictly newer). A crossing placement fills immediately at the maker's price; the
     ///      oracle price drives the margin checks and the stale band only.
     function _placeLimitAt(address user, bool isLong, uint256 size, uint256 limitPrice, uint256 oraclePriceUsd)
         internal
         returns (uint256)
     {
-        vm.warp(vm.getBlockTimestamp() + 3);
+        vm.warp(vm.getBlockTimestamp() + 4);
         bytes[] memory pu = _priceUpdate(oraclePriceUsd, uint64(vm.getBlockTimestamp()));
         vm.prank(user);
         pair.createOrder(_limitSpec(isLong, size, limitPrice), _hintsNone(), pu, 0, 0, 0, "", "");
@@ -305,6 +335,20 @@ abstract contract IntegrationBase is Test {
         }
     }
 
+    /// @dev Pack a keeper bounty into a trigger price the way OrderSpec carries it: the bounty
+    ///      (BAZAAR precision) in the high 128 bits, the price below.
+    function _withBounty(uint256 triggerPrice, uint256 bounty) internal pure returns (uint256) {
+        return (bounty << 128) | triggerPrice;
+    }
+
+    /// @dev Approve the pair to pull `amount` (BAZAAR precision) from `user`'s wallet — what a
+    ///      trigger order's bounty needs at creation, since _deposit's approval is consumed by
+    ///      the deposit itself.
+    function _approveWallet(address user, uint256 amount) internal {
+        vm.prank(user);
+        usdc.approve(address(pair), amount / 1e12);
+    }
+
     // ---------------------------- keeper entry points ----------------------------
 
     /// @dev Fire one stop through the permissionless trigger executor at $50k.
@@ -312,13 +356,21 @@ abstract contract IntegrationBase is Test {
         return _executeTriggerAt(orderId, 50_000);
     }
 
-    /// @dev Fire one stop at a custom oracle price (warps +3s so the update is strictly newer).
+    /// @dev Fire one stop at a custom oracle price (warps +4s so the update is strictly newer).
     function _executeTriggerAt(uint256 orderId, uint256 priceUsd) internal returns (uint256 executedCount) {
-        vm.warp(vm.getBlockTimestamp() + 3);
+        return _executeTriggerAs(seq, orderId, priceUsd);
+    }
+
+    /// @dev Fire one stop at a custom oracle price from a chosen keeper address.
+    function _executeTriggerAs(address keeper, uint256 orderId, uint256 priceUsd)
+        internal
+        returns (uint256 executedCount)
+    {
+        vm.warp(vm.getBlockTimestamp() + 4);
         bytes[] memory pu = _priceUpdate(priceUsd, uint64(vm.getBlockTimestamp()));
         BazaarTypes.TriggerExec[] memory execs = new BazaarTypes.TriggerExec[](1);
         execs[0].orderId = uint64(orderId);
-        vm.prank(seq);
+        vm.prank(keeper);
         executedCount = pair.executeTriggeredOrders(execs, pu);
     }
 
@@ -331,11 +383,11 @@ abstract contract IntegrationBase is Test {
 
     // ---------------------------- order / position / vault readers ----------------------------
     function _takeProfitOrderId(address user) internal view returns (uint256 id) {
-        (,,,,, id,,,) = pair.positionBuckets(user);
+        (,,,,, id,) = pair.positionBuckets(user);
     }
 
     function _stopLossOrderId(address user) internal view returns (uint256 id) {
-        (,,,,,, id,,) = pair.positionBuckets(user);
+        (,,,,,, id) = pair.positionBuckets(user);
     }
 
     function _filledSize(uint256 orderId) internal view returns (uint256 s) {
@@ -355,19 +407,19 @@ abstract contract IntegrationBase is Test {
     }
 
     function _position(address user) internal view returns (bool isLong, uint256 size) {
-        (isLong, size,,,,,,,) = pair.positionBuckets(user);
+        (isLong, size,,,,,) = pair.positionBuckets(user);
     }
 
     function _posSize(address user) internal view returns (uint256 size) {
-        (, size,,,,,,,) = pair.positionBuckets(user);
+        (, size,,,,,) = pair.positionBuckets(user);
     }
 
     function _posCollateral(address user) internal view returns (uint256 c) {
-        (,,, c,,,,,) = pair.positionBuckets(user);
+        (,,, c,,,) = pair.positionBuckets(user);
     }
 
     function _insuranceBal() internal view returns (uint256 b) {
-        (,,,,, b,,,,,,,,) = pair.pairVault();
+        (,,,,, b,,,,,,,,,,,) = pair.pairVault();
     }
 
     // ---------------------------- misc array helpers ----------------------------
@@ -394,7 +446,7 @@ abstract contract IntegrationBase is Test {
 
     /// @dev totalCollateralDeposited (D) — Vault field index 4.
     function _totalDeposited() internal view returns (uint256 d) {
-        (,,,, d,,,,,,,,,) = pair.pairVault();
+        (,,,, d,,,,,,,,,,,,) = pair.pairVault();
     }
 
     /// @dev The Check-3 expected balance: insuranceFundBalance (I) + totalCollateralDeposited (D)
@@ -402,7 +454,7 @@ abstract contract IntegrationBase is Test {
     ///      cash the contract still holds against a third-party claim, so they belong on the
     ///      books side of the comparison exactly like I and D.
     function _ledgerBaz() internal view returns (uint256) {
-        (,,,, uint256 d, uint256 i,,,,,,,,) = pair.pairVault();
+        (,,,, uint256 d, uint256 i,,,,,,,,,,,) = pair.pairVault();
         return d + i + _escrowTotal();
     }
 
@@ -444,11 +496,11 @@ abstract contract IntegrationBase is Test {
 
     /// @dev Unclaimed fees owed to `who`, and the escrow's total liability.
     function _escrowOwed(address who) internal view returns (uint256 owed) {
-        (owed,) = pair.claimableFees(who);
+        (owed,) = lens.claimableFees(address(pair), who);
     }
 
     function _escrowTotal() internal view returns (uint256 total) {
-        (, total) = pair.claimableFees(address(0));
+        (, total) = lens.claimableFees(address(pair), address(0));
     }
 
     /// @dev Claim `who`'s escrowed fees and return the USDC that actually landed. Every third-party
@@ -466,12 +518,16 @@ abstract contract IntegrationBase is Test {
     ///      bankruptcy notional sits below its entry by that collateral, which is how the seizure
     ///      is recovered without being tracked. Vault struct depths: 6 pendingLiqSize,
     ///      7 pendingLiqEntryNotional, 8 pendingLiqBankruptcyNotional, 10 pendingLiqIsLong.
-    function _stageHeldInventory(BazaarPair target, uint256 entryNotional, uint256 seized) internal {
-        _stdstore.target(address(target)).sig("pairVault()").depth(6).checked_write(1 * BAZAAR_SCALE);
+    function _stageHeldInventory(BazaarPair target, uint256 size, uint256 entryNotional, uint256 seized) internal {
+        _stdstore.target(address(target)).sig("pairVault()").depth(6).checked_write(size);
         _stdstore.target(address(target)).sig("pairVault()").depth(7).checked_write(entryNotional);
         _stdstore.target(address(target)).sig("pairVault()").depth(8).checked_write(entryNotional - seized);
         _stdstore.target(address(target)).sig("pairVault()").depth(10).checked_write(true);
         _stdstore.target(address(target)).sig("pairVault()").depth(13).checked_write(seized);
+    }
+
+    function _stageHeldInventory(BazaarPair target, uint256 entryNotional, uint256 seized) internal {
+        _stageHeldInventory(target, 1 * BAZAAR_SCALE, entryNotional, seized);
     }
 
     function _stageHeldInventory(uint256 entryNotional, uint256 seized) internal {

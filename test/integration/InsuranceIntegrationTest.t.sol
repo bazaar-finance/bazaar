@@ -2,22 +2,15 @@
 pragma solidity 0.8.34;
 
 import {IntegrationBase} from "./IntegrationBase.sol";
+import {InsuranceVaultLib} from "../../src/libraries/InsuranceVaultLib.sol";
 
 /// @title InsuranceIntegrationTest
-/// @notice End-to-end insurance-fund withdrawal lifecycle: deposit → request → 20-day cooldown →
-///         execute. Exercises the two-step gate, share burn, and USDC return through the live pair.
+/// @notice End-to-end insurance-fund withdrawal lifecycle: deposit → request → cooldown → execute.
+///         Exercises the two-step gate, share burn, and USDC return through the live pair.
 contract InsuranceIntegrationTest is IntegrationBase {
-    /// @dev Execute-with-fee: build the price update before the prank and forward the Pyth fee.
-    function _executeInsuranceWithdrawal(address user) internal {
-        bytes[] memory pu = _freshPrice();
-        uint256 fee = oracle.getUpdateFee(pu);
-        vm.deal(user, fee);
-        vm.prank(user);
-        pair.executeInsuranceWithdrawal{value: fee}(pu, 0, 0, 0, "");
-    }
-
-    /// @notice Full deposit → request → cooldown → execute cycle: the request cannot execute before the
-    ///         20-day cooldown, then executes cleanly — burning the shares and returning USDC at NAV.
+    /// @notice Full deposit → request → cooldown → lock → claim cycle: the request cannot execute
+    ///         before the cooldown elapses; inside the window the first call locks and the second
+    ///         burns the shares and returns USDC at NAV.
     function test_e2e_Insurance_TwoStepWithdrawal() public {
         _depositInsurance(carol, 1_000 * BAZAAR_SCALE);
         uint256 shares = pair.insuranceShares(carol);
@@ -43,12 +36,17 @@ contract InsuranceIntegrationTest is IntegrationBase {
             vm.deal(carol, fee);
             vm.prank(carol);
             vm.expectRevert();
-            pair.executeInsuranceWithdrawal{value: fee}(pu, 0, 0, 0, "");
+            pair.executeInsuranceWithdrawal{value: fee}(pu, 0, 0, 0, "", "");
         }
 
-        // Step 2: after the 20-day cooldown (inside the 3-day window) it executes.
-        vm.warp(vm.getBlockTimestamp() + 20 days + 1);
-        _executeInsuranceWithdrawal(carol);
+        // Step 2: after the cooldown (inside the execution window) the first call locks and
+        // pays nothing; the second, once its claim opens, burns the shares and pays.
+        vm.warp(vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN + 1);
+        _executeRedemption(pair, carol, _freshPrice());
+        assertEq(pair.insuranceShares(carol), shares, "the lock burns nothing");
+        assertEq(usdc.balanceOf(carol), usdcBefore, "the lock pays nothing");
+        _warpToRedemptionClaim(pair, carol);
+        _executeRedemption(pair, carol, _freshPrice());
 
         assertEq(pair.insuranceShares(carol), 0, "shares burned");
         assertEq(pair.totalInsuranceShares(), totalBefore - shares, "share supply reduced");
@@ -60,7 +58,7 @@ contract InsuranceIntegrationTest is IntegrationBase {
         );
     }
 
-    /// @notice Waiting past the 3-day execution window (cooldown + window) makes the request expire —
+    /// @notice Waiting past the execution window (cooldown + window) makes the request expire —
     ///         `executeInsuranceWithdrawal` reverts and the shares remain.
     function test_e2e_Insurance_WithdrawalWindowExpires() public {
         _depositInsurance(carol, 1_000 * BAZAAR_SCALE);
@@ -69,14 +67,17 @@ contract InsuranceIntegrationTest is IntegrationBase {
         vm.prank(carol);
         pair.requestInsuranceWithdrawal(shares, 0, 0, 0, "", "");
 
-        // 20-day cooldown + 3-day window + slack → the request is stale.
-        vm.warp(vm.getBlockTimestamp() + 20 days + 3 days + 1);
+        // Cooldown + window + slack → the request is stale.
+        vm.warp(
+            vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN
+                + InsuranceVaultLib.INSURANCE_WITHDRAWAL_WINDOW + 1
+        );
         bytes[] memory pu = _freshPrice();
         uint256 fee = oracle.getUpdateFee(pu);
         vm.deal(carol, fee);
         vm.prank(carol);
         vm.expectRevert();
-        pair.executeInsuranceWithdrawal{value: fee}(pu, 0, 0, 0, "");
+        pair.executeInsuranceWithdrawal{value: fee}(pu, 0, 0, 0, "", "");
 
         assertEq(pair.insuranceShares(carol), shares, "shares retained after expiry");
     }

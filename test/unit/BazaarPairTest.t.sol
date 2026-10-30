@@ -172,10 +172,10 @@ contract BazaarPairTest is Test {
     function testSetup_InsuranceFundBalanceMatchesSeed() public view {
         uint256 seedBazaar = PROPOSAL_TOTAL - (bondUsdc * BAZAAR_SCALE / USDC_SCALE);
 
-        (,,,,, uint256 btcInsuranceBal,,,,,,,,) = btcPair.pairVault();
+        (,,,,, uint256 btcInsuranceBal,,,,,,,,,,,) = btcPair.pairVault();
         assertEq(btcInsuranceBal, seedBazaar);
 
-        (,,,,, uint256 aaplInsuranceBal,,,,,,,,) = aaplPair.pairVault();
+        (,,,,, uint256 aaplInsuranceBal,,,,,,,,,,,) = aaplPair.pairVault();
         assertEq(aaplInsuranceBal, seedBazaar);
     }
 
@@ -212,11 +212,11 @@ contract BazaarPairTest is Test {
         vm.stopPrank();
 
         // Verify collateral recorded in position bucket
-        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, depositAmount);
 
         // Verify vault totalCollateralDeposited updated
-        (,,,, uint256 totalCollateral,,,,,,,,,) = btcPair.pairVault();
+        (,,,, uint256 totalCollateral,,,,,,,,,,,,) = btcPair.pairVault();
         assertEq(totalCollateral, depositAmount);
 
         // Verify USDC transferred from user to pair
@@ -252,11 +252,11 @@ contract BazaarPairTest is Test {
         btcPair.depositCollateral(depositAmount, nonce, deadline, relayerFeeAmount, sig, "");
 
         // Verify collateral recorded for user (not relayer)
-        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, depositAmount);
 
         // The fee accrued to the relayer's claimable balance; claiming pays it out in USDC
-        (uint256 owed,) = btcPair.claimableFees(relayer);
+        (uint256 owed,) = factory.lens().claimableFees(address(btcPair), relayer);
         assertEq(owed, relayerFeeAmount);
         vm.prank(relayer);
         btcPair.claimFees();
@@ -298,11 +298,11 @@ contract BazaarPairTest is Test {
         btcPair.depositCollateral(depositAmount, nonce, deadline, relayerFeeAmount, depositSig, permitData);
 
         // Verify collateral recorded for user
-        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, depositAmount);
 
         // Verify the fee accrued to the relayer
-        (uint256 owed,) = btcPair.claimableFees(relayer);
+        (uint256 owed,) = factory.lens().claimableFees(address(btcPair), relayer);
         assertEq(owed, relayerFeeAmount);
 
         // Verify user never called approve — allowance was set via permit
@@ -324,7 +324,7 @@ contract BazaarPairTest is Test {
         vm.stopPrank();
 
         // Verify collateral is cumulative
-        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, firstDeposit + secondDeposit);
     }
 
@@ -468,10 +468,10 @@ contract BazaarPairTest is Test {
         vm.stopPrank();
 
         // Verify both pairs have correct collateral
-        (,,, uint256 btcCollateral,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 btcCollateral,,,) = btcPair.positionBuckets(user1);
         assertEq(btcCollateral, depositAmount);
 
-        (,,, uint256 aaplCollateral,,,,,) = aaplPair.positionBuckets(user2);
+        (,,, uint256 aaplCollateral,,,) = aaplPair.positionBuckets(user2);
         assertEq(aaplCollateral, depositAmount);
     }
 
@@ -509,12 +509,12 @@ contract BazaarPairTest is Test {
         uint256 raw = 100 * BAZAAR_SCALE + 5e11; // $100 + 0.0000005 USDC (sub-µUSDC remainder)
         uint256 expected = raw - (raw % 1e12); // = exactly 100e18
 
-        (,,,, uint256 collBefore,,,,,,,,,) = btcPair.pairVault();
+        (,,,, uint256 collBefore,,,,,,,,,,,,) = btcPair.pairVault();
         uint256 pairUsdcBefore = usdc.balanceOf(address(btcPair));
 
         _depositCollateral(btcPair, user1, raw);
 
-        (,,,, uint256 collAfter,,,,,,,,,) = btcPair.pairVault();
+        (,,,, uint256 collAfter,,,,,,,,,,,,) = btcPair.pairVault();
         uint256 pairUsdcAfter = usdc.balanceOf(address(btcPair));
 
         // Bookkeeping credited the rounded amount, not the raw value (no sub-µUSDC over-credit).
@@ -537,7 +537,7 @@ contract BazaarPairTest is Test {
         btcPair.withdrawCollateral(withdrawAmount, emptyPriceUpdate, 0, 0, 0, "");
 
         // Verify remaining collateral
-        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, depositAmount - withdrawAmount);
 
         // Verify USDC returned to user
@@ -557,11 +557,11 @@ contract BazaarPairTest is Test {
         btcPair.withdrawCollateral(depositAmount, emptyPriceUpdate, 0, 0, 0, "");
 
         // Verify collateral is zero
-        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, 0);
 
         // Verify vault totalCollateralDeposited is zero
-        (,,,, uint256 totalCollateral,,,,,,,,,) = btcPair.pairVault();
+        (,,,, uint256 totalCollateral,,,,,,,,,,,,) = btcPair.pairVault();
         assertEq(totalCollateral, 0);
     }
 
@@ -594,7 +594,7 @@ contract BazaarPairTest is Test {
         btcPair.withdrawCollateral(withdrawAmount, new bytes[](0), nonce, deadline, relayerFeeAmount, sig);
 
         // Verify remaining collateral
-        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, depositAmount - withdrawAmount);
 
         // Verify user received withdrawal minus relayer fee
@@ -605,7 +605,7 @@ contract BazaarPairTest is Test {
         assertEq(usdc.balanceOf(user1), user1BalanceAfterSetup - depositUsdc + withdrawUsdc - relayerFeeUsdc);
 
         // The withheld fee accrued to the relayer's claimable balance; claiming pays it out
-        (uint256 owed,) = btcPair.claimableFees(relayer);
+        (uint256 owed,) = factory.lens().claimableFees(address(btcPair), relayer);
         assertEq(owed, relayerFeeAmount);
         vm.prank(relayer);
         btcPair.claimFees();
@@ -658,7 +658,7 @@ contract BazaarPairTest is Test {
         btcPair.withdrawCollateral(20 * BAZAAR_SCALE, emptyPriceUpdate, 0, 0, 0, "");
         vm.stopPrank();
 
-        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, 50 * BAZAAR_SCALE);
     }
 
@@ -716,14 +716,14 @@ contract BazaarPairTest is Test {
 
         _depositCollateral(btcPair, user1, depositAmount);
 
-        (,,,, uint256 totalBefore,,,,,,,,,) = btcPair.pairVault();
+        (,,,, uint256 totalBefore,,,,,,,,,,,,) = btcPair.pairVault();
         assertEq(totalBefore, depositAmount);
 
         bytes[] memory emptyPriceUpdate = new bytes[](0);
         vm.prank(user1);
         btcPair.withdrawCollateral(withdrawAmount, emptyPriceUpdate, 0, 0, 0, "");
 
-        (,,,, uint256 totalAfter,,,,,,,,,) = btcPair.pairVault();
+        (,,,, uint256 totalAfter,,,,,,,,,,,,) = btcPair.pairVault();
         assertEq(totalAfter, depositAmount - withdrawAmount);
     }
 
@@ -742,10 +742,10 @@ contract BazaarPairTest is Test {
         vm.prank(user2);
         aaplPair.withdrawCollateral(withdrawAmount, emptyPriceUpdate, 0, 0, 0, "");
 
-        (,,, uint256 btcCollateral,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 btcCollateral,,,) = btcPair.positionBuckets(user1);
         assertEq(btcCollateral, depositAmount - withdrawAmount);
 
-        (,,, uint256 aaplCollateral,,,,,) = aaplPair.positionBuckets(user2);
+        (,,, uint256 aaplCollateral,,,) = aaplPair.positionBuckets(user2);
         assertEq(aaplCollateral, depositAmount - withdrawAmount);
     }
 
@@ -764,9 +764,9 @@ contract BazaarPairTest is Test {
     // notional = size * price / BAZAAR_SCALE = 1e18 * 5e22 / 1e18 = 5e22
     uint256 constant POSITION_NOTIONAL = BTC_PRICE_USD * BAZAAR_SCALE; // 5e22
 
-    // pairVault starts at slot 7 (totalLongOI=7, totalShortOI=8, longWeightedEntrySum=9, shortWeightedEntrySum=10)
-    uint256 constant SLOT_PAIR_VAULT_TOTAL_LONG_OI = 5;
-    uint256 constant SLOT_PAIR_VAULT_LONG_WEIGHTED_ENTRY_SUM = 7;
+    // pairVault starts at slot 4 (totalLongOI=4, totalShortOI=5, longWeightedEntrySum=6, shortWeightedEntrySum=7)
+    uint256 constant SLOT_PAIR_VAULT_TOTAL_LONG_OI = 4;
+    uint256 constant SLOT_PAIR_VAULT_LONG_WEIGHTED_ENTRY_SUM = 6;
     uint256 constant SLOT_PAIR_VAULT_PENDING_LIQ_SIZE = SLOT_PAIR_VAULT_TOTAL_LONG_OI + 6;
     uint256 constant SLOT_PAIR_VAULT_PENDING_LIQ_ENTRY_NOTIONAL = SLOT_PAIR_VAULT_TOTAL_LONG_OI + 7;
     uint256 constant SLOT_PAIR_VAULT_PENDING_LIQ_BANKRUPTCY_NOTIONAL = SLOT_PAIR_VAULT_TOTAL_LONG_OI + 8;
@@ -811,10 +811,10 @@ contract BazaarPairTest is Test {
 
     // ==================== withdrawCollateral With Open Position Tests ====================
 
-    /// @dev isAdlPending is PACKED (slot 26, byte offset 20 — see `forge inspect BazaarPair
+    /// @dev isAdlPending is PACKED (slot 27, byte offset 20 — see `forge inspect BazaarPair
     ///      storage-layout`), which stdstore can't write; set the single byte via vm.store.
     function _setAdlPending(bool v) internal {
-        bytes32 slot = bytes32(uint256(26));
+        bytes32 slot = bytes32(uint256(27));
         bytes32 cur = vm.load(address(btcPair), slot);
         bytes32 mask = bytes32(uint256(0xff) << (20 * 8));
         vm.store(address(btcPair), slot, (cur & ~mask) | bytes32(uint256(v ? 1 : 0) << (20 * 8)));
@@ -846,7 +846,7 @@ contract BazaarPairTest is Test {
         // bankruptcy sits below entry by the collateral that was seized into the fund.
         vm.store(address(btcPair), bytes32(SLOT_PAIR_VAULT_PENDING_LIQ_ENTRY_NOTIONAL), bytes32(70_000 * BAZAAR_SCALE));
         vm.store(address(btcPair), bytes32(SLOT_PAIR_VAULT_PENDING_LIQ_IS_LONG), bytes32(uint256(1)));
-        (,,,,,, uint256 pendingLiqSize,,,,,,,) = btcPair.pairVault();
+        (,,,,,, uint256 pendingLiqSize,,,,,,,,,,) = btcPair.pairVault();
         assertEq(pendingLiqSize, POSITION_SIZE, "pendingLiq write landed");
     }
 
@@ -877,7 +877,7 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         btcPair.withdrawCollateral(1_000 * BAZAAR_SCALE, new bytes[](0), 0, 0, 0, "");
 
-        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, 4_000 * BAZAAR_SCALE, "flat withdrawal proceeds during ADL pending");
     }
 
@@ -940,7 +940,7 @@ contract BazaarPairTest is Test {
         btcPair.withdrawCollateral(withdrawAmount, priceUpdate, 0, 0, 0, "");
 
         // Collateral reduced by withdrawal amount
-        (,,, uint256 remaining,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 remaining,,,) = btcPair.positionBuckets(user1);
         assertEq(remaining, 11_000 * BAZAAR_SCALE);
 
         // USDC transferred back to user
@@ -950,7 +950,7 @@ contract BazaarPairTest is Test {
         assertEq(usdc.balanceOf(user1), user1BalanceAfterSetup - depositUsdc + withdrawUsdc);
 
         // Position still open
-        (, uint256 size,,,,,,,) = btcPair.positionBuckets(user1);
+        (, uint256 size,,,,,) = btcPair.positionBuckets(user1);
         assertEq(size, POSITION_SIZE);
     }
 
@@ -986,7 +986,7 @@ contract BazaarPairTest is Test {
     // storage-layout`: adding or resizing a state variable declared earlier in BazaarPair shifts
     // every slot below it. The helpers assert a public getter afterward where one exists, so a
     // stale slot fails loudly rather than silently writing an unrelated word.
-    uint256 constant SLOT_SCHEDULED_TERMINATION_TS = 30;
+    uint256 constant SLOT_SCHEDULED_TERMINATION_TS = 31;
 
     /// @dev Terminate the pair for real at `termPrice`: fix the price, settle `user`'s position at
     ///      it (a flat user settles nothing), and finalize. Every scenario using this is
@@ -1041,10 +1041,12 @@ contract BazaarPairTest is Test {
     /// @dev Per-pair probe watermark for _lastCreatedOrderId.
     mapping(address => uint256) internal _idProbe;
 
-    /// @dev The newest orderId a pair has assigned. Ids are a gapless monotonic counter from 1,
-    ///      so probing forward finds the last created order even when it is already terminal
-    ///      (a crossing or self-matching placement is filled/canceled in its own transaction,
-    ///      so the active-order set is no source).
+    /// @dev The newest orderId a pair has assigned. Ids are a monotonic counter from 1 with gaps
+    ///      only where amendOrders or a keeper arming a StopLimit drew queue positions, which
+    ///      these tests never do, so probing
+    ///      forward finds the last created order even when it is already terminal (a crossing or
+    ///      self-matching placement is filled/canceled in its own transaction, so the
+    ///      active-order set is no source).
     function _lastCreatedOrderId(BazaarPair p) internal returns (uint256) {
         uint256 w = _idProbe[address(p)];
         if (w == 0) w = 1;
@@ -1070,11 +1072,11 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         btcPair.withdrawCollateral(depositAmount, emptyPriceUpdate, 0, 0, 0, "");
 
-        (,,, uint256 remaining,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 remaining,,,) = btcPair.positionBuckets(user1);
         assertEq(remaining, 0);
 
         // Vault totalCollateralDeposited should be zero
-        (,,,, uint256 totalCollateral,,,,,,,,,) = btcPair.pairVault();
+        (,,,, uint256 totalCollateral,,,,,,,,,,,,) = btcPair.pairVault();
         assertEq(totalCollateral, 0);
     }
 
@@ -1089,14 +1091,14 @@ contract BazaarPairTest is Test {
         _terminateAt(btcPair, 40_000 * BAZAAR_SCALE, user1);
         uint256 expected = 5_000 * BAZAAR_SCALE - BazaarTypes.TERMINAL_SETTLEMENT_TIP;
 
-        (uint256 owed,) = btcPair.claimableFees(address(this));
+        (uint256 owed,) = factory.lens().claimableFees(address(btcPair), address(this));
         assertEq(owed, BazaarTypes.TERMINAL_SETTLEMENT_TIP, "settler tipped from the bucket");
 
         bytes[] memory emptyPriceUpdate = new bytes[](0);
         vm.prank(user1);
         btcPair.withdrawCollateral(expected, emptyPriceUpdate, 0, 0, 0, "");
 
-        (, uint256 size,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
+        (, uint256 size,, uint256 collateral,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, 0, "collateral less the loss and the tip, fully withdrawn");
         assertEq(size, 0, "position closed by settlement");
     }
@@ -1168,7 +1170,7 @@ contract BazaarPairTest is Test {
     }
 
     /// @dev Pins the accepting edge of the window: Pyth admits an update whose age equals the
-    ///      bound, so 2s old must still settle a direct withdrawal. Without this the reverting
+    ///      bound, so 3s old must still settle a direct withdrawal. Without this the reverting
     ///      cases above would also pass if the gate had collapsed to "only a same-second price".
     function testWithdrawCollateral_DirectCall_AcceptsPriceAtStalenessBound() public {
         // Deposit and open position
@@ -1176,12 +1178,12 @@ contract BazaarPairTest is Test {
         _simulateOpenPosition(user1);
 
         // Price published exactly MAX_PRICE_STALENESS ago — the oldest update still admissible
-        bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp - 2));
+        bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp - 3));
 
         vm.prank(user1);
         btcPair.withdrawCollateral(1_000 * BAZAAR_SCALE, priceUpdate, 0, 0, 0, "");
 
-        (,,, uint256 remaining,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 remaining,,,) = btcPair.positionBuckets(user1);
         assertEq(remaining, 14_000 * BAZAAR_SCALE);
     }
 
@@ -1207,11 +1209,11 @@ contract BazaarPairTest is Test {
         uint256 withdrawUsdc = withdrawAmount * USDC_SCALE / BAZAAR_SCALE;
         uint256 relayerFeeUsdc = relayerFeeAmount * USDC_SCALE / BAZAAR_SCALE;
         assertEq(usdc.balanceOf(user1), user1BalanceBefore + withdrawUsdc - relayerFeeUsdc);
-        (uint256 owed,) = btcPair.claimableFees(relayer);
+        (uint256 owed,) = factory.lens().claimableFees(address(btcPair), relayer);
         assertEq(owed, relayerFeeAmount);
 
         // Collateral reduced by full withdrawal amount (fee comes from the withdrawal, not collateral)
-        (,,, uint256 remaining,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 remaining,,,) = btcPair.positionBuckets(user1);
         assertEq(remaining, depositAmount - withdrawAmount);
     }
 
@@ -1233,7 +1235,7 @@ contract BazaarPairTest is Test {
         btcPair.withdrawCollateral(withdrawAmount, priceUpdate, 0, 0, 0, "");
 
         // Withdrawal succeeds — position still open
-        (, uint256 size,,,,,,,) = btcPair.positionBuckets(user1);
+        (, uint256 size,,,,,) = btcPair.positionBuckets(user1);
         assertEq(size, POSITION_SIZE);
     }
 
@@ -1265,7 +1267,7 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         btcPair.withdrawCollateral(500 * BAZAAR_SCALE, priceUpdate, 0, 0, 0, "");
 
-        (, uint256 size,,,,,,,) = btcPair.positionBuckets(user1);
+        (, uint256 size,,,,,) = btcPair.positionBuckets(user1);
         assertEq(size, POSITION_SIZE);
     }
 
@@ -1285,7 +1287,7 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         btcPair.withdrawCollateral(4_960 * BAZAAR_SCALE, priceUpdate, 0, 0, 0, "");
 
-        (, uint256 size,,,,,,,) = btcPair.positionBuckets(user1);
+        (, uint256 size,,,,,) = btcPair.positionBuckets(user1);
         assertEq(size, POSITION_SIZE);
     }
 
@@ -1353,7 +1355,7 @@ contract BazaarPairTest is Test {
         // Price triples to $600: unrealized profit (~$400) alone covers the IMR requirement.
         bytes[] memory priceUpdate = _createAaplPriceUpdateAtPrice(600, uint64(block.timestamp));
 
-        (uint256 imrBp, uint256 mmrBp,,,) = aaplPair.marginRequirements();
+        (uint256 imrBp, uint256 mmrBp,,) = aaplPair.marginRequirements();
         uint256 lowPrice = 600 * BAZAAR_SCALE - (600 * BAZAAR_SCALE / 1000); // long bracket: spot - 0.1% conf
         uint256 floorAmt = imrBp * lowPrice / 10_000; // 1-unit position: notional == lowPrice
         assertGt(floorAmt, mmrBp * lowPrice / 10_000, "imr floor strictly above the continuous pairs' mmr floor");
@@ -1370,7 +1372,7 @@ contract BazaarPairTest is Test {
         priceUpdate = _createAaplPriceUpdateAtPrice(600, uint64(block.timestamp));
         vm.prank(user2);
         aaplPair.withdrawCollateral(deposit - floorAmt, priceUpdate, 0, 0, 0, "");
-        (,,, uint256 remaining,,,,,) = aaplPair.positionBuckets(user2);
+        (,,, uint256 remaining,,,) = aaplPair.positionBuckets(user2);
         assertEq(remaining, floorAmt, "retains exactly initial margin in cash");
     }
 
@@ -1379,21 +1381,23 @@ contract BazaarPairTest is Test {
     function testWithdrawCollateral_NoPosition_WithLimitOrder_MarginReserved() public {
         // Deposit $15,000, no position, but place a limit buy order for 1 BTC at $50,000
         // Order notional = 1 * 50,000 = $50,000
-        // IMR required = 20% of $50,000 = $10,000
-        // Max withdraw = 15,000 - 10,000 = $5,000
+        // IMR required = 20% of $50,000 = $10,000, plus the maker fee the fill takes ahead of
+        // its margin test: $50,000 x MAKER_INSURANCE_FEE_EBP / EBP_SCALE = $2.50
+        // Max withdraw = 15,000 - 10,002.50 = $4,997.50
         _depositCollateral(btcPair, user1, 15_000 * BAZAAR_SCALE);
         _createLimitOrder(user1, USER1_PK, true, POSITION_SIZE, BTC_SPOT_PRICE);
+        uint256 fee = 50_000 * BAZAAR_SCALE * BazaarTypes.MAKER_INSURANCE_FEE_EBP / BazaarTypes.EBP_SCALE;
 
         bytes[] memory emptyPriceUpdate = new bytes[](0);
         vm.prank(user1);
-        btcPair.withdrawCollateral(5_000 * BAZAAR_SCALE, emptyPriceUpdate, 0, 0, 0, "");
+        btcPair.withdrawCollateral(5_000 * BAZAAR_SCALE - fee, emptyPriceUpdate, 0, 0, 0, "");
 
-        (,,, uint256 remaining,,,,,) = btcPair.positionBuckets(user1);
-        assertEq(remaining, 10_000 * BAZAAR_SCALE);
+        (,,, uint256 remaining,,,) = btcPair.positionBuckets(user1);
+        assertEq(remaining, 10_000 * BAZAAR_SCALE + fee);
 
         // Vault totalCollateralDeposited decreased by withdrawal
-        (,,,, uint256 totalCollateral,,,,,,,,,) = btcPair.pairVault();
-        assertEq(totalCollateral, 10_000 * BAZAAR_SCALE);
+        (,,,, uint256 totalCollateral,,,,,,,,,,,,) = btcPair.pairVault();
+        assertEq(totalCollateral, 10_000 * BAZAAR_SCALE + fee);
     }
 
     function testWithdrawCollateral_NoPosition_WithLimitOrder_RevertsInsufficientMargin() public {
@@ -1424,7 +1428,7 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         btcPair.withdrawCollateral(4_000 * BAZAAR_SCALE, priceUpdate, 0, 0, 0, "");
 
-        (, uint256 size,,,,,,,) = btcPair.positionBuckets(user1);
+        (, uint256 size,,,,,) = btcPair.positionBuckets(user1);
         assertEq(size, POSITION_SIZE);
     }
 
@@ -1457,11 +1461,11 @@ contract BazaarPairTest is Test {
         vm.prank(user1);
         btcPair.withdrawCollateral(15_000 * BAZAAR_SCALE, emptyPriceUpdate, 0, 0, 0, "");
 
-        (,,, uint256 remaining,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 remaining,,,) = btcPair.positionBuckets(user1);
         assertEq(remaining, 0);
 
         // Vault totalCollateralDeposited should be zero
-        (,,,, uint256 totalCollateral,,,,,,,,,) = btcPair.pairVault();
+        (,,,, uint256 totalCollateral,,,,,,,,,,,,) = btcPair.pairVault();
         assertEq(totalCollateral, 0);
     }
 
@@ -1565,7 +1569,10 @@ contract BazaarPairTest is Test {
                 canceledBlock: 0,
                 filledBlock: 0,
                 expiryBlock: expiry,
-                creationBlock: uint64(block.number)
+                prioritySeq: 1,
+                tif: BazaarTypes.TimeInForce.GTC,
+                integrator: address(0),
+                cancelReason: BazaarTypes.CancelReason.None
             })
         );
 
@@ -1603,7 +1610,7 @@ contract BazaarPairTest is Test {
         assertTrue(isLong);
 
         // Verify tracked in userActiveLimitOrders
-        (uint256[] memory activeOrders, uint256 count,,) = btcPair.getUserActiveLimitOrders(user1);
+        (uint256[] memory activeOrders, uint256 count,,) = factory.lens().getUserActiveLimitOrders(address(btcPair), user1);
         assertEq(count, 1);
         assertEq(activeOrders[0], 1);
     }
@@ -1738,7 +1745,7 @@ contract BazaarPairTest is Test {
         BazaarTypes.Order memory o = OrderView.order(btcPair, 1);
         (uint256 tp, uint256 filledSize, BazaarTypes.OrderType ot) = (o.triggerPrice, o.filledSize, o.orderType);
         (uint64 creationBlock, uint64 expiryBlock, uint64 canceledBlock) =
-            (o.creationBlock, o.expiryBlock, o.canceledBlock);
+            (uint64(block.number), o.expiryBlock, o.canceledBlock);
         assertTrue(ot == BazaarTypes.OrderType.Market);
         assertEq(tp, BTC_SPOT_PRICE); // triggerPrice set to current price
         assertEq(expiryBlock, creationBlock); // never outlives its own transaction
@@ -2282,8 +2289,8 @@ contract BazaarPairTest is Test {
         _depositCollateral(btcPair, user1, 15_000 * BAZAAR_SCALE);
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
 
-        // Expiration less than MIN_ORDER_LIFETIME_BLOCKS (12) from current block
-        uint64 tooSoonExpiration = uint64(block.number + 2);
+        // One block short of MIN_ORDER_LIFETIME_BLOCKS from the current block.
+        uint64 tooSoonExpiration = uint64(block.number) + BazaarTypes.MIN_ORDER_LIFETIME_BLOCKS - 1;
 
         vm.prank(user1);
         vm.expectRevert(
@@ -2345,7 +2352,7 @@ contract BazaarPairTest is Test {
         );
 
         BazaarTypes.Order memory o = OrderView.order(btcPair, 1);
-        (uint64 creationBlock, uint64 expiryBlock) = (o.creationBlock, o.expiryBlock);
+        (uint64 creationBlock, uint64 expiryBlock) = (uint64(block.number), o.expiryBlock);
         assertEq(expiryBlock, creationBlock + 365 * 24 * 60 * 60 * 4); // MAX_ORDER_LIFETIME_BLOCKS
     }
 
@@ -2487,7 +2494,7 @@ contract BazaarPairTest is Test {
         assertEq(msBp, tpSlippage);
 
         // Bucket links to TP order
-        (,,,,, uint256 tpOrderId,,,) = btcPair.positionBuckets(user1);
+        (,,,,, uint256 tpOrderId,) = btcPair.positionBuckets(user1);
         assertEq(tpOrderId, 1);
     }
 
@@ -2584,7 +2591,7 @@ contract BazaarPairTest is Test {
             ""
         );
 
-        (,,,,, uint256 tpOrderId,,,) = btcPair.positionBuckets(user1);
+        (,,,,, uint256 tpOrderId,) = btcPair.positionBuckets(user1);
         assertEq(tpOrderId, 1, "oversized TP armed");
         uint256 storedSize = OrderView.order(btcPair, 1).size;
         assertEq(storedSize, 2 * POSITION_SIZE, "size stored as written; the cap applies at fire time");
@@ -2619,7 +2626,7 @@ contract BazaarPairTest is Test {
                     triggerPrice: ot == BazaarTypes.OrderType.Market ? 0 : 45_000 * BAZAAR_SCALE,
                     limitPrice: isStopLimit ? 44_000 * BAZAAR_SCALE : 0,
                     maxSlippageBp: isStopLimit ? 0 : 500,
-                    expirationBlock: isStopLimit ? uint64(block.number + 100) : 0,
+                    expirationBlock: isStopLimit ? uint64(block.number + 500_000) : 0,
                     integrator: address(0)
                 }),
                 BazaarTypes.MatchHints(0, 0, 0, 0, 0),
@@ -2664,7 +2671,7 @@ contract BazaarPairTest is Test {
             ""
         );
 
-        (,,,,, uint256 tpOrderId,,,) = btcPair.positionBuckets(user1);
+        (,,,,, uint256 tpOrderId,) = btcPair.positionBuckets(user1);
         assertEq(tpOrderId, 1, "max-size TP armed");
         uint256 storedSize = OrderView.order(btcPair, 1).size;
         // The close-everything idiom is stored as the field's maximum. Any size at or above the
@@ -2702,7 +2709,7 @@ contract BazaarPairTest is Test {
             ""
         );
 
-        (,,,,,, uint256 slOrderId,,) = btcPair.positionBuckets(user1);
+        (,,,,,, uint256 slOrderId) = btcPair.positionBuckets(user1);
         assertEq(slOrderId, 1, "max-size SL armed");
     }
 
@@ -2801,7 +2808,7 @@ contract BazaarPairTest is Test {
         );
 
         // Both orders tracked
-        (uint256[] memory activeOrders, uint256 count,,) = btcPair.getUserActiveLimitOrders(user1);
+        (uint256[] memory activeOrders, uint256 count,,) = factory.lens().getUserActiveLimitOrders(address(btcPair), user1);
         assertEq(count, 2);
     }
 
@@ -2899,11 +2906,11 @@ contract BazaarPairTest is Test {
         assertEq(creator, user1);
 
         // Collateral is untouched: the fee never routes through the bucket.
-        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, 15_000 * BAZAAR_SCALE);
 
         // The fee accrued to the relayer, and it came from the user's wallet.
-        (uint256 owed,) = btcPair.claimableFees(relayer);
+        (uint256 owed,) = factory.lens().claimableFees(address(btcPair), relayer);
         assertEq(owed, relayerFeeAmount);
         assertEq(usdc.balanceOf(user1), user1UsdcBefore - relayerFeeUsdc);
 
@@ -2972,9 +2979,9 @@ contract BazaarPairTest is Test {
         );
 
         // Nothing moved: no order, whole bucket, nothing owed to the relayer.
-        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, 15_000 * BAZAAR_SCALE);
-        (uint256 owed,) = btcPair.claimableFees(relayer);
+        (uint256 owed,) = factory.lens().claimableFees(address(btcPair), relayer);
         assertEq(owed, 0);
     }
 
@@ -3110,9 +3117,9 @@ contract BazaarPairTest is Test {
         assertEq(creator, user1);
         assertEq(canceledBlock, 0);
 
-        // Read original creationBlock + expiryBlock from storage so the assertion is exact
+        // Read the stored expiryBlock so the assertion is exact
         BazaarTypes.Order memory os = OrderView.order(btcPair, orderId);
-        (uint64 creationBlockStored, uint64 expiryBlockStored) = (os.creationBlock, os.expiryBlock);
+        uint64 expiryBlockStored = os.expiryBlock;
 
         // Cancel it
         uint256[] memory ids = new uint256[](1);
@@ -3136,7 +3143,10 @@ contract BazaarPairTest is Test {
                 canceledBlock: uint64(block.number),
                 filledBlock: 0,
                 expiryBlock: expiryBlockStored,
-                creationBlock: creationBlockStored
+                prioritySeq: uint64(orderId),
+                tif: BazaarTypes.TimeInForce.GTC,
+                integrator: address(0),
+                cancelReason: BazaarTypes.CancelReason.Owner
             })
         );
 
@@ -3174,7 +3184,7 @@ contract BazaarPairTest is Test {
         uint256 orderId = _createLimitOrder(user1, USER1_PK, true, POSITION_SIZE, BTC_SPOT_PRICE);
 
         // Verify order is in active set
-        (uint256[] memory activeBefore, uint256 countBefore,,) = btcPair.getUserActiveLimitOrders(user1);
+        (uint256[] memory activeBefore, uint256 countBefore,,) = factory.lens().getUserActiveLimitOrders(address(btcPair), user1);
         assertEq(countBefore, 1);
         assertEq(activeBefore[0], orderId);
 
@@ -3185,7 +3195,7 @@ contract BazaarPairTest is Test {
         btcPair.cancelOrders(ids, 0, 0, 0, "", "");
 
         // Verify removed from active set
-        (, uint256 countAfter,,) = btcPair.getUserActiveLimitOrders(user1);
+        (, uint256 countAfter,,) = factory.lens().getUserActiveLimitOrders(address(btcPair), user1);
         assertEq(countAfter, 0);
     }
 
@@ -3258,10 +3268,10 @@ contract BazaarPairTest is Test {
         assertTrue(canceledBlock != 0);
 
         // The fee accrued to the relayer from the user's wallet; collateral is untouched.
-        (uint256 owed,) = btcPair.claimableFees(relayer);
+        (uint256 owed,) = factory.lens().claimableFees(address(btcPair), relayer);
         assertEq(owed, relayerFee);
         assertEq(user1BalBefore - usdc.balanceOf(user1), relayerFeeUsdc);
-        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, 15_000 * BAZAAR_SCALE);
     }
 
@@ -3293,7 +3303,7 @@ contract BazaarPairTest is Test {
         );
         btcPair.cancelOrders(ids, nonce, deadline, relayerFee, sig, "");
 
-        (,,, uint256 collateral,,,,,) = btcPair.positionBuckets(user1);
+        (,,, uint256 collateral,,,) = btcPair.positionBuckets(user1);
         assertEq(collateral, deposit);
         assertEq(OrderView.order(btcPair, orderId).canceledBlock, 0);
     }
@@ -3357,7 +3367,7 @@ contract BazaarPairTest is Test {
         );
 
         // Verify TP order ID set on bucket
-        (,,,,, uint256 tpBefore,,,) = btcPair.positionBuckets(user1);
+        (,,,,, uint256 tpBefore,) = btcPair.positionBuckets(user1);
         assertTrue(tpBefore != 0);
 
         // Cancel TP
@@ -3367,7 +3377,7 @@ contract BazaarPairTest is Test {
         btcPair.cancelOrders(ids, 0, 0, 0, "", "");
 
         // Verify TP order ID cleared on bucket
-        (,,,,, uint256 tpAfter,,,) = btcPair.positionBuckets(user1);
+        (,,,,, uint256 tpAfter,) = btcPair.positionBuckets(user1);
         assertEq(tpAfter, 0);
     }
 
@@ -3402,7 +3412,7 @@ contract BazaarPairTest is Test {
         );
 
         // Verify SL order ID set on bucket
-        (,,,,,, uint256 slBefore,,) = btcPair.positionBuckets(user1);
+        (,,,,,, uint256 slBefore) = btcPair.positionBuckets(user1);
         assertTrue(slBefore != 0);
 
         // Cancel SL
@@ -3412,7 +3422,7 @@ contract BazaarPairTest is Test {
         btcPair.cancelOrders(ids, 0, 0, 0, "", "");
 
         // Verify SL order ID cleared on bucket
-        (,,,,,, uint256 slAfter,,) = btcPair.positionBuckets(user1);
+        (,,,,,, uint256 slAfter) = btcPair.positionBuckets(user1);
         assertEq(slAfter, 0);
     }
 
@@ -3547,7 +3557,7 @@ contract BazaarPairTest is Test {
             _createSmallLimitOrder(user1);
         }
 
-        (uint256[] memory ids,,,) = btcPair.getUserActiveLimitOrders(user1);
+        (uint256[] memory ids,,,) = factory.lens().getUserActiveLimitOrders(address(btcPair), user1);
         assertEq(ids.length, CAP);
     }
 
@@ -3630,7 +3640,7 @@ contract BazaarPairTest is Test {
         }
 
         // Cancel one to free a slot
-        (uint256[] memory ids,,,) = btcPair.getUserActiveLimitOrders(user1);
+        (uint256[] memory ids,,,) = factory.lens().getUserActiveLimitOrders(address(btcPair), user1);
         uint256[] memory toCancel = new uint256[](1);
         toCancel[0] = ids[0];
         vm.prank(user1);
@@ -3639,7 +3649,7 @@ contract BazaarPairTest is Test {
         // Should now succeed
         _createSmallLimitOrder(user1);
 
-        (uint256[] memory idsAfter,,,) = btcPair.getUserActiveLimitOrders(user1);
+        (uint256[] memory idsAfter,,,) = factory.lens().getUserActiveLimitOrders(address(btcPair), user1);
         assertEq(idsAfter.length, CAP);
     }
 
@@ -3648,7 +3658,7 @@ contract BazaarPairTest is Test {
 
         // Fill the cap with short-expiry orders
         bytes[] memory priceUpdate = _createBtcPriceUpdate(uint64(block.timestamp));
-        uint64 shortExpiry = uint64(block.number + 100);
+        uint64 shortExpiry = uint64(block.number) + BazaarTypes.MIN_ORDER_LIFETIME_BLOCKS;
         for (uint256 i = 0; i < CAP; i++) {
             // Hint built BEFORE the prank — its external book reads would consume it.
             BazaarTypes.MatchHints memory tailHint = BazaarTypes.MatchHints(_bidTail(), 0, 0, 0, 0);
@@ -3677,14 +3687,14 @@ contract BazaarPairTest is Test {
         }
 
         // Roll past expiry
-        vm.roll(block.number + 200);
+        vm.roll(block.number + BazaarTypes.MIN_ORDER_LIFETIME_BLOCKS + 1);
         vm.warp(block.timestamp + 60);
 
         // New order succeeds — BazaarPair._cleanupExpiredLimitOrders prunes
         // expired entries from the active set before the cap check fires
         _createSmallLimitOrder(user1);
 
-        (uint256[] memory idsAfter,,,) = btcPair.getUserActiveLimitOrders(user1);
+        (uint256[] memory idsAfter,,,) = factory.lens().getUserActiveLimitOrders(address(btcPair), user1);
         assertEq(idsAfter.length, 1, "only the new live order should remain");
     }
 
@@ -3700,7 +3710,7 @@ contract BazaarPairTest is Test {
         // user2 unaffected
         _createSmallLimitOrder(user2);
 
-        (uint256[] memory u2,,,) = btcPair.getUserActiveLimitOrders(user2);
+        (uint256[] memory u2,,,) = factory.lens().getUserActiveLimitOrders(address(btcPair), user2);
         assertEq(u2.length, 1);
     }
 
@@ -3716,7 +3726,7 @@ contract BazaarPairTest is Test {
         _createMarketOrder(user1, true, BAZAAR_SCALE / 1000, 100);
         _createMarketOrder(user1, true, BAZAAR_SCALE / 1000, 100);
 
-        (uint256[] memory ids,,,) = btcPair.getUserActiveLimitOrders(user1);
+        (uint256[] memory ids,,,) = factory.lens().getUserActiveLimitOrders(address(btcPair), user1);
         assertEq(ids.length, CAP, "market orders never enter the active-limit set");
     }
 
@@ -3748,7 +3758,10 @@ contract BazaarPairTest is Test {
                 canceledBlock: 0,
                 filledBlock: 0,
                 expiryBlock: uint64(block.number),
-                creationBlock: uint64(block.number)
+                prioritySeq: 1,
+                tif: BazaarTypes.TimeInForce.GTC,
+                integrator: address(0),
+                cancelReason: BazaarTypes.CancelReason.None
             })
         );
 
@@ -3803,7 +3816,10 @@ contract BazaarPairTest is Test {
                 canceledBlock: 0,
                 filledBlock: 0,
                 expiryBlock: expiry,
-                creationBlock: uint64(block.number)
+                prioritySeq: 1,
+                tif: BazaarTypes.TimeInForce.GTC,
+                integrator: address(0),
+                cancelReason: BazaarTypes.CancelReason.None
             })
         );
 
@@ -3859,7 +3875,10 @@ contract BazaarPairTest is Test {
                 canceledBlock: 0,
                 filledBlock: 0,
                 expiryBlock: type(uint64).max, // NEVER_EXPIRE_BLOCK
-                creationBlock: uint64(block.number)
+                prioritySeq: 1,
+                tif: BazaarTypes.TimeInForce.GTC,
+                integrator: address(0),
+                cancelReason: BazaarTypes.CancelReason.None
             })
         );
 
@@ -3920,7 +3939,7 @@ contract BazaarPairTest is Test {
         );
 
         // Pre-cancel: bucket has takeProfitOrderId set
-        (,,,,, uint256 tpBefore,,,) = btcPair.positionBuckets(user1);
+        (,,,,, uint256 tpBefore,) = btcPair.positionBuckets(user1);
         assertEq(tpBefore, 1);
 
         uint256[] memory ids = new uint256[](1);
@@ -3944,7 +3963,10 @@ contract BazaarPairTest is Test {
                 canceledBlock: uint64(block.number),
                 filledBlock: 0,
                 expiryBlock: type(uint64).max,
-                creationBlock: uint64(block.number)
+                prioritySeq: 1,
+                tif: BazaarTypes.TimeInForce.GTC,
+                integrator: address(0),
+                cancelReason: BazaarTypes.CancelReason.Owner
             })
         );
 
@@ -3952,7 +3974,7 @@ contract BazaarPairTest is Test {
         btcPair.cancelOrders(ids, 0, 0, 0, "", "");
 
         // Post-cancel: bucket pointer cleared
-        (,,,,, uint256 tpAfter,,,) = btcPair.positionBuckets(user1);
+        (,,,,, uint256 tpAfter,) = btcPair.positionBuckets(user1);
         assertEq(tpAfter, 0);
     }
 
@@ -3966,7 +3988,7 @@ contract BazaarPairTest is Test {
 
         // Fresh deposit: pre-state is all zero, post-state has collateral set.
         // The IMR/MMR fields come from the pair's marginRequirements at emit time.
-        (uint256 imrBp, uint256 mmrBp,,,) = btcPair.marginRequirements();
+        (uint256 imrBp, uint256 mmrBp,,) = btcPair.marginRequirements();
 
         vm.expectEmit(true, true, true, true, address(btcPair));
         emit BazaarTypes.PositionBucketUpdated(
@@ -3979,8 +4001,7 @@ contract BazaarPairTest is Test {
             0, // entryFundingIndex
             0, // globalFundingIndex (currentFundingIndex)
             imrBp,
-            mmrBp,
-            0 // entryMmrBp
+            mmrBp
         );
 
         vm.prank(user1);
@@ -3992,11 +4013,11 @@ contract BazaarPairTest is Test {
         uint256 withdrawAmount = 400 * BAZAAR_SCALE;
         _depositCollateral(btcPair, user1, depositAmount);
 
-        (uint256 imrBp, uint256 mmrBp,,,) = btcPair.marginRequirements();
+        (uint256 imrBp, uint256 mmrBp,,) = btcPair.marginRequirements();
 
         vm.expectEmit(true, true, true, true, address(btcPair));
         emit BazaarTypes.PositionBucketUpdated(
-            btcPair.pairId(), user1, false, 0, 0, depositAmount - withdrawAmount, 0, 0, imrBp, mmrBp, 0
+            btcPair.pairId(), user1, false, 0, 0, depositAmount - withdrawAmount, 0, 0, imrBp, mmrBp
         );
 
         bytes[] memory emptyPriceUpdate = new bytes[](0);

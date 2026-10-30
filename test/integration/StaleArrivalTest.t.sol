@@ -27,10 +27,10 @@ contract StaleArrivalTest is IntegrationBase {
     /// @dev Store a fresh AAPL price so the pair has a stale-fallback reference, then step past
     ///      MAX_PRICE_STALENESS so subsequent empty-update calls run on the fallback.
     function _seedPriceThenGoStale(uint256 priceUsd) internal {
-        vm.warp(vm.getBlockTimestamp() + 3);
+        vm.warp(vm.getBlockTimestamp() + 4);
         bytes[] memory pu = _priceUpdateFor(AAPL_USD_FEED_ID, priceUsd, uint64(vm.getBlockTimestamp()));
         aaplPair.refreshPrice{value: 0}(pu);
-        vm.warp(vm.getBlockTimestamp() + 60); // well past the 2s freshness bound
+        vm.warp(vm.getBlockTimestamp() + 60); // well past the 3s freshness bound
     }
 
     /// @dev Place an AAPL limit with NO price update — consumes the stale fallback.
@@ -82,7 +82,7 @@ contract StaleArrivalTest is IntegrationBase {
 
         assertEq(_aaplFilled(bid), 2 * SHARE, "in-band crossing fills while stale");
         assertEq(_aaplFilled(ask), 2 * SHARE);
-        (, uint256 sz, uint256 entry,,,,,,) = aaplPair.positionBuckets(alice);
+        (, uint256 sz, uint256 entry,,,,) = aaplPair.positionBuckets(alice);
         assertEq(sz, 2 * SHARE);
         assertEq(entry, 2 * 202 * BAZAAR_SCALE, "filled at the maker's price");
     }
@@ -168,7 +168,7 @@ contract StaleArrivalTest is IntegrationBase {
 
         // ...and once a fresh print arrives, the band is gone: an arrival crosses it normally
         // (margin is checked at the fresh price; the fill stays at the maker's price).
-        vm.warp(vm.getBlockTimestamp() + 3);
+        vm.warp(vm.getBlockTimestamp() + 4);
         bytes[] memory pu = _priceUpdateFor(AAPL_USD_FEED_ID, 175, uint64(vm.getBlockTimestamp()));
         BazaarTypes.OrderSpec memory s;
         s.orderType = BazaarTypes.OrderType.Limit;

@@ -2,6 +2,7 @@
 cache/
 out/
 artifacts/
+abi/
 
 # Node
 node_modules/

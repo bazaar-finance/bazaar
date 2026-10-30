@@ -20,8 +20,9 @@ Reports are triaged on a best-effort basis by a small team. No response time is 
 - **There is no bug-bounty program at this stage.** Valid findings are credited to the reporter in
   the published advisory. A retroactive reward may be considered for significant findings once the
   project is funded, but none is promised or guaranteed.
-- The contracts do carry an on-chain white-hat budget: 1% of every fee stream is skimmed to a
-  bug-bounty address fixed at factory deployment (`BUG_BOUNTY_TAX_BP`). Nothing has accrued and
+- The contracts do carry an on-chain white-hat budget: 1% of every fill's insurance and
+  integrator fees is skimmed to a bug-bounty address fixed at factory deployment
+  (`BUG_BOUNTY_TAX_BP`). Nothing has accrued and
   nothing can be paid from it — the protocol is not deployed and charges no fees. Treat it as
   future funding for a program that does not exist yet, not as a bounty you are reporting into.
 - Please give us a reasonable window to publish an advisory before disclosing publicly. Nothing is
@@ -31,11 +32,12 @@ Reports are triaged on a best-effort basis by a small team. No response time is 
 
 **In scope** — the protocol source and the tooling that deploys it:
 
-- `src/` — pair, factory, sequencer, oracle, terminator, lens, and all libraries
+- `src/` — pair, factory, oracle, terminator, lens, and all libraries
 - `script/` — deployment scripts and network configuration
-- The documented protocol invariants: zero-sum accounting, solvency and margin math, the matching
-  engine's three passes, funding accrual, liquidation and ADL pricing, the insurance waterfall, the
-  termination and settlement paths, listing gating, and the sequencer fraud proofs
+- The documented protocol invariants: zero-sum accounting, solvency and margin math, arrival
+  matching (price-time priority, fill pricing and the per-fill margin checks), funding accrual,
+  liquidation and ADL pricing, the insurance waterfall, the termination and settlement paths, and
+  listing gating
 
 **Out of scope:**
 
@@ -57,18 +59,21 @@ Read this before reporting; it rules out a class of findings that do not apply h
 - **One governed parameter**, and it is the loudest one: the UMA identifier that assertions are
   adjudicated under. It moves only through a bonded assertion (at least $5,000,
   `IDENTIFIER_UPGRADE_BOND_USDC`), a 2-day dispute window (`IDENTIFIER_UPGRADE_LIVENESS`), a
-  whitelist re-check, and a 14-day activation timelock (`IDENTIFIER_UPGRADE_TIMELOCK`) users can
+  whitelist re-check, and a 12-day activation timelock (`IDENTIFIER_UPGRADE_TIMELOCK`) users can
   exit during. While the identifier is off UMA's live whitelist, listings and UMA terminations fail
   closed rather than entering an undisputable pipeline. `BazaarFactory.umaIdentifierIsLive()` is the
   one-call monitoring endpoint.
-- **Sequencer misconduct is bounded, not prevented.** Bonds, volume caps, and
-  [fraud proofs][sequencers] are designed to make censorship and stale-flag abuse provable and
-  unprofitable — not impossible. A report showing misconduct that is *profitable* or *unprovable*
-  is squarely in scope.
-- **Accounting is tamper-evident.** The insurance and deposits ledgers are reconciled against the
-  actual USDC balance (0.1% tolerance, `USDC_BALANCE_TOLERANCE_BP`) on every major state-changing
-  flow — matching, liquidations, ADL, and exposure-bearing withdrawals. A mismatch freezes the
-  market into pro-rata emergency withdrawal rather than letting anyone race the exit.
+- **Matching fairness is structural, not promised.** The order book lives on-chain, sorted, and
+  [matching happens on arrival][matching]: price-time priority and every fill price are enforced
+  by the contract itself, with no trusted matcher to censor, front-run, or misprice anyone. A
+  report showing an order filled out of priority, or at a price the book did not offer, is
+  squarely in scope.
+- **Accounting is tamper-evident.** The insurance and deposits ledgers plus the unclaimed fee
+  escrow are reconciled against the actual USDC balance (0.1% tolerance,
+  `USDC_BALANCE_TOLERANCE_BP`) on every major state-changing flow — matching, liquidations, ADL,
+  price refreshes, insurance redemptions and withdrawals. A mismatch fixes the settlement price
+  and freezes the market, and finalize pays principal pro-rata on the cash actually held rather
+  than letting anyone race the exit.
 - **Unaudited.** This codebase has not undergone a professional audit. Assume undiscovered bugs.
 
 Full posture and testing detail: [Security & Status][security] in the book.
@@ -83,5 +88,5 @@ nothing older to support.
 | `master` | ✅        |
 
 [termination]: https://docs.bazaar.finance/protocol/termination.html
-[sequencers]: https://docs.bazaar.finance/protocol/sequencers.html
+[matching]: https://docs.bazaar.finance/protocol/matching.html
 [security]: https://docs.bazaar.finance/security.html

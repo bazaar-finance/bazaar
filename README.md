@@ -4,7 +4,7 @@
 
 Bazaar is a USDC-margined perpetual-futures protocol built for Arbitrum. Any asset with a [Pyth](https://pyth.network) price feed — crypto, equities, FX, indices — can be listed permissionlessly through an [UMA Optimistic Oracle](https://uma.xyz) assertion and traded on an on-chain central limit order book. The book is **fully on-chain and sorted**, and orders match **on arrival**, inside their own creation transaction — price-time priority and fill prices are enforced by the contract itself, with no trusted matcher anywhere in the fill path.
 
-The protocol is immutable: no owner, no pauser, no upgradeable proxies, no governance token. Every privileged action is either fully permissionless, economically bonded, or adjudicated by UMA's optimistic oracle. The single governed parameter — the UMA identifier those assertions are adjudicated under — moves only through a $5,000-bonded assertion, a 2-day public dispute window, and a 14-day activation timelock.
+The protocol is immutable: no owner, no pauser, no upgradeable proxies, no governance token. Every privileged action is either fully permissionless, economically bonded, or adjudicated by UMA's optimistic oracle. The single governed parameter — the UMA identifier those assertions are adjudicated under — moves only through a bonded assertion (at least $5,000), a 2-day public dispute window, and a 12-day activation timelock.
 
 > ⚠️ **Status: pre-audit, work in progress — not yet deployed.** There is no official deployment on any network; do not use with real funds.
 
@@ -39,7 +39,7 @@ src/
 ├── BazaarPairTerminator.sol    # Wind-down paths
 ├── BazaarPairLens.sol          # Read-only views
 ├── interfaces/
-└── libraries/                  # ten DELEGATECALL externals, then inlined helpers
+└── libraries/                  # twelve DELEGATECALL externals, then inlined helpers
     ├── MatchingEngineLib.sol   # Arrival matching: the walk, insertion, unload
     ├── OrderManagementLib.sol  # Order creation/cancel/cleanup
     ├── CollateralLib.sol       # Deposits/withdrawals incl. terminal modes
@@ -50,18 +50,19 @@ src/
     ├── FundingLib.sol          # Mark EMA + funding index
     ├── TerminationLib.sol      # Settlement waterfall
     ├── MetaTxLib.sol           # EIP-712 meta-transactions
+    ├── VaultHealthLib.sol      # ADL/termination triggers
+    ├── ClaimTextLib.sol        # Static UMA claim text (factory + terminator)
     ├── OrderBookLib.sol        # Sorted doubly-linked book lists (insert/unlink)
     ├── BucketLib.sol           # Position solvency math
-    ├── VaultHealthLib.sol      # ADL/termination triggers
     ├── MmrSampleLib.sol        # 24h-lagged MMR ring buffer
     ├── FeeEscrowLib.sol        # Claimable-balance escrow behind every payout
     ├── BazaarMathLib.sol       # Fixed-point + effective-price helpers
     └── BazaarTypes.sol         # Structs, enums, protocol constants
 script/                         # DeployLibraries + DeployBazaar + network config
 test/
-├── unit/                       # 25 test files: per-library and per-mechanism
-├── integration/                # 38 test files: end-to-end, incl. zero-sum invariant
-├── mocks/                      # Pyth, USDC, UMA OOv3
+├── unit/                       # Per-library and per-mechanism suites
+├── integration/                # End-to-end suites, incl. the zero-sum invariant
+├── mocks/                      # ArbSys, USDC, UMA OOv3 (MockPyth comes from the Pyth SDK)
 └── *.sol                       # Shared harness helpers (storage probes, Pyth seeding)
 ```
 

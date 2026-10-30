@@ -7,7 +7,7 @@ interface IBucketRead {
     function positionBuckets(address user)
         external
         view
-        returns (bool, uint128, uint128, uint128, int256, uint64, uint64, uint32, uint64);
+        returns (bool, uint128, uint128, uint128, int256, uint64, uint64);
 }
 
 /// @title BucketStore
@@ -23,7 +23,7 @@ interface IBucketRead {
 ///        base+0: isLong (bit 0) | size (bits 8..135)
 ///        base+1: entryValue (bits 0..127) | collateral (bits 128..255)
 ///        base+2: entryFundingIndex (full slot)
-///        base+3: takeProfitOrderId | stopLossOrderId | entryMmrBp | mmrUpdateTs
+///        base+3: takeProfitOrderId | stopLossOrderId
 library BucketStore {
     Vm private constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
 
@@ -39,7 +39,7 @@ library BucketStore {
             bytes32 slot = bytes32(uint256(base) + 2);
             bytes32 prev = vm.load(pair, slot);
             vm.store(pair, slot, bytes32(uint256(sentinel)));
-            (,,,, int256 got,,,,) = IBucketRead(pair).positionBuckets(user);
+            (,,,, int256 got,,) = IBucketRead(pair).positionBuckets(user);
             vm.store(pair, slot, prev);
             if (got == sentinel) return base;
         }

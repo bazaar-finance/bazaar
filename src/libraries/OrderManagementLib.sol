@@ -4,8 +4,12 @@ pragma solidity 0.8.34;
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {BazaarTypes} from "./BazaarTypes.sol";
 import {BucketLib} from "./BucketLib.sol";
+import {CollateralLib} from "./CollateralLib.sol";
+import {FeeEscrowLib} from "./FeeEscrowLib.sol";
 import {OrderBookLib} from "./OrderBookLib.sol";
 
 /// @title OrderManagementLib
@@ -13,6 +17,7 @@ import {OrderBookLib} from "./OrderBookLib.sol";
 ///         Runs via DELEGATECALL from BazaarPair — has direct storage access.
 library OrderManagementLib {
     using EnumerableSet for EnumerableSet.UintSet;
+    using SafeERC20 for IERC20;
 
     // -------------------- Constants --------------------
 
@@ -44,20 +49,39 @@ library OrderManagementLib {
     error OrderManagementLib__TpSlMustBeOppositeDirection();
     error OrderManagementLib__TpSlOrderAlreadyExists();
     error OrderManagementLib__TooManyActiveLimitOrders();
+    error OrderManagementLib__BountyOnUntriggeredType();
+    error OrderManagementLib__BountyNotWholeUsdc(uint256 bounty);
+    /// @notice The batch is empty, not whole triples, longer than MAX_AMENDS_PER_CALL, or an id
+    ///         word carries bits above its two hint fields.
+    error OrderManagementLib__InvalidAmendBatch();
+    /// @notice Only a resting good-till-cancelled Limit order can be amended.
+    error OrderManagementLib__NotAmendable(uint256 orderId);
+    /// @notice The amended size would not exceed what the order has already filled.
+    error OrderManagementLib__AmendSizeNotAboveFilled(uint256 orderId);
+    /// @notice The amended price would cross the best resting order on the other side.
+    error OrderManagementLib__AmendWouldCross(uint256 orderId, uint256 limitPrice, uint256 oppositeBest);
+    /// @notice The amendment would move the order (a new price or a larger size) with less than
+    ///         MIN_ORDER_LIFETIME_BLOCKS left before its expiry block: `expiryBlock` is below
+    ///         `minExpiryBlock`, the current block plus that floor.
+    error OrderManagementLib__AmendTooCloseToExpiry(uint256 orderId, uint64 expiryBlock, uint64 minExpiryBlock);
 
     // -------------------- External Functions --------------------
 
     /// @notice Creates a new order and stores it in the orders mapping. Matching against the
     ///         book happens afterwards in MatchingEngineLib.executeArrival — this function only
-    ///         validates and records.
+    ///         validates and records. A trigger order's keeper bounty (the high 128 bits of
+    ///         `spec.triggerPrice`) is pulled from the creator's wallet here and held in the
+    ///         escrow against the order.
     /// @dev Expiry is absolute-block based: the caller supplies `spec.expirationBlock`, which for
-    ///      an order that can rest must satisfy currentBlock + MIN_ORDER_LIFETIME_BLOCKS <= exp
-    ///      <= currentBlock + MAX_ORDER_LIFETIME_BLOCKS. Types that never rest ignore the field —
-    ///      _resolveExpiryBlock carries the per-type rule.
+    ///      an order that can rest must be at least currentBlock + MIN_ORDER_LIFETIME_BLOCKS; a
+    ///      block past currentBlock + MAX_ORDER_LIFETIME_BLOCKS is clamped to that ceiling. An
+    ///      order that never rests — Market, and a Limit sent IOC or FOK — ignores the field, as
+    ///      does a TP/SL, which never expires; _resolveExpiryBlock carries the per-type rule.
     function createOrder(
         mapping(uint256 => BazaarTypes.Order) storage orders,
         mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
         mapping(address => EnumerableSet.UintSet) storage userActiveLimitOrders,
+        BazaarTypes.FeeEscrow storage feeEscrow,
         BazaarTypes.CreateOrderParams memory params,
         address caller
     ) external returns (uint256 newNextOrderId) {
@@ -70,14 +94,37 @@ library OrderManagementLib {
         // can never describe an order.
         if (spec.size == 0) revert OrderManagementLib__ZeroSize();
 
-        // Per-user caps: Limit + StopLimit share the userActiveLimitOrders set, capped at
-        // MAX_ACTIVE_LIMIT_ORDERS_PER_USER to bound both the exposure-tally iteration and a
-        // user's worst-case book footprint.
+        // The keeper bounty rides in the high half of the trigger price. It is escrowed from the
+        // wallet, never from bucket collateral: collateral backs an open position and leaves only
+        // through withdrawCollateral's solvency, retained-cash and IMR gates, and a payment
+        // debited from it — by an owner acting as their own keeper — would be a second exit that
+        // skips all three. A wallet pull touches neither the bucket nor the deposits ledger, so
+        // the bounty needs no margin gate and a stop on a thin account still pays its executor.
+        // Pulled here, ahead of the validation below, so a later revert unwinds it; every trigger
+        // type reaches the escrow, and any other type must leave the field clear so a mistaken
+        // amount cannot be pulled for an order that can never pay it out. The pull converts to
+        // USDC's six decimals, so the amount must be whole at that resolution or the escrow would
+        // record cash that was never received.
+        {
+            uint256 bounty = spec.triggerPrice >> 128;
+            if (bounty != 0) {
+                if (
+                    ot != BazaarTypes.OrderType.StopLimit && ot != BazaarTypes.OrderType.StopLoss
+                        && ot != BazaarTypes.OrderType.TakeProfit
+                ) revert OrderManagementLib__BountyOnUntriggeredType();
+                if (bounty % 1e12 != 0) revert OrderManagementLib__BountyNotWholeUsdc(bounty);
+                IERC20(params.usdc).safeTransferFrom(caller, address(this), bounty / 1e12);
+                FeeEscrowLib.escrowBounty(feeEscrow, params.pairId, params.nextOrderId, bounty);
+            }
+        }
+
+        // Per-user caps: the Limit and StopLimit orders that can rest share the
+        // userActiveLimitOrders set, capped at MAX_ACTIVE_LIMIT_ORDERS_PER_USER to bound both the
+        // exposure-tally iteration and a user's worst-case book footprint.
         // TP/SL are bounded to 1 each per position via takeProfitOrderId/stopLossOrderId.
-        // Market orders need no cap: they never rest and are terminal within their own tx. A
-        // fill-or-kill limit is exempt on exactly that ground — it never joins the set, so
-        // gating it on the set's occupancy would deny a user at the cap an order that cannot
-        // add to either quantity the cap bounds.
+        // An order that never rests — Market, and a Limit sent IOC or FOK — is terminal within
+        // its own transaction and never joins the set, so gating it on the set's occupancy would
+        // deny a user at the cap an order that cannot add to either quantity the cap bounds.
         if (_joinsActiveSet(ot, spec.tif)) {
             if (userActiveLimitOrders[caller].length() >= BazaarTypes.MAX_ACTIVE_LIMIT_ORDERS_PER_USER) {
                 revert OrderManagementLib__TooManyActiveLimitOrders();
@@ -104,7 +151,7 @@ library OrderManagementLib {
         }
 
         uint256 currentPrice = params.currentPrice;
-        uint256 orderTriggerPrice = spec.triggerPrice;
+        uint256 orderTriggerPrice = uint256(uint128(spec.triggerPrice)); // the bounty above it is not a price
         uint256 orderLimitPrice = spec.limitPrice;
         uint256 orderMaxSlippageBp = spec.maxSlippageBp;
 
@@ -133,7 +180,7 @@ library OrderManagementLib {
             orderLimitPrice = 0;
         } else if (ot == BazaarTypes.OrderType.StopLimit) {
             if (spec.isPostOnly) revert OrderManagementLib__PostOnlyNotAllowed();
-            if (spec.triggerPrice == 0) revert OrderManagementLib__ZeroTriggerPrice();
+            if (orderTriggerPrice == 0) revert OrderManagementLib__ZeroTriggerPrice();
             if (spec.limitPrice == 0) revert OrderManagementLib__ZeroLimitPrice();
             // The limit must be on the fillable side of the trigger. The trigger is evaluated
             // against a fresh oracle price (immediately at creation, or by executeTriggeredOrders
@@ -142,10 +189,10 @@ library OrderManagementLib {
             // triggered the limit is on the wrong side of the market, and whenever the limit
             // would be marketable the trigger is no longer met. Reject these dead configs at
             // creation rather than let them sit consuming exposure.
-            if (spec.isLong && spec.limitPrice < spec.triggerPrice) {
+            if (spec.isLong && spec.limitPrice < orderTriggerPrice) {
                 revert OrderManagementLib__StopLimitPriceOnWrongSide();
             }
-            if (!spec.isLong && spec.limitPrice > spec.triggerPrice) {
+            if (!spec.isLong && spec.limitPrice > orderTriggerPrice) {
                 revert OrderManagementLib__StopLimitPriceOnWrongSide();
             }
             orderMaxSlippageBp = 0;
@@ -154,14 +201,14 @@ library OrderManagementLib {
             // the oracle reaches it, so it carries a trigger and a slippage bound and no limit
             // price. A profit target that must fill at an exact price is a plain Limit order.
             if (spec.isPostOnly) revert OrderManagementLib__PostOnlyNotAllowed();
-            if (spec.triggerPrice == 0) revert OrderManagementLib__ZeroTriggerPrice();
+            if (orderTriggerPrice == 0) revert OrderManagementLib__ZeroTriggerPrice();
             if (spec.maxSlippageBp == 0 || spec.maxSlippageBp > MAX_SLIPPAGE_BP) {
                 revert OrderManagementLib__InvalidSlippage(spec.maxSlippageBp);
             }
             orderLimitPrice = 0;
         } else if (ot == BazaarTypes.OrderType.StopLoss) {
             if (spec.isPostOnly) revert OrderManagementLib__PostOnlyNotAllowed();
-            if (spec.triggerPrice == 0) revert OrderManagementLib__ZeroTriggerPrice();
+            if (orderTriggerPrice == 0) revert OrderManagementLib__ZeroTriggerPrice();
             if (spec.maxSlippageBp == 0 || spec.maxSlippageBp > MAX_SLIPPAGE_BP) {
                 revert OrderManagementLib__InvalidSlippage(spec.maxSlippageBp);
             }
@@ -204,8 +251,12 @@ library OrderManagementLib {
             // Full-close exemption: an opposite-direction order for exactly the whole position is
             // always creatable, even under the floor — otherwise a position whose notional drifted
             // below MIN_ORDER_AMOUNT could not be closed at market until price recovered. Partial
-            // reduces stay floored so sub-minimum residuals can't be minted deliberately. The
-            // comparison uses the capped size so an oversized TP/SL still reads as a full close.
+            // reduces stay floored like any other order. The floor bounds orders, not positions: a
+            // reduce sized just under the position, or a small partial fill of a resting order,
+            // still leaves a position below MIN_ORDER_AMOUNT, which is why the flat keeper payouts
+            // for such a position are limited to what it holds itself (LiquidationLib.flatReward,
+            // CollateralLib._paySettlementTip). The comparison uses the capped size so an
+            // oversized TP/SL still reads as a full close.
             BazaarTypes.PositionBucket storage closeBucket = positionBuckets[caller];
             bool isFullClose =
                 closeBucket.size > 0 && closeBucket.isLong != spec.isLong && sizeForMinCheck == closeBucket.size;
@@ -223,11 +274,13 @@ library OrderManagementLib {
             // gate values it at the then-current oracle, never at the fill price, so a bid below
             // the mark margined at its own limit would reserve less than any fill of it will
             // demand — the order would be creatable but only ever auto-cancelable at the gate.
-            // The limit leg of the max keeps asks above the mark reserved at their full crossing
-            // price.
+            // A bid is valued at the mark outright: above the mark, its excess over the mark is
+            // the loss the fill books, charged in full by the fill debit below, so valuing it at
+            // the limit as well would count that excess twice over. The limit leg of the max
+            // keeps asks above the mark reserved at their full crossing price.
             uint256 executionPrice;
             if (ot == BazaarTypes.OrderType.Limit) {
-                executionPrice = orderLimitPrice > currentPrice ? orderLimitPrice : currentPrice;
+                executionPrice = !spec.isLong && orderLimitPrice > currentPrice ? orderLimitPrice : currentPrice;
             } else if (ot == BazaarTypes.OrderType.Market) {
                 // Both sides margin at the upper slippage bound. The fill price is the maker's,
                 // so it isn't known here — maxSlippageBp only states how far from currentPrice
@@ -254,17 +307,24 @@ library OrderManagementLib {
                 }
             }
 
+            // The resting set, already swept by the pair, reserved against the mark as this order
+            // is (CollateralLib._restingReserve): its exposure per side and the fill gate's debit
+            // across it.
+            uint256 restingDebit;
             {
+                (uint256 longExposure, uint256 shortExposure, uint256 debit) = CollateralLib._restingReserve(
+                    userActiveLimitOrders[caller], orders, params.currentBlock, currentPrice
+                );
+                restingDebit = debit;
+
                 uint256 posNotional = newTotalNotional;
                 bool posIsLong = bucket.size == 0 ? spec.isLong : bucket.isLong;
                 if (bucket.size > 0 && bucket.isLong != spec.isLong && orderNotional > currentState.currentNotional) {
                     posIsLong = spec.isLong;
                 }
 
-                uint256 sameDirectionExposure =
-                    posIsLong ? params.outstandingLongOrderExposure : params.outstandingShortOrderExposure;
-                uint256 oppositeDirectionExposure =
-                    posIsLong ? params.outstandingShortOrderExposure : params.outstandingLongOrderExposure;
+                uint256 sameDirectionExposure = posIsLong ? longExposure : shortExposure;
+                uint256 oppositeDirectionExposure = posIsLong ? shortExposure : longExposure;
 
                 uint256 worstCaseExposure = posNotional + sameDirectionExposure;
                 uint256 worstCaseFlip =
@@ -273,7 +333,18 @@ library OrderManagementLib {
             }
 
             if (newTotalNotional > currentState.currentNotional || bucket.size == 0) {
-                uint256 requiredMargin = Math.mulDiv(params.marginReqs.imrBp, newTotalNotional, BazaarTypes.BP_SCALE);
+                // Initial margin on the worst-case notional, plus everything the fill gate debits
+                // from the same collateral before it tests that margin: for this order and every
+                // resting one, the loss a fill at the limit books against the mark and the maker
+                // fee (CollateralLib._fillDebitOf), and the held position's unrealized loss. An
+                // order that gate would refuse is refused here rather than resting until a fill
+                // auto-cancels it.
+                uint256 requiredMargin = Math.mulDiv(params.marginReqs.imrBp, newTotalNotional, BazaarTypes.BP_SCALE)
+                    + restingDebit
+                    + CollateralLib._fillDebitOf(
+                        ot, spec.isLong, spec.size, orderLimitPrice, orderTriggerPrice, currentPrice, spec.integrator
+                    );
+                if (currentState.totalPnl < 0) requiredMargin += uint256(-currentState.totalPnl);
 
                 if (currentState.effectiveCollateral < requiredMargin) {
                     revert OrderManagementLib__InsufficientMarginAfterOrder(
@@ -314,10 +385,14 @@ library OrderManagementLib {
             isPostOnly: spec.isPostOnly,
             tif: spec.tif,
             inBook: false,
-            creationBlock: params.currentBlock,
+            // Queue position: the id itself until an amend moves the order or a keeper arms a
+            // StopLimit (BazaarTypes.Order).
+            prioritySeq: uint48(orderId),
             expiryBlock: expiryBlock,
             canceledBlock: 0,
             filledBlock: 0,
+            restedBlock: 0,
+            restedPremiumPpm: 0,
             prevInBook: 0,
             nextInBook: 0
         });
@@ -331,42 +406,34 @@ library OrderManagementLib {
             positionBuckets[caller].stopLossOrderId = uint64(orderId);
         }
 
-        // Limit + StopLimit are tracked together in userActiveLimitOrders for the per-user cap
-        // and for exposure tally during deposit/withdraw margin checks.
+        // An order that can rest joins userActiveLimitOrders, which carries the per-user cap and
+        // the resting-order reserve that the creation, amendment and withdrawal margin checks
+        // tally.
         if (_joinsActiveSet(ot, spec.tif)) {
             userActiveLimitOrders[caller].add(orderId);
         }
 
-        emit BazaarTypes.OrderUpdated(
-            params.pairId,
-            orderId,
-            caller,
-            BazaarTypes.OrderUpdatePayload({
-                action: BazaarTypes.OrderAction.Created,
-                orderType: ot,
-                isLong: spec.isLong,
-                isPostOnly: spec.isPostOnly,
-                size: storedSize,
-                filledSize: 0,
-                triggerPrice: orderTriggerPrice,
-                limitPrice: orderLimitPrice,
-                maxSlippageBp: orderMaxSlippageBp,
-                canceledBlock: 0,
-                filledBlock: 0,
-                expiryBlock: expiryBlock,
-                creationBlock: params.currentBlock
-            })
+        OrderBookLib.emitOrderUpdated(
+            params.pairId, orderId, orders[orderId], BazaarTypes.OrderAction.Created, BazaarTypes.CancelReason.None
         );
     }
 
     /// @notice Cancel an order — callable by order creator via BazaarPair. Unlinks it from the
     ///         book in the same write, so a canceled order is out of the matching walk's reach
-    ///         within its own transaction.
+    ///         within its own transaction, and returns whatever keeper bounty it still holds to
+    ///         the owner's claimable balance.
+    /// @dev An order that is already terminal or expired cannot be canceled again, but it may
+    ///      still hold a bounty: the walk's auto-cancels, the TP/SL fence, a liquidation or a
+    ///      deleverage stamp an order terminal without touching the escrow, and expiry needs no
+    ///      write at all. For such an order this call refunds the bounty instead of reverting,
+    ///      so the owner always has one route to it — including after the pair terminates, when
+    ///      the permissionless sweep is closed.
     function cancelOrder(
         mapping(uint256 => BazaarTypes.Order) storage orders,
         mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
         mapping(address => EnumerableSet.UintSet) storage userActiveLimitOrders,
         BazaarTypes.OrderBook storage book,
+        BazaarTypes.FeeEscrow storage feeEscrow,
         uint256 orderId,
         bytes32 pairId,
         uint64 currentBlock
@@ -374,12 +441,20 @@ library OrderManagementLib {
         BazaarTypes.Order storage order = orders[orderId];
 
         if (order.creator == address(0)) revert OrderManagementLib__OrderNotFound(orderId);
-        if (order.canceledBlock != 0) revert OrderManagementLib__OrderIsNotActive(orderId);
-        if (order.filledBlock != 0) revert OrderManagementLib__OrderIsNotActive(orderId);
-        if (currentBlock > order.expiryBlock) revert OrderManagementLib__OrderAlreadyExpired(orderId);
+        if (order.canceledBlock != 0 || order.filledBlock != 0 || currentBlock > order.expiryBlock) {
+            if (feeEscrow.bounty[orderId] != 0) {
+                FeeEscrowLib.refundBounty(feeEscrow, pairId, orderId, order.creator);
+                return;
+            }
+            if (currentBlock > order.expiryBlock && order.canceledBlock == 0 && order.filledBlock == 0) {
+                revert OrderManagementLib__OrderAlreadyExpired(orderId);
+            }
+            revert OrderManagementLib__OrderIsNotActive(orderId);
+        }
 
         order.canceledBlock = currentBlock;
         OrderBookLib.unlink(orders, book, orderId);
+        FeeEscrowLib.refundBounty(feeEscrow, pairId, orderId, order.creator);
 
         // Clear position-bucket order-slot pointer for slot-bound types
         BazaarTypes.OrderType ot = order.orderType;
@@ -394,32 +469,15 @@ library OrderManagementLib {
             userActiveLimitOrders[order.creator].remove(orderId);
         }
 
-        emit BazaarTypes.OrderUpdated(
-            pairId,
-            orderId,
-            order.creator,
-            BazaarTypes.OrderUpdatePayload({
-                action: BazaarTypes.OrderAction.Canceled,
-                orderType: order.orderType,
-                isLong: order.isLong,
-                isPostOnly: order.isPostOnly,
-                size: order.size,
-                filledSize: order.filledSize,
-                triggerPrice: order.triggerPrice,
-                limitPrice: order.limitPrice,
-                maxSlippageBp: order.maxSlippageBp,
-                canceledBlock: currentBlock,
-                filledBlock: order.filledBlock,
-                expiryBlock: order.expiryBlock,
-                creationBlock: order.creationBlock
-            })
+        OrderBookLib.emitOrderUpdated(
+            pairId, orderId, order, BazaarTypes.OrderAction.Canceled, BazaarTypes.CancelReason.Owner
         );
     }
 
-    /// @notice Sweeps a user's active-limit-order set: drops expired/canceled/filled entries
-    ///         (cancel-emitting and unlinking expired ones) and totals the surviving directional
-    ///         exposure per side, both as limit-priced notional and as raw size — callers reserve
-    ///         at the larger of the notional and the size valued at the current mark.
+    /// @notice Sweeps a user's active-limit-order set: drops expired/canceled/filled entries,
+    ///         cancel-emitting and unlinking expired ones. What survives is reserved by the gate
+    ///         that follows (CollateralLib._restingReserve), never here: the sweep runs before
+    ///         the pair resolves a price, since what it leaves decides whether one is needed.
     /// @dev Called via BazaarPair's _cleanupExpiredLimitOrders wrapper. Canceled/filled entries
     ///      were already unlinked at their terminal write; only the expired-but-live case still
     ///      holds a book position here.
@@ -428,9 +486,268 @@ library OrderManagementLib {
         mapping(uint256 => BazaarTypes.Order) storage orders,
         BazaarTypes.OrderBook storage book,
         bytes32 pairId,
-        address user,
         uint64 currentBlock
-    ) external returns (uint256 longExposure, uint256 shortExposure, uint256 longSize, uint256 shortSize) {
+    ) external {
+        _pruneExpired(orderSet, orders, book, pairId, currentBlock);
+    }
+
+    /// @notice Amends the caller's resting limit orders in place. Each amendment gives one order
+    ///         a new price and size; the order keeps its id, its expiry, its integrator and its
+    ///         place in the owner's order set. A new price, or a larger size, moves the order to
+    ///         the back of its new price level; a smaller size at the same price keeps its place.
+    ///         The batch is all or nothing: any amendment that fails reverts the call.
+    /// @dev Called via DELEGATECALL. The caller resolves the mark, refreshes the margin curve and
+    ///      handles the relayer fee; nothing here moves USDC.
+    ///
+    ///      An amendment never crosses the book. A price at or through the best resting order on
+    ///      the other side would make the order a taker — a walk, taker fees and fill gates, the
+    ///      arrival path in all but name — so it is refused and the caller sends a taker order
+    ///      instead. The same refusal keeps a post-only order post-only and rules out a
+    ///      self-match, since an order that crosses nothing can meet nothing, its owner's orders
+    ///      included. Only the head of the other side is consulted: it is the best price there,
+    ///      and an expired order still linked at the head is removed by the next walk that
+    ///      touches it, not here.
+    ///
+    ///      Margin is judged once, on the set the batch leaves behind: after the amendments the
+    ///      owner's expired orders are pruned and the surviving orders are reserved exactly as
+    ///      createOrder reserves them (CollateralLib._orderReserve), and the position plus that
+    ///      exposure has to clear initial margin together with the fill gate's debit across the
+    ///      set and the position's unrealized loss (_requireRestingExposureAffordable). Only the
+    ///      final set has to pass: intermediate states inside the batch cannot be observed.
+    ///
+    ///      An amendment that moves an order needs MIN_ORDER_LIFETIME_BLOCKS of the order's life
+    ///      left, the floor createOrder holds a new order to, so the order stands open to fills at
+    ///      its new place for that long before it can expire into a dead node a later walk spends a
+    ///      step removing. A smaller size at the same price needs only that the order has not
+    ///      expired: it stays where it has stood.
+    ///
+    ///      Queue positions are drawn from the pair's id counter in batch order, so two
+    ///      amendments landing on one level queue in the order the caller listed them, and no
+    ///      value is ever shared between an order's id and another's position.
+    ///
+    ///      A relinked order is placed from up to two predecessor hints the caller packs into the
+    ///      id word, with its old neighbours as fallback candidates. OrderBookLib.locate verifies
+    ///      every candidate against the real neighbours before linking, so a hint can fail a
+    ///      placement, never misplace an order; an exact candidate resolves without a walk, and
+    ///      otherwise the repair walk starts from the first live one. The caller's hints lead, so
+    ///      a jump across the book walks from where the caller says the slot is, and a requote by a
+    ///      few ticks needs no hint because the old neighbours sit within a few nodes of the slot.
+    ///      A slot further than MAX_WALK_STEPS nodes from that first live candidate is refused
+    ///      (OrderBookLib__HintRepairExhausted) and is a cancel and a new order. The hints travel
+    ///      inside the signed words, so a relayer cannot refresh them.
+    /// @param orders The pair's order storage
+    /// @param positionBuckets Storage mapping of position buckets
+    /// @param userActiveLimitOrders Per-user active Limit/StopLimit order sets
+    /// @param book The pair's book heads/counts
+    /// @param marginReqs The pair's stored margin requirements, as createOrder's gate reads them
+    /// @param lastPairPrice The pair's stored price, whose age decides whether a relinked order's
+    ///        far-side premium is stamped against `params.currentPrice` or not at all
+    ///        (BazaarTypes.Order.restedPremiumPpm)
+    /// @param amends The batch as triples of words, in order: each amendment's id word — the
+    ///        order id in bits 0-63, optional predecessor hints in bits 64-127 and 128-191 (the
+    ///        order to rest directly behind at the new price, 0 for none), bits 192-255 zero —
+    ///        then its new price and its new total size (the filled size stays, so the size must
+    ///        exceed it)
+    /// @param params Pair state the amendments are judged against (BazaarTypes.AmendOrdersParams)
+    /// @param caller The acting user; every order must be theirs
+    /// @return newNextOrderId The id counter after the queue positions drawn here
+    function amendOrders(
+        mapping(uint256 => BazaarTypes.Order) storage orders,
+        mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
+        mapping(address => EnumerableSet.UintSet) storage userActiveLimitOrders,
+        BazaarTypes.OrderBook storage book,
+        BazaarTypes.MarginRequirements storage marginReqs,
+        BazaarTypes.PairPrice storage lastPairPrice,
+        uint256[] calldata amends,
+        BazaarTypes.AmendOrdersParams memory params,
+        address caller
+    ) external returns (uint256 newNextOrderId) {
+        uint256 n = amends.length / 3;
+        if (n == 0 || n > BazaarTypes.MAX_AMENDS_PER_CALL || amends.length % 3 != 0) {
+            revert OrderManagementLib__InvalidAmendBatch();
+        }
+        // A relink stamps its far-side premium only against an index no older than
+        // MAX_PRICE_STALENESS, the age test the pair's mark gate keys on: an older stored price
+        // (the stale fallback) is from an earlier moment, and the quote was not on offer at the
+        // distance it reads from it.
+        uint256 stampIndex =
+            lastPairPrice.updateTs + BazaarTypes.MAX_PRICE_STALENESS < block.timestamp ? 0 : params.currentPrice;
+        newNextOrderId = params.nextOrderId;
+        for (uint256 i; i < n; ++i) {
+            uint256 at = 3 * i;
+            newNextOrderId = _amendOne(
+                orders,
+                book,
+                positionBuckets[caller],
+                amends[at],
+                amends[at + 1],
+                amends[at + 2],
+                params,
+                caller,
+                newNextOrderId,
+                stampIndex
+            );
+        }
+
+        // The gate runs on the set as the batch leaves it, expired orders pruned and each order
+        // reserved against the mark as createOrder reserves a new one.
+        _pruneExpired(userActiveLimitOrders[caller], orders, book, params.pairId, params.currentBlock);
+        (uint256 longExposure, uint256 shortExposure, uint256 fillDebit) = CollateralLib._restingReserve(
+            userActiveLimitOrders[caller], orders, params.currentBlock, params.currentPrice
+        );
+        _requireRestingExposureAffordable(
+            positionBuckets[caller], marginReqs, params, longExposure, shortExposure, fillDebit
+        );
+    }
+
+    /// @dev One amendment: validate, then rewrite the order in place and, when it loses its
+    ///      place, relink it, stamping its far-side premium against `stampIndex` (0: none).
+    ///      Returns the id counter after any queue position drawn.
+    function _amendOne(
+        mapping(uint256 => BazaarTypes.Order) storage orders,
+        BazaarTypes.OrderBook storage book,
+        BazaarTypes.PositionBucket storage bucket,
+        uint256 idWord,
+        uint256 newPrice,
+        uint256 newSize,
+        BazaarTypes.AmendOrdersParams memory params,
+        address caller,
+        uint256 seqCounter,
+        uint256 stampIndex
+    ) private returns (uint256) {
+        // The id word carries the order id in its low 64 bits and two optional predecessor hints
+        // above it; the top 64 bits must be clear so one amendment has exactly one encoding.
+        if (idWord >> 192 != 0) revert OrderManagementLib__InvalidAmendBatch();
+        uint256 orderId = idWord & type(uint64).max;
+        BazaarTypes.Order storage o = orders[orderId];
+        if (o.creator == address(0)) revert OrderManagementLib__OrderNotFound(orderId);
+        if (o.creator != caller) revert OrderManagementLib__RequestorIsNotOrderOwner(orderId, caller);
+        // Only a resting good-till-cancelled Limit order has a price and a queue position to amend.
+        // Trigger orders wait outside the book with a bounty and position links of their own, and
+        // IOC/FOK orders never rest; each of those is a cancel and a create.
+        if (o.orderType != BazaarTypes.OrderType.Limit || o.tif != BazaarTypes.TimeInForce.GTC) {
+            revert OrderManagementLib__NotAmendable(orderId);
+        }
+        if (o.canceledBlock != 0 || o.filledBlock != 0 || !o.inBook) revert OrderManagementLib__OrderIsNotActive(orderId);
+        if (params.currentBlock > o.expiryBlock) revert OrderManagementLib__OrderAlreadyExpired(orderId);
+
+        if (newPrice == 0) revert OrderManagementLib__ZeroLimitPrice();
+        {
+            // The same placement band a new Limit order is held to.
+            uint256 bandLo = params.currentPrice * (BazaarTypes.BP_SCALE - BazaarTypes.MAX_PLACEMENT_DEVIATION_BP)
+                / BazaarTypes.BP_SCALE;
+            uint256 bandHi = params.currentPrice * (BazaarTypes.BP_SCALE + BazaarTypes.MAX_PLACEMENT_DEVIATION_BP)
+                / BazaarTypes.BP_SCALE;
+            if (newPrice < bandLo || newPrice > bandHi) {
+                revert OrderManagementLib__LimitPriceOutsidePlacementBand(newPrice, bandLo, bandHi);
+            }
+        }
+        uint256 filled = o.filledSize;
+        if (newSize <= filled) revert OrderManagementLib__AmendSizeNotAboveFilled(orderId);
+        {
+            // The remainder is held to the notional floor like a new order, with the same
+            // full-close exemption.
+            uint256 remaining = newSize - filled;
+            uint256 notional = Math.mulDiv(remaining, newPrice, BazaarTypes.BAZAAR_SCALE);
+            if (notional < MIN_ORDER_AMOUNT) {
+                bool isFullClose = bucket.size > 0 && bucket.isLong != o.isLong && remaining == bucket.size;
+                if (!isFullClose) revert OrderManagementLib__NotionalBelowMinimum(notional, MIN_ORDER_AMOUNT);
+            }
+        }
+        {
+            uint64 best = o.isLong ? book.askHead : book.bidHead;
+            if (best != 0) {
+                uint256 bestPrice = orders[best].limitPrice;
+                if (o.isLong ? newPrice >= bestPrice : newPrice <= bestPrice) {
+                    revert OrderManagementLib__AmendWouldCross(orderId, newPrice, bestPrice);
+                }
+            }
+        }
+
+        bool repriced = newPrice != o.limitPrice;
+        bool grew = newSize > o.size;
+        if (!repriced && !grew) {
+            if (newSize == o.size) return seqCounter; // nothing changes, nothing to report
+            // A smaller size at the same price keeps its place: it takes nothing from anyone
+            // queued behind it. Below the stored size, so inside the field.
+            o.size = uint128(newSize);
+        } else {
+            // A move links the order into the book anew, and every link must leave the order the
+            // lifetime a new one is created with. Without the floor an order could rest deep in
+            // the book and move to the front in its last live block: one block later it is a
+            // dead node at the head, which the next walk spends a step removing, so a wall of
+            // them could exhaust a taker's or an unload's step budget at the cost of one block of
+            // exposure each.
+            uint64 minExpiry = params.currentBlock + MIN_ORDER_LIFETIME_BLOCKS;
+            if (o.expiryBlock < minExpiry) {
+                revert OrderManagementLib__AmendTooCloseToExpiry(orderId, o.expiryBlock, minExpiry);
+            }
+            // A new price, or more size at the same one, is a new claim on the level: the order
+            // goes to the back behind every order resting there, under a fresh queue position,
+            // and the relink restarts its exposure and re-measures its far-side premium
+            // (Order.restedBlock, Order.restedPremiumPpm) — a quote moved to a new price, or
+            // grown, has not stood at that price and size for anyone to take. The reduction
+            // above keeps all three: what remains was there all along.
+            // The caller's hints lead, so a jump across the book walks from where the caller says
+            // the slot is; the old neighbours, still resting, follow as the fallback anchor, so a
+            // requote by a few ticks with no hint, or a dead one, still walks from close by.
+            BazaarTypes.MatchHints memory hints;
+            hints.pred = uint64(idWord >> 64);
+            hints.pred2 = uint64(idWord >> 128);
+            hints.pred3 = o.prevInBook;
+            hints.pred4 = o.nextInBook;
+            OrderBookLib.unlink(orders, book, orderId);
+            o.limitPrice = SafeCast.toUint128(newPrice);
+            o.size = SafeCast.toUint128(newSize);
+            // Counter values stay far below 2^48 (BazaarTypes.Order).
+            o.prioritySeq = uint48(seqCounter);
+            unchecked {
+                ++seqCounter;
+            }
+            OrderBookLib.insert(orders, book, orderId, hints, params.currentBlock, stampIndex);
+        }
+        OrderBookLib.emitOrderUpdated(
+            params.pairId, orderId, o, BazaarTypes.OrderAction.Amended, BazaarTypes.CancelReason.None
+        );
+        return seqCounter;
+    }
+
+    /// @dev createOrder's margin gate for the resting set alone: the position plus its resting
+    ///      orders, in whichever direction is worse (CollateralLib._worstCaseNotional, the base the
+    ///      withdrawal gate and the lens use), must be covered at initial margin together with the
+    ///      fill gate's debit across the set (`fillDebit`, CollateralLib._fillDebitOf) and the
+    ///      position's unrealized loss. Judged only when the orders add exposure beyond the
+    ///      position, or when there is no position, as createOrder judges a new order.
+    function _requireRestingExposureAffordable(
+        BazaarTypes.PositionBucket storage bucket,
+        BazaarTypes.MarginRequirements storage marginReqs,
+        BazaarTypes.AmendOrdersParams memory params,
+        uint256 longExposure,
+        uint256 shortExposure,
+        uint256 fillDebit
+    ) private view {
+        BazaarTypes.BucketState memory state =
+            BucketLib.calculateState(bucket, params.currentPrice, params.currentFundingIndex, marginReqs);
+        bool flat = bucket.size == 0;
+        uint256 posNotional = flat ? 0 : state.currentNotional;
+        uint256 worst = CollateralLib._worstCaseNotional(bucket.isLong, posNotional, longExposure, shortExposure);
+        if (worst > posNotional || flat) {
+            uint256 requiredMargin = Math.mulDiv(marginReqs.imrBp, worst, BazaarTypes.BP_SCALE) + fillDebit;
+            if (state.totalPnl < 0) requiredMargin += uint256(-state.totalPnl);
+            if (state.effectiveCollateral < requiredMargin) {
+                revert OrderManagementLib__InsufficientMarginAfterOrder(state.effectiveCollateral, requiredMargin);
+            }
+        }
+    }
+
+    /// @dev The body of cleanupExpiredLimitOrders, shared with amendOrders.
+    function _pruneExpired(
+        EnumerableSet.UintSet storage orderSet,
+        mapping(uint256 => BazaarTypes.Order) storage orders,
+        BazaarTypes.OrderBook storage book,
+        bytes32 pairId,
+        uint64 currentBlock
+    ) private {
         uint256 len = orderSet.length();
         uint256 i;
         while (i < len) {
@@ -445,57 +762,36 @@ library OrderManagementLib {
                 if (isExpired && !isCanceled && !isFilled) {
                     order.canceledBlock = currentBlock;
                     OrderBookLib.unlink(orders, book, orderId);
-                    emit BazaarTypes.OrderUpdated(
-                        pairId,
-                        orderId,
-                        user,
-                        BazaarTypes.OrderUpdatePayload({
-                            action: BazaarTypes.OrderAction.Canceled,
-                            orderType: order.orderType,
-                            isLong: order.isLong,
-                            isPostOnly: order.isPostOnly,
-                            size: order.size,
-                            filledSize: order.filledSize,
-                            triggerPrice: order.triggerPrice,
-                            limitPrice: order.limitPrice,
-                            maxSlippageBp: order.maxSlippageBp,
-                            canceledBlock: currentBlock,
-                            filledBlock: order.filledBlock,
-                            expiryBlock: order.expiryBlock,
-                            creationBlock: order.creationBlock
-                        })
+                    OrderBookLib.emitOrderUpdated(
+                        pairId, orderId, order, BazaarTypes.OrderAction.Canceled, BazaarTypes.CancelReason.Expired
                     );
                 }
                 orderSet.remove(orderId);
                 len--;
                 // don't increment i — the last element was swapped into this index
             } else {
-                uint256 remaining = order.size - order.filledSize;
-                uint256 notional = Math.mulDiv(remaining, order.limitPrice, BazaarTypes.BAZAAR_SCALE);
-                if (order.isLong) {
-                    longExposure += notional;
-                    longSize += remaining;
-                } else {
-                    shortExposure += notional;
-                    shortSize += remaining;
-                }
                 i++;
             }
         }
     }
 
-    /// @notice Permissionless expiry janitor: cancels + unlinks any of the given orders that
-    ///         have expired without reaching a terminal state. Non-expired, already-terminal,
-    ///         and unknown ids are skipped silently so racing keepers never revert each other.
+    /// @notice Permissionless janitor: cancels + unlinks any of the given orders that have
+    ///         expired without reaching a terminal state, and returns the keeper bounty of any
+    ///         order that is terminal or expired to its owner's claimable balance. Live,
+    ///         non-expired and unknown ids are skipped silently so racing keepers never revert
+    ///         each other.
     /// @dev Expired orders are otherwise removed lazily — by the matching walk on contact or by
     ///      the owner's sweeps during create/withdraw — so this exists to let anyone clear dead
     ///      nodes from the book front proactively. Only Limit/StopLimit can expire (TP/SL carry
     ///      the never-expire sentinel; Market orders are terminal in their creation tx), so the
-    ///      set removal below covers every sweepable type.
+    ///      set removal below covers every sweepable type. The bounty refund covers the terminal
+    ///      writes that bypass the escrow (the walk's auto-cancels, the TP/SL fence, liquidation
+    ///      and deleverage resets), so a stranded bounty needs no action from its owner.
     function sweepExpired(
         mapping(uint256 => BazaarTypes.Order) storage orders,
         mapping(address => EnumerableSet.UintSet) storage userActiveLimitOrders,
         BazaarTypes.OrderBook storage book,
+        BazaarTypes.FeeEscrow storage feeEscrow,
         uint256[] calldata orderIds,
         bytes32 pairId,
         uint64 currentBlock
@@ -504,76 +800,31 @@ library OrderManagementLib {
             uint256 orderId = orderIds[i];
             BazaarTypes.Order storage order = orders[orderId];
             if (order.creator == address(0)) continue;
-            if (order.canceledBlock != 0 || order.filledBlock != 0) continue;
-            if (currentBlock <= order.expiryBlock) continue;
+            if (order.canceledBlock == 0 && order.filledBlock == 0) {
+                if (currentBlock <= order.expiryBlock) continue;
 
-            order.canceledBlock = currentBlock;
-            OrderBookLib.unlink(orders, book, orderId);
-            userActiveLimitOrders[order.creator].remove(orderId);
+                order.canceledBlock = currentBlock;
+                OrderBookLib.unlink(orders, book, orderId);
+                userActiveLimitOrders[order.creator].remove(orderId);
 
-            emit BazaarTypes.OrderUpdated(
-                pairId,
-                orderId,
-                order.creator,
-                BazaarTypes.OrderUpdatePayload({
-                    action: BazaarTypes.OrderAction.Canceled,
-                    orderType: order.orderType,
-                    isLong: order.isLong,
-                    isPostOnly: order.isPostOnly,
-                    size: order.size,
-                    filledSize: order.filledSize,
-                    triggerPrice: order.triggerPrice,
-                    limitPrice: order.limitPrice,
-                    maxSlippageBp: order.maxSlippageBp,
-                    canceledBlock: currentBlock,
-                    filledBlock: order.filledBlock,
-                    expiryBlock: order.expiryBlock,
-                    creationBlock: order.creationBlock
-                })
-            );
-        }
-    }
-
-    /// @notice Read-only twin of cleanupExpiredLimitOrders: totals the remaining directional
-    ///         exposure of a user's active-limit-order set, SKIPPING expired/canceled/filled
-    ///         entries instead of pruning them. The liveness test and the summed notional are
-    ///         identical, so both functions always report the same totals — the pruning is
-    ///         purely lazy hygiene, not semantics.
-    /// @dev Reached via BazaarPair.outstandingOrderExposure so off-chain withdrawal previews
-    ///      (BazaarPairLens.getMaxWithdrawable) can margin-check against live order exposure
-    ///      from an eth_call.
-    function outstandingOrderExposure(
-        EnumerableSet.UintSet storage orderSet,
-        mapping(uint256 => BazaarTypes.Order) storage orders,
-        uint64 currentBlock
-    ) external view returns (uint256 longExposure, uint256 shortExposure, uint256 longSize, uint256 shortSize) {
-        uint256 len = orderSet.length();
-        for (uint256 i = 0; i < len; i++) {
-            BazaarTypes.Order storage order = orders[orderSet.at(i)];
-            if (currentBlock > order.expiryBlock || order.canceledBlock != 0 || order.filledBlock != 0) {
-                continue;
+                OrderBookLib.emitOrderUpdated(
+                    pairId, orderId, order, BazaarTypes.OrderAction.Canceled, BazaarTypes.CancelReason.Expired
+                );
             }
-            uint256 remaining = order.size - order.filledSize;
-            uint256 notional = Math.mulDiv(remaining, order.limitPrice, BazaarTypes.BAZAAR_SCALE);
-            if (order.isLong) {
-                longExposure += notional;
-                longSize += remaining;
-            } else {
-                shortExposure += notional;
-                shortSize += remaining;
-            }
+            FeeEscrowLib.refundBounty(feeEscrow, pairId, orderId, order.creator);
         }
     }
 
     // -------------------- Internal Functions --------------------
 
     /// @dev Resolve an order's absolute expiry block. TP/SL never expire and take the
-    ///      NEVER_EXPIRE_BLOCK sentinel. Market and fill-or-kill orders are terminal within their
-    ///      own transaction, so they are stamped expired at the creation block: demanding a
-    ///      future block from them would be asking the caller to populate a field no later
-    ///      observer can act on. Everything else rests, so its user-supplied expiry must land in
-    ///      [cb + MIN_ORDER_LIFETIME_BLOCKS, cb + MAX_ORDER_LIFETIME_BLOCKS] — under-long is
-    ///      rejected, over-long is clamped down to the ceiling.
+    ///      NEVER_EXPIRE_BLOCK sentinel. An order that never rests — Market, and a Limit sent IOC
+    ///      or FOK — is terminal within its own transaction, so its expiry is stamped at the
+    ///      creation block: demanding a future block from it would be asking the caller to
+    ///      populate a field no later observer can act on. Everything else can rest, so its
+    ///      user-supplied expiry must land in [cb + MIN_ORDER_LIFETIME_BLOCKS,
+    ///      cb + MAX_ORDER_LIFETIME_BLOCKS] — under-long is rejected, over-long is clamped down to
+    ///      the ceiling.
     /// @param ot The order's type.
     /// @param tif The order's time-in-force.
     /// @param specExpirationBlock The caller's requested absolute expiry block.
@@ -588,7 +839,7 @@ library OrderManagementLib {
         if (ot == BazaarTypes.OrderType.TakeProfit || ot == BazaarTypes.OrderType.StopLoss) {
             return NEVER_EXPIRE_BLOCK;
         }
-        if (ot == BazaarTypes.OrderType.Market || tif == BazaarTypes.TimeInForce.FOK) return cb;
+        if (ot == BazaarTypes.OrderType.Market || tif != BazaarTypes.TimeInForce.GTC) return cb;
 
         uint64 minExp = cb + MIN_ORDER_LIFETIME_BLOCKS;
         uint64 maxExp = cb + MAX_ORDER_LIFETIME_BLOCKS;
@@ -600,13 +851,15 @@ library OrderManagementLib {
 
     /// @dev Whether an order belongs in userActiveLimitOrders — the set that carries the per-user
     ///      order cap and the outstanding-exposure tally. Membership means "can still be resting
-    ///      when a later transaction reads this set", which is true of Limit and StopLimit and
-    ///      false of a fill-or-kill limit: it is terminal within its own transaction, so adding it
-    ///      would register and deregister the same id in one call. One predicate rather than the
-    ///      condition written twice, so the cap gate and the registration can never disagree about
-    ///      which orders the set holds.
+    ///      when a later transaction reads this set", which is true of a good-till-cancelled Limit
+    ///      and of a StopLimit (creation admits no other time-in-force on it), and false of an
+    ///      order that never rests — Market, and a Limit sent IOC or FOK — since it is terminal
+    ///      within its own transaction. The walk's fill and cancel paths still remove an IOC or
+    ///      FOK limit's id on the way out; removing an id the set does not hold is a no-op. One
+    ///      predicate rather than the condition written twice, so the cap gate and the
+    ///      registration can never disagree about which orders the set holds.
     function _joinsActiveSet(BazaarTypes.OrderType ot, BazaarTypes.TimeInForce tif) internal pure returns (bool) {
-        return (ot == BazaarTypes.OrderType.Limit && tif != BazaarTypes.TimeInForce.FOK)
+        return (ot == BazaarTypes.OrderType.Limit && tif == BazaarTypes.TimeInForce.GTC)
             || ot == BazaarTypes.OrderType.StopLimit;
     }
 }

@@ -13,20 +13,45 @@ contract RiskScenarioHarness {
     BazaarTypes.LiquidationGapEma internal liquidationGapEma;
     BazaarTypes.Vault internal pairVault;
     BazaarTypes.ReopenGapEma internal reopenGapEma;
+    BazaarTypes.MmrSampleBuffer internal mmrBuffer;
 
-    function seed(uint256 variance, int256 gap, uint192 reopen, uint256 fund, uint256 oi) external {
+    /// @dev `slip` in whole basis points; the stored line is unsigned, so a negative one stores as
+    ///      zero.
+    function seed(uint256 variance, int256 slip, uint192 reopen, uint256 fund, uint256 oi) external {
         lastPairPrice.emaVarianceBp = variance;
-        liquidationGapEma.emaGapBp = gap;
-        reopenGapEma.gapEmaBp = reopen;
+        liquidationGapEma.slippage = slip > 0 ? uint256(slip) * RiskParamsLib.GAP_EMA_SCALE : 0;
+        reopenGapEma.gapEmaBp = uint128(reopen);
         pairVault.insuranceFundBalance = fund;
         pairVault.totalLongOI = oi;
         pairVault.totalShortOI = oi;
         marginRequirements.lastUpdateTs = 0;
     }
 
+    /// @dev Anchors both value lines and the batch clock at `ts`, as one batch then would.
+    function setGapTs(uint256 ts) external {
+        liquidationGapEma.slippageAnchorTs = uint64(ts);
+        liquidationGapEma.driftAnchorTs = uint64(ts);
+        liquidationGapEma.lastLiquidationTs = uint64(ts);
+    }
+
+    /// @dev Stands in for a live market's latest stored price, where the fade clock stops.
+    function setLastPriceTs(uint256 ts) external {
+        lastPairPrice.updateTs = ts;
+    }
+
     function run(uint256 price, bool cont) external {
         RiskParamsLib.calculateIMRandMMR(
-            marginRequirements, lastPairPrice, liquidationGapEma, pairVault, reopenGapEma, price, cont, 0, 50_000, 0
+            marginRequirements,
+            lastPairPrice,
+            liquidationGapEma,
+            pairVault,
+            reopenGapEma,
+            mmrBuffer,
+            price,
+            cont,
+            0,
+            50_000,
+            0
         );
     }
 
@@ -49,12 +74,13 @@ contract RiskScenarioHarness {
 contract RiskRegimeScenarioTest is Test {
     uint256 internal constant OI = 1_000_000e18;
     uint256 internal constant PRICE = 1e18; // OI size == OI notional, so fund bp is direct
+    uint256 internal constant EPISODE_TS = 30 days; // the clock every test starts on, past warmup
 
     RiskScenarioHarness internal h;
 
     function setUp() public {
         h = new RiskScenarioHarness();
-        vm.warp(10 days);
+        vm.warp(EPISODE_TS);
     }
 
     /// @dev `fundBp` is the fund as bp of OI notional, which at PRICE is the coverage ratio.
@@ -77,18 +103,18 @@ contract RiskRegimeScenarioTest is Test {
         (uint256 imr, uint256 target, uint256 fee) = _scenario(BazaarTypes.VARIANCE_EXTREME, 0, 0, 500, true);
         assertEq(target, 450, "target = the 4.5% stress move");
         assertEq(imr, 900, "IMR = 2 x M, no fund-health uplift at 5% coverage");
-        assertEq(fee, 96, "0.96 bp base rate: above target, so no deficit surcharge");
+        assertEq(fee, 159, "1.59 bp base rate: above target, so no deficit surcharge");
     }
 
     /// @notice The same pair genuinely underfunded at 2% coverage still prices the shortfall
-    ///         hard: the deficit surcharge is quadratic, so the rate is 15.5 bp and margin
+    ///         hard: the deficit surcharge is quadratic, so the rate is 25.63 bp and margin
     ///         carries a fund-health uplift. The base rate is only reached once coverage
     ///         actually meets the target.
     function test_scenario_highVolUnderfunded() public {
         (uint256 imr, uint256 target, uint256 fee) = _scenario(BazaarTypes.VARIANCE_EXTREME, 0, 0, 200, true);
         assertEq(target, 450, "same target: it reads risk, not the fund");
         assertEq(imr, 1899, "2 x 450 x the 2.11x fund-health multiplier");
-        assertEq(fee, 1547, "15.5 bp while coverage is 56% short");
+        assertEq(fee, 2563, "25.63 bp while coverage is 56% short");
     }
 
     /// @notice A realized liquidation gap keeps raising margin past the 3% point where a
@@ -104,7 +130,7 @@ contract RiskRegimeScenarioTest is Test {
 
         assertEq(target3, 450, "3% gap: 150 + 300, still inside the 5% fund's coverage");
         assertEq(imr3, 900, "so no fund-health uplift: 2 x 450");
-        assertEq(fee3, 96, "and the taker rate rests on its base");
+        assertEq(fee3, 159, "and the taker rate rests on its base");
 
         assertEq(target5, 650, "5% gap: the target outruns the 5% fund");
         assertEq(imr5, 1899, "2 x 650 x the 1.46x uplift the shortfall now creates");
@@ -113,13 +139,29 @@ contract RiskRegimeScenarioTest is Test {
 
     /// @notice A session pair that has demonstrated a 10% reopen. The target reaches the full
     ///         gap rather than half of it, so the same 5% fund now reads as half-covered and
-    ///         both margin and the fee tighten sharply. This is the mirror image of the high-vol
-    ///         case and the reason the two must be judged together.
+    ///         both margin and the fee tighten sharply, the fee to its 50 bp cap. This is the
+    ///         mirror image of the high-vol case and the reason the two must be judged together.
     function test_scenario_sessionPairWithDemonstratedReopen() public {
         (uint256 imr, uint256 target, uint256 fee) = _scenario(0, 0, 1000, 500, false);
         assertEq(target, 1_000, "the full demonstrated reopen, capped at 10%");
         assertEq(imr, 4_000, "2 x 1000 x the 2x fund-health multiplier");
-        assertEq(fee, 2_650, "26.5 bp: entry flow pre-funds the demonstrated tail");
+        assertEq(fee, 5_000, "the 50 bp cap: entry flow pre-funds the demonstrated tail");
+    }
+
+    /// @notice A session pair carrying a cap-sized reopen. The peak enters the maintenance level
+    ///         at full size, so MMR is the cap itself and IMR is twice it — which leaves the
+    ///         fund-health multiplier room to lift margin further as coverage falls. A cap set at
+    ///         the stress-move ceiling would instead arrive already on MAX_IMR_BP, with no margin
+    ///         response left for a pair that is both gap-prone and underfunded.
+    function test_scenario_sessionPairAtReopenCap() public {
+        uint192 cap = uint192(RiskParamsLib.REOPEN_GAP_EMA_CAP_BP);
+
+        (uint256 imrFunded, uint256 target,) = _scenario(0, 0, cap, 1_000, false);
+        assertEq(target, 1_000, "a cap-sized reopen saturates the coverage band");
+        assertEq(imrFunded, 5_000, "2 x the cap while the fund meets its target");
+
+        (uint256 imrShort,,) = _scenario(0, 0, cap, 900, false);
+        assertEq(imrShort, 6_000, "a short fund still has margin response left under MAX_IMR_BP");
     }
 
     /// @notice A freshly listed session pair with no gap history sits above the old calm
@@ -130,38 +172,52 @@ contract RiskRegimeScenarioTest is Test {
         assertEq(target, 300, "the closure prior reaches the target too");
     }
 
-    /// @notice CHARACTERIZATION of a live hazard, not an endorsement of it. The liquidation-gap
-    ///         EMA is the one leg of the stress move with no ceiling of its own: the volatility
-    ///         leg stops at VOL_MULTIPLIER_MAX and the reopen peak-hold at REOPEN_GAP_EMA_CAP_BP,
-    ///         while the gap is bounded only by the clamp on the SUM. A crash that leaves the
-    ///         oracle far below the estates' average bankruptcy price prints a gap of that whole
-    ///         distance, because the unload band is measured from the oracle. At 24% the
-    ///         maintenance level lands at 25.5%, against 4.5% under a saturating multiplier.
-    function test_hazard_extremeLiquidationGapHasNoLegCeiling() public {
-        (uint256 imr, uint256 target,) = _scenario(0, 2400, 0, 1_000, true);
-        assertEq(target, 1_000, "the target truncates at its 10% ceiling");
-        assertEq(imr, 5_100, "2 x (150 + 2400): the gap leg alone carries margin to 51%");
-        assertEq(imr / 2, 2_550, "maintenance margin at 25.5% off one episode");
-
-        // The clamp on the sum is the only thing bounding it: 3850bp of gap pins the ceiling.
-        (uint256 pinned,,) = _scenario(0, 3_850, 0, 1_000, true);
-        assertEq(pinned, 8_000, "gap alone reaches MAX_IMR_BP, i.e. 1.25x maximum leverage");
+    /// @notice Every leg of the stress move carries a ceiling of its own: the volatility leg stops
+    ///         at VOL_MULTIPLIER_MAX, the reopen peak-hold at REOPEN_GAP_EMA_CAP_BP, and slippage
+    ///         at LIQ_MAX_SLIPPAGE_BP — set where it is measured, since each fill is clamped before
+    ///         it is weighted and the stored reading is only ever a blend of clamped fills. On a
+    ///         calm 24/7 pair that bounds what slippage alone can ask of margin at 2 x (150 + 500),
+    ///         about 7.7x leverage, however thin the book a walk sold into.
+    function test_slippageLegCeilingIsTheUnloadBand() public {
+        (uint256 imr, uint256 target,) = _scenario(0, int256(BazaarTypes.LIQ_MAX_SLIPPAGE_BP), 0, 1_000, true);
+        assertEq(target, 650, "150 + 500: the target still tracks M inside the band");
+        assertEq(imr, 1_300, "2 x (150 + 500): the most the slippage leg alone can ask");
     }
 
-    /// @notice CHARACTERIZATION of the same hazard's persistence. The gap EMA's time decay is
-    ///         applied inside updateLiquidationGapEmaBatch, which only runs when a liquidation
-    ///         unload actually fills. Nothing decays it on the read side, so a pair that goes
-    ///         quiet after one bad episode holds the elevated maintenance level indefinitely.
-    ///         The tau = 3 days on the estimator does not bound how long the margin curve
-    ///         carries the observation.
-    function test_hazard_liquidationGapNeverDecaysWithoutAFurtherLiquidation() public {
-        (uint256 imrAtEpisode,,) = _scenario(0, 2400, 0, 1_000, true);
+    /// @notice The reading fades with the clock. With no further liquidation the value the curves
+    ///         read halves three days after the batch and keeps falling harmonically — 1/11 of
+    ///         itself at thirty days — on a 24/7 market storing prices as it goes, so the pair
+    ///         walks back to its volatility curve on its own, and the target walks down with it.
+    ///         The store is seeded at 2400, well past the band the measurement caps each fill at,
+    ///         so the decay spans the whole curve; it still holds 2400 throughout, since only a
+    ///         batch rewrites it, blending against the faded value.
+    function test_liquidationGapFadesWithoutAFurtherLiquidation() public {
+        // Constants, not a local holding block.timestamp: the optimizer re-reads the opcode
+        // after each vm.warp, which would move the anchor with the clock.
+        h.setGapTs(EPISODE_TS);
+        h.setLastPriceTs(EPISODE_TS);
 
-        vm.warp(block.timestamp + 365 days);
-        (uint256 imrAYearLater,,) = _scenario(0, 2400, 0, 1_000, true);
+        (uint256 imr0,,) = _scenario(0, 2400, 0, 1_000, true);
+        assertEq(imr0, 5_100, "at the episode: 2 x (150 + 2400)");
 
-        assertEq(imrAYearLater, imrAtEpisode, "a year of quiet does not relax the gap leg at all");
-        assertEq(imrAYearLater, 5_100, "still 51% initial margin");
+        _liveAt(EPISODE_TS + 3 days);
+        (uint256 imr3,,) = _scenario(0, 2400, 0, 1_000, true);
+        assertEq(imr3, 2_700, "half the gap remains: 2 x (150 + 1200)");
+
+        _liveAt(EPISODE_TS + 30 days);
+        (uint256 imr30, uint256 target30,) = _scenario(0, 2400, 0, 1_000, true);
+        assertEq(imr30, 736, "2 x (150 + 218)");
+        assertEq(target30, 368, "the target follows it down");
+
+        _liveAt(EPISODE_TS + 365 days);
+        (uint256 imr365,,) = _scenario(0, 2400, 0, 1_000, true);
+        assertEq(imr365, 400, "back on the calm-pair floor");
+    }
+
+    /// @dev Moves the clock the way a live market does: its latest stored price lands with it.
+    function _liveAt(uint256 ts) internal {
+        vm.warp(ts);
+        h.setLastPriceTs(ts);
     }
 
     /// @notice Coverage per unit of maintenance margin is constant while the target band is not

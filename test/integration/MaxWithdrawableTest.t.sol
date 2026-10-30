@@ -52,7 +52,7 @@ contract MaxWithdrawableTest is IntegrationBase {
         uint256 maxW = lens.getMaxWithdrawable(address(pair), alice, 50_000 * BAZAAR_SCALE);
         assertLt(maxW, 10_000 * BAZAAR_SCALE, "resting order reserves margin");
 
-        (uint256 longExp, uint256 shortExp, uint256 longSz, uint256 shortSz) = pair.outstandingOrderExposure(alice);
+        (uint256 longExp, uint256 shortExp, uint256 longSz, uint256 shortSz) = lens.outstandingOrderExposure(address(pair), alice);
         assertEq(longExp, 4_000 * BAZAAR_SCALE, "0.1 BTC x $40k limit");
         assertEq(longSz, BAZAAR_SCALE / 10, "raw size reported alongside");
         assertEq(shortExp, 0);

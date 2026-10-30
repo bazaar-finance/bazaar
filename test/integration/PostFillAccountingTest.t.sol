@@ -65,11 +65,11 @@ contract PostFillAccountingTest is IntegrationBase {
     }
 
     function _posEntryValue(address user) internal view returns (uint256 ev) {
-        (,, ev,,,,,,) = pair.positionBuckets(user);
+        (,, ev,,,,) = pair.positionBuckets(user);
     }
 
-    function _mmrUpdateTs(address user) internal view returns (uint256 ts) {
-        (,,,,,,,, ts) = pair.positionBuckets(user);
+    function _posEntryFundingIndex(address user) internal view returns (int256 idx) {
+        (,,,, idx,,) = pair.positionBuckets(user);
     }
 
     // ============================ partial close / flip ============================
@@ -97,11 +97,11 @@ contract PostFillAccountingTest is IntegrationBase {
     }
 
     /// @notice Flip: an oversized opposing fill closes the position and reopens the remainder on
-    ///         the other side at the fill price, restamping the MMR clock.
+    ///         the other side at the fill price and the live funding index.
     function test_flip_reopensRemainderOnOppositeSide() public {
         _openAt50k(BAZAAR_SCALE / 10); // alice long 0.1 @ 50k
 
-        // Advance time so the restamp is distinguishable from the open's stamp.
+        // Advance time so the reopened remainder's funding stamp is the flip's own.
         vm.warp(vm.getBlockTimestamp() + 100);
         _deposit(carol, 30_000 * BAZAAR_SCALE);
         _placeLimit(alice, false, 3 * BAZAAR_SCALE / 10, 49_000 * BAZAAR_SCALE); // older -> fill 49k
@@ -112,7 +112,7 @@ contract PostFillAccountingTest is IntegrationBase {
         assertFalse(isLong, "flipped short");
         assertEq(size, 2 * BAZAAR_SCALE / 10, "remainder 0.2");
         assertEq(_posEntryValue(alice), 2 * BAZAAR_SCALE / 10 * 49_000, "fresh entry at the fill price");
-        assertEq(_mmrUpdateTs(alice), vm.getBlockTimestamp(), "MMR clock restamped on flip");
+        assertEq(_posEntryFundingIndex(alice), pair.currentFundingIndex(), "fresh entry at the live funding index");
     }
 
     // ============================ TP/SL oversize fence ============================
@@ -176,7 +176,7 @@ contract PostFillAccountingTest is IntegrationBase {
     /// @notice OI and weighted entry sums track real fills: symmetric on open, zero after close.
     function test_oiAggregates_openThenCloseRoundTrip() public {
         _openAt50k(BAZAAR_SCALE / 10);
-        (uint256 longOI, uint256 shortOI, uint256 longSum, uint256 shortSum,,,,,,,,,,) = pair.pairVault();
+        (uint256 longOI, uint256 shortOI, uint256 longSum, uint256 shortSum,,,,,,,,,,,,,) = pair.pairVault();
         assertEq(longOI, BAZAAR_SCALE / 10, "long OI == size");
         assertEq(shortOI, BAZAAR_SCALE / 10, "short OI == size");
         assertEq(longSum, 5_000 * BAZAAR_SCALE, "long weighted entry == fill notional");
@@ -188,7 +188,7 @@ contract PostFillAccountingTest is IntegrationBase {
         _placeLimit(bob, true, BAZAAR_SCALE / 10, 51_000 * BAZAAR_SCALE);
         assertEq(_posSize(alice), 0, "closed");
 
-        (longOI, shortOI, longSum, shortSum,,,,,,,,,,) = pair.pairVault();
+        (longOI, shortOI, longSum, shortSum,,,,,,,,,,,,,) = pair.pairVault();
         assertEq(longOI, 0, "long OI zeroed");
         assertEq(shortOI, 0, "short OI zeroed");
         assertEq(longSum, 0, "long sum zeroed");
@@ -387,7 +387,7 @@ contract PostFillAccountingTest is IntegrationBase {
         assertEq(unloaded, 0, "no fill against an under-margined maker");
         assertEq(_filledSize(longId), 0, "order unfilled");
         assertGt(_canceledBlock(longId), 0, "failing maker auto-canceled");
-        (,,,,,, uint256 pendSize,,,,,,,) = pair.pairVault();
+        (,,,,,, uint256 pendSize,,,,,,,,,,) = pair.pairVault();
         assertEq(pendSize, liqSize, "vault inventory untouched");
     }
 

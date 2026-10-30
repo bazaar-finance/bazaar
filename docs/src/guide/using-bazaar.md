@@ -9,9 +9,10 @@ Bazaar is designed to be used as a deployed protocol, not software you need to r
 | You want to… | Start here | You need |
 |---|---|---|
 | Trade perps with leverage | [Trading](trading.md) | USDC on Arbitrum |
-| Earn yield backstopping a market | [Earning → Insurance LP](earning.md#insurance-lp) | USDC, patience (20-day exit cooldown) |
+| Earn yield backstopping a market | [Earning → Insurance LP](earning.md#insurance-lp) | USDC, patience (13-day exit cooldown) |
 | Run bots that collect bounties | [Earning → Keeper bounties](earning.md#keeper-bounties) | a bot, gas money |
 | Build a frontend/bot and earn referral fees | [Integrators](integrators.md) | just an address |
+| Place several orders in one transaction | [Batching Orders](batching.md) | a contract account (an example is in the repo) |
 | List a new market | [Markets & Listing](../protocol/listing.md) | ≥ $4,000 (bond + insurance seed) |
 | Understand the machine | [Protocol chapters](../protocol/architecture.md) | curiosity |
 

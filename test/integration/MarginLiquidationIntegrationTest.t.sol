@@ -30,92 +30,88 @@ contract MarginLiquidationIntegrationTest is IntegrationBase {
 
     // ============================ 24h-lagged MMR ============================
 
-    /// @notice The lagged-MMR threshold only becomes available once ≥24h of hourly samples exist:
-    ///         `getLaggedMmr()` walks the ring buffer for the newest sample ≥24h old. Before that
-    ///         history accrues it returns 0 (falling back to entryMmrBp); after 24h it returns a real
-    ///         historical MMR. This exercises MmrSampleLib.record + laggedMmr through the live pair.
-    function test_e2e_LaggedMmr_BecomesAvailableAfter24hOfSamples() public {
+    /// @notice A pair younger than the grace period has no sample old enough to open a 24h window,
+    ///         and `getLaggedMmr()` falls back to the lowest rate it has recorded, so positions on a
+    ///         new pair still get a lagged threshold. Once ≥24h of hourly samples exist, the window
+    ///         opens on the newest sample ≥24h old. This exercises MmrSampleLib.record + laggedMmr
+    ///         through the live pair.
+    function test_e2e_LaggedMmr_YoungPairUsesItsWholeHistory() public {
         _deposit(alice, 20_000 * BAZAAR_SCALE);
         // A resting long limit far below oracle — never crosses (no counterparty). The arrival
         // itself records the first MMR sample; each hourly placement records another.
         _placeLimit(alice, true, BAZAAR_SCALE / 100, 40_000 * BAZAAR_SCALE);
         _roll(2);
+        (, uint256 mmrAtStart,,) = pair.marginRequirements();
 
-        // A second sample an hour later; nothing is ≥24h old yet.
+        // A second sample an hour later; nothing is ≥24h old yet, so the whole history counts.
         _sampleHour();
-        (uint256 laggedEarly,) = pair.getLaggedMmr();
-        assertEq(laggedEarly, 0, "no >=24h-old sample yet");
+        uint256 laggedEarly = pair.getLaggedMmr();
+        assertGt(laggedEarly, 0, "a young pair still has a lagged MMR");
+        assertLe(laggedEarly, mmrAtStart, "the lowest rate recorded so far");
 
         // Lay a full ring of hourly samples spanning >24h.
         for (uint256 i = 0; i < 25; i++) {
             _sampleHour();
         }
 
-        (uint256 lagged,) = pair.getLaggedMmr();
-        assertGt(lagged, 0, "a >=24h-old sample is now the lagged MMR");
-        (, uint256 mmrNow,,,) = pair.marginRequirements();
+        uint256 lagged = pair.getLaggedMmr();
+        assertGt(lagged, 0, "a >=24h-old sample now opens the window");
+        (, uint256 mmrNow,,) = pair.marginRequirements();
         assertGt(mmrNow, 0, "current MMR is set");
     }
 
-    /// @notice A liquidation refreshes the margin curve (lastUpdateTs = now) and records an MMR
-    ///         sample — so MMR sampling is not gated solely on order arrivals. That sample becomes
-    ///         the lagged MMR once a mark 24h newer than it exists: the grace is measured back from
-    ///         the price positions are valued against, so a sample ages into the window when the
-    ///         price advances, not when the block clock does.
+    /// @notice A liquidation refreshes the margin curve (lastUpdateTs = now) and records the rate it
+    ///         sets, so the ring is not advanced by order arrivals alone: the record is in the
+    ///         lagged minimum at once, through the open interval.
     function test_e2e_LaggedMmr_LiquidationRefreshesMarginAndSamples() public {
         _setupInsolventAlice();
 
         vm.prank(bob);
         assertEq(pair.liquidate(_arr1(alice), _freshPrice()), 1, "alice liquidated");
 
-        (, uint256 mmrAfter, uint256 lastTs,,) = pair.marginRequirements();
+        (, uint256 mmrAfter, uint256 lastTs,) = pair.marginRequirements();
         assertEq(lastTs, vm.getBlockTimestamp(), "margin curve refreshed at liquidation");
         assertGt(mmrAfter, 0, "MMR set");
+        uint256 lagged = pair.getLaggedMmr();
+        assertGt(lagged, 0, "the pair has a lagged MMR");
+        assertLe(lagged, mmrAfter, "no higher than the rate the liquidation recorded");
 
-        // 24h of wall time alone does not admit the sample: the stored mark is still the one the
-        // liquidation wrote, so the cutoff has not moved off it.
+        // A day later, with a fresh mark, the window opens on the interval in force at the
+        // liquidation; the rate has not moved since, so that is the lagged MMR.
         vm.warp(vm.getBlockTimestamp() + 24 hours + 1);
-        (uint256 laggedNoMark,) = pair.getLaggedMmr();
-        assertEq(laggedNoMark, 0, "the cutoff follows the mark, not the block clock");
-
-        // A mark stamped 24h after the sample admits it.
         _pokePrice(50_000);
-        (uint256 laggedAfter,) = pair.getLaggedMmr();
-        assertEq(laggedAfter, mmrAfter, "liquidation-time sample is the lagged MMR");
+        assertEq(pair.getLaggedMmr(), mmrAfter, "liquidation-time rate is the lagged MMR");
     }
 
-    /// @notice refreshPrice() is the permissionless way to advance BOTH halves of the lagged
-    ///         threshold through a trading gap: it records an MMR sample and it advances the mark
-    ///         the grace period is measured back from. With no arrivals and no liquidations neither
-    ///         moves, so a silent week leaves the ring holding nothing the cutoff admits and
-    ///         positions fall back to their entry MMR. Two pokes 24h apart — one to lay a sample,
-    ///         one to give it a mark to age against — bring the threshold back to reality.
+    /// @notice refreshPrice() is the permissionless way to keep both halves of the lagged
+    ///         threshold moving through a trading gap: it recomputes the margin curve, records the
+    ///         rate it sets, and advances the mark the grace period is measured back from. A silent
+    ///         week moves neither, and the pair keeps the lagged rate it had before the gap.
     function test_e2e_LaggedMmr_RefreshPriceAdvancesRingDuringTradingGap() public {
         // Lay real samples via order arrivals, then go quiet.
         _deposit(alice, 20_000 * BAZAAR_SCALE);
         _placeLimit(alice, true, BAZAAR_SCALE / 100, 40_000 * BAZAAR_SCALE);
         _roll(2);
         _sampleHour();
+        (, uint256 mmrPreGap,,) = pair.marginRequirements();
 
-        // A week of silence advances neither the ring nor the mark, so the cutoff still sits 24h
-        // before a price recorded at the start of the gap — ahead of every sample in the ring.
+        // A week of silence advances neither the ring nor the mark.
         vm.warp(vm.getBlockTimestamp() + 7 days);
-        (uint256 laggedFrozen,) = pair.getLaggedMmr();
-        assertEq(laggedFrozen, 0, "frozen mark: no sample is 24h older than it");
+        uint256 laggedFrozen = pair.getLaggedMmr();
+        assertGt(laggedFrozen, 0, "frozen mark: the pre-gap lagged rate stands");
+        assertLe(laggedFrozen, mmrPreGap, "no higher than the pre-gap rate");
 
-        // Permissionless poke from an outsider with no orders or position. It records a sample and
-        // moves the mark forward a week, which by itself admits the pre-gap samples.
+        // Permissionless poke from an outsider with no orders or position: it recomputes the curve
+        // and records the rate it sets.
         _pokePrice(50_000);
-        (, uint256 mmrNow, uint256 lastTs,,) = pair.marginRequirements();
+        (, uint256 mmrNow, uint256 lastTs,) = pair.marginRequirements();
         assertEq(lastTs, vm.getBlockTimestamp(), "margin curve recomputed by the poke");
-        (uint256 laggedAfterPoke,) = pair.getLaggedMmr();
-        assertGt(laggedAfterPoke, 0, "the advanced mark admits the pre-gap samples");
+        assertLe(pair.getLaggedMmr(), mmrNow, "the poke's record is in the lagged minimum");
 
-        // The poke's own sample rules only once a second mark 24h newer than it lands.
+        // A day later a second poke's mark puts the first poke's interval at the cutoff.
         vm.warp(vm.getBlockTimestamp() + 24 hours + 1);
         _pokePrice(50_000);
-        (uint256 laggedPoke,) = pair.getLaggedMmr();
-        assertEq(laggedPoke, mmrNow, "poke-time sample is the lagged MMR once a 24h-newer mark exists");
+        assertEq(pair.getLaggedMmr(), mmrNow, "poke-time rate is the lagged MMR once a 24h-newer mark exists");
     }
 
     // ============================ close / reduce round-trip ============================
@@ -167,7 +163,7 @@ contract MarginLiquidationIntegrationTest is IntegrationBase {
         assertEq(_posSize(alice), size, "opened 1 BTC");
 
         BazaarTypes.BucketState memory st = lens.checkBucketSolvency(address(pair), alice, 50_000 * BAZAAR_SCALE);
-        (uint256 imrBp,,,,) = pair.marginRequirements();
+        (uint256 imrBp,,,) = pair.marginRequirements();
         uint256 imrReq = imrBp * st.currentNotional / 10_000;
         assertGt(st.availableEquity, imrReq, "position has free collateral");
         uint256 free = st.availableEquity - imrReq;

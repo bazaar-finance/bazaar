@@ -9,6 +9,8 @@ import {CollateralLib} from "../../src/libraries/CollateralLib.sol";
 import {InsuranceVaultLib} from "../../src/libraries/InsuranceVaultLib.sol";
 import {VaultHealthLib} from "../../src/libraries/VaultHealthLib.sol";
 import {AdlLib} from "../../src/libraries/AdlLib.sol";
+import {FundingLib} from "../../src/libraries/FundingLib.sol";
+import {MockArbSys} from "../mocks/MockArbSys.sol";
 
 /// @notice Minimal stand-in exposing only the IBazaarPairLens selectors the Lens reads, with
 ///         settable state — lets us drive the Lens's computed getters without a full pair deploy.
@@ -30,11 +32,19 @@ contract MockPairForLens {
     mapping(address => uint256) public terminalProfitClaim;
     uint256 public fixedSettlementPrice;
     uint256 public settlementPriceFixedTs;
+    bool public isPairTerminated;
+    uint256 public scheduledTerminationTs;
+    // No token behind it: the lens reads an unreadable USDC balance as no shortfall.
+    address public usdc;
+    // The deposits ledger, set high enough that it never caps a withdrawal quote.
+    uint256 internal deposited_ = 1e30;
     uint256 internal snapPrice;
     int256 internal snapFundingIdx;
     bool internal snapAdlLongs;
-    uint256 internal frozenPrincipalRatioBp;
-    uint256 internal frozenProfitRatioBp;
+    uint256 internal deferredCount_;
+    int256 internal fundingIdx_;
+    uint256 internal frozenPrincipalRatio;
+    uint256 internal frozenProfitRatio;
     uint256 internal imrBp_;
     uint256 internal mmrBp_;
     uint256 internal laggedMmrBp_;
@@ -50,16 +60,42 @@ contract MockPairForLens {
         insuranceShares[u] = s;
     }
 
+    // Raw storage the lens reads through extsload, at BazaarPair's slots.
+    mapping(bytes32 => bytes32) internal slots;
+    uint256 internal constant SLOT_USER_ACTIVE_LIMIT_ORDERS = 2;
+    uint256 internal constant SLOT_MARK_PREMIUM_NOTIONAL = 63;
+    uint256 internal constant SLOT_FEE_ESCROW_TOTAL = 106;
+    uint256 internal constant SLOT_FEE_ESCROW_CLAIMABLE = 107;
+
+    function extsload(bytes32 slot) external view returns (bytes32) {
+        return slots[slot];
+    }
+
+    // The mark line: the premium tally at its slot, the anchor and volume tally through auxState.
+    uint256 internal markAnchor_;
+    uint256 internal markVolume_;
+    uint256 internal longOI_;
+    uint256 internal shortOI_;
+
+    function setMarkLine(int256 premiumNotional, uint256 anchor, uint256 volume) external {
+        slots[bytes32(SLOT_MARK_PREMIUM_NOTIONAL)] = bytes32(uint256(premiumNotional));
+        markAnchor_ = anchor;
+        markVolume_ = volume;
+    }
+
+    function setOpenInterest(uint256 longOI, uint256 shortOI) external {
+        longOI_ = longOI;
+        shortOI_ = shortOI;
+    }
+
     mapping(address => uint256) internal claimable_;
     uint256 internal claimableTotal_;
 
     function setClaimable(address who, uint256 amount) external {
         claimableTotal_ = claimableTotal_ - claimable_[who] + amount;
         claimable_[who] = amount;
-    }
-
-    function claimableFees(address who) external view returns (uint256 owed, uint256 total) {
-        return (claimable_[who], claimableTotal_);
+        slots[keccak256(abi.encode(who, SLOT_FEE_ESCROW_CLAIMABLE))] = bytes32(amount);
+        slots[bytes32(SLOT_FEE_ESCROW_TOTAL)] = bytes32(claimableTotal_);
     }
 
     /// @dev Sets both clocks to `since_`: they coincide on an auction no discontinuity has
@@ -71,10 +107,21 @@ contract MockPairForLens {
         adlAuctionStartTs = since_;
     }
 
-    function setAdlSnapshot(uint256 price_, int256 fundingIdx_, bool adlLongs_) external {
+    function setAdlSnapshot(uint256 price_, int256 snapFundingIdx_, bool adlLongs_) external {
         snapPrice = price_;
-        snapFundingIdx = fundingIdx_;
+        snapFundingIdx = snapFundingIdx_;
         snapAdlLongs = adlLongs_;
+    }
+
+    /// @dev Deferred liquidations left open for the auction: while nonzero, the inventory's own
+    ///      side is a candidate cohort too.
+    function setDeferredCount(uint256 n) external {
+        deferredCount_ = n;
+    }
+
+    /// @dev The live funding index, which the deferred cohort ranks against.
+    function setFundingIndex(int256 idx_) external {
+        fundingIdx_ = idx_;
     }
 
     function setBucket(address u, bool isLong_, uint256 size_, uint256 entryValue_, uint256 collateral_) external {
@@ -93,11 +140,13 @@ contract MockPairForLens {
         terminalProfitClaim[u] = claim;
     }
 
-    function setTerminal(uint256 fixedPrice_, uint256 fixedTs_, uint256 principalBp_, uint256 profitBp_) external {
+    function setTerminal(uint256 fixedPrice_, uint256 fixedTs_, uint256 principalRatio_, uint256 profitRatio_)
+        external
+    {
         fixedSettlementPrice = fixedPrice_;
         settlementPriceFixedTs = fixedTs_;
-        frozenPrincipalRatioBp = principalBp_;
-        frozenProfitRatioBp = profitBp_;
+        frozenPrincipalRatio = principalRatio_;
+        frozenProfitRatio = profitRatio_;
     }
 
     function setContinuouslyTraded(bool v) external {
@@ -110,15 +159,77 @@ contract MockPairForLens {
         laggedMmrBp_ = laggedMmrBp;
     }
 
-    function setOrderExposure(uint256 longExp, uint256 shortExp) external {
+    /// @dev Two synthetic resting orders for WINNER, one per side, worth `longExp` and `shortExp`
+    ///      at a $100 limit, so size × limit is the exposure and the lens's size-at-mark floor
+    ///      reproduces the same figure at a $100 mark (the price these tests pass) or less.
+    uint256 internal constant SYNTHETIC_LIMIT = 100e18;
+
+    address internal exposureOwner_;
+
+    function setOrderExposure(address who, uint256 longExp, uint256 shortExp) external {
+        exposureOwner_ = who;
         longOrderExposure_ = longExp;
         shortOrderExposure_ = shortExp;
+        bytes32 base = keccak256(abi.encode(who, SLOT_USER_ACTIVE_LIMIT_ORDERS));
+        slots[base] = bytes32(uint256(2));
+        uint256 data = uint256(keccak256(abi.encode(base)));
+        slots[bytes32(data)] = bytes32(uint256(1));
+        slots[bytes32(data + 1)] = bytes32(uint256(2));
     }
 
-    function outstandingOrderExposure(address) external view returns (uint256, uint256, uint256, uint256) {
-        // Sizes stay 0: the lens's reserve-at-mark max is a no-op here, so these tests pin the
-        // ceiling math against the exposure values exactly as set.
-        return (longOrderExposure_, shortOrderExposure_, 0, 0);
+    /// @dev The pair's `orders` getter for the two synthetic orders: id 1 long, id 2 short, each
+    ///      sized so remainder × limit equals the exposure set, never expiring.
+    function orders(uint256 orderId)
+        external
+        view
+        returns (
+            address,
+            uint64,
+            BazaarTypes.OrderType,
+            bool,
+            bool,
+            BazaarTypes.TimeInForce,
+            address,
+            uint64,
+            bool,
+            uint24,
+            uint128,
+            uint128,
+            uint128,
+            uint128,
+            uint48,
+            uint64,
+            uint32,
+            uint16,
+            uint48,
+            uint48
+        )
+    {
+        bool isLong = orderId == 1;
+        uint256 exposure = isLong ? longOrderExposure_ : shortOrderExposure_;
+        uint128 size = uint128(exposure * 1e18 / SYNTHETIC_LIMIT);
+        return (
+            exposureOwner_,
+            0,
+            BazaarTypes.OrderType.Limit,
+            isLong,
+            false,
+            BazaarTypes.TimeInForce.GTC,
+            address(0),
+            type(uint64).max,
+            true,
+            0,
+            0,
+            uint128(SYNTHETIC_LIMIT),
+            size,
+            0,
+            uint48(orderId),
+            0,
+            0,
+            0,
+            0,
+            0
+        );
     }
 
     function setPendingLiq(uint256 size_, uint256 entry_, uint256 bk_, bool isLong_) external {
@@ -140,6 +251,12 @@ contract MockPairForLens {
         pLiqSeized = seized_;
     }
 
+    uint64 internal pLiqSeizedTs;
+
+    function setPendingLiqSeizedTs(uint64 ts_) external {
+        pLiqSeizedTs = ts_;
+    }
+
     function setTargetInsuranceRatioBp(uint256 bp) external {
         targetInsuranceRatioBp_ = bp;
     }
@@ -155,34 +272,23 @@ contract MockPairForLens {
     function positionBuckets(address u)
         external
         view
-        returns (bool, uint256, uint256, uint256, int256, uint256, uint256, uint256, uint256)
+        returns (bool, uint256, uint256, uint256, int256, uint256, uint256)
     {
         BazaarTypes.PositionBucket storage b = buckets[u];
-        return (
-            b.isLong,
-            b.size,
-            b.entryValue,
-            b.collateral,
-            b.entryFundingIndex,
-            b.takeProfitOrderId,
-            b.stopLossOrderId,
-            b.entryMmrBp,
-            b.mmrUpdateTs
-        );
+        return
+            (b.isLong, b.size, b.entryValue, b.collateral, b.entryFundingIndex, b.takeProfitOrderId, b.stopLossOrderId);
     }
 
-    function currentFundingIndex() external pure returns (int256) {
-        return 0;
+    function currentFundingIndex() external view returns (int256) {
+        return fundingIdx_;
     }
 
-    function marginRequirements() external view returns (uint256, uint256, uint256, uint256, uint256) {
-        return (imrBp_, mmrBp_, 0, laggedMmrBp_, 0);
+    function marginRequirements() external view returns (uint256, uint256, uint256, uint256) {
+        return (imrBp_, mmrBp_, 0, laggedMmrBp_);
     }
 
-    /// @dev Sample timestamp 0: setBucket leaves mmrUpdateTs at 0, so effectiveMmr's guard keeps
-    ///      every bucket here on the entry branch and the lagged rate is inert either way.
-    function getLaggedMmr() external view returns (uint256, uint256) {
-        return (laggedMmrBp_, 0);
+    function getLaggedMmr() external view returns (uint256) {
+        return laggedMmrBp_;
     }
 
     function pairId() external pure returns (bytes32) {
@@ -206,15 +312,18 @@ contract MockPairForLens {
             bool,
             uint256,
             uint256,
-            uint256
+            uint256,
+            uint256,
+            uint64,
+            uint128
         )
     {
         return (
+            longOI_,
+            shortOI_,
             0,
             0,
-            0,
-            0,
-            0,
+            deposited_,
             insuranceFundBalance,
             pLiqSize,
             pLiqEntry,
@@ -223,17 +332,23 @@ contract MockPairForLens {
             pLiqIsLong,
             0,
             targetInsuranceRatioBp_,
-            pLiqSeized
+            pLiqSeized,
+            0,
+            pLiqSeizedTs,
+            0
         );
     }
 
     function auxState() external view returns (BazaarTypes.AuxState memory a) {
+        a.lastMarkUpdateTs = markAnchor_;
+        a.rollingVolume = markVolume_;
         a.adlSnapshotPrice = snapPrice;
         a.adlSnapshotFundingIndex = snapFundingIdx;
         a.adlLongs = snapAdlLongs;
+        a.deferredCount = deferredCount_;
         a.settlementPrice = fixedSettlementPrice;
-        a.terminalPrincipalRatioBp = frozenPrincipalRatioBp;
-        a.terminalProfitRatioBp = frozenProfitRatioBp;
+        a.terminalPrincipalRatio = frozenPrincipalRatio;
+        a.terminalProfitRatio = frozenProfitRatio;
         return a;
     }
 }
@@ -263,6 +378,7 @@ contract BazaarPairLensTest is Test {
         lens = new BazaarPairLens(address(factory));
         pair = new MockPairForLens();
         vm.warp(1_000_000);
+        vm.etch(address(0x64), address(new MockArbSys()).code); // ArbSys precompile the lens expires orders by
     }
 
     // ---------------- fee escrow views ----------------
@@ -330,7 +446,8 @@ contract BazaarPairLensTest is Test {
     }
 
     function test_getTypehashes() public view {
-        (bytes32 dep, bytes32 wd, bytes32 di, bytes32 ei, bytes32 co, bytes32 ca, bytes32 ri) = lens.getTypehashes();
+        (bytes32 dep, bytes32 wd, bytes32 di, bytes32 ei, bytes32 co, bytes32 ca, bytes32 ri, bytes32 am) =
+            lens.getTypehashes();
         assertEq(dep, MetaTxLib.DEPOSIT_COLLATERAL_TYPEHASH);
         assertEq(wd, MetaTxLib.WITHDRAW_COLLATERAL_TYPEHASH);
         assertEq(di, MetaTxLib.DEPOSIT_TO_INSURANCE_TYPEHASH);
@@ -338,12 +455,55 @@ contract BazaarPairLensTest is Test {
         assertEq(co, MetaTxLib.CREATE_ORDER_TYPEHASH);
         assertEq(ca, MetaTxLib.CANCEL_ORDERS_TYPEHASH);
         assertEq(ri, MetaTxLib.REQUEST_INSURANCE_WITHDRAWAL_TYPEHASH);
+        assertEq(am, MetaTxLib.AMEND_ORDERS_TYPEHASH);
     }
 
     function test_getOrderLifetimeConstants() public view {
         (uint64 minL, uint64 maxL) = lens.getOrderLifetimeConstants();
         assertEq(minL, BazaarTypes.MIN_ORDER_LIFETIME_BLOCKS);
         assertEq(maxL, BazaarTypes.MAX_ORDER_LIFETIME_BLOCKS);
+    }
+
+    function test_getMarkConstants() public view {
+        (uint256 exposure, uint256 floorBp, uint256 alphaBp, uint256 bandBp, uint256 decay) = lens.getMarkConstants();
+        assertEq(exposure, FundingLib.MAKER_EXPOSURE_BLOCKS);
+        assertEq(floorBp, FundingLib.VOLUME_FLOOR_BP);
+        assertEq(alphaBp, FundingLib.MAX_ALPHA);
+        assertEq(bandBp, FundingLib.MAX_MARK_DEVIATION_BP);
+        assertEq(decay, FundingLib.MARK_DECAY_PERIOD);
+    }
+
+    /// @notice markPrice reads the pair's two tallies over the floor its open interest sets, carried
+    ///         on the last stored price, exactly as FundingLib.currentMark reads them, and 0 before
+    ///         a mark has formed.
+    function test_markPrice_readsTheLineOverTheFloor() public {
+        vm.warp(1_700_000_000);
+        assertEq(lens.markPrice(address(pair)), 0, "no mark before a line forms");
+
+        pair.setMark(200e18); // the stored price
+        pair.setOpenInterest(20e18, 20e18); // $4,000 of notional a side: an $80 floor
+        uint256 floorVolume = FundingLib.floorVolumeOf(20e18, 200e18);
+        assertEq(floorVolume, 80e18, "fixture: 2% of $4,000");
+        uint256 anchor = block.timestamp - 10 minutes;
+
+        // $100 of volume at 3%, ten minutes in: still above the floor, so the ratio stands.
+        pair.setMarkLine(3e18, anchor, 100e18);
+        assertEq(
+            lens.markPrice(address(pair)),
+            FundingLib.currentMark(3e18, 100e18, anchor, floorVolume, 200e18),
+            "the library's reading, above the floor"
+        );
+        assertEq(lens.markPrice(address(pair)), 206e18, "3% over $200");
+
+        // $20 of volume at 3%: under the floor, so the premium tally is read over the floor. Ten
+        // minutes in, 0.5 of premium tally over $80 is 0.625%.
+        pair.setMarkLine(6e17, anchor, 20e18);
+        assertEq(
+            lens.markPrice(address(pair)),
+            FundingLib.currentMark(6e17, 20e18, anchor, floorVolume, 200e18),
+            "the library's reading, under the floor"
+        );
+        assertEq(lens.markPrice(address(pair)), 201_25e16, "0.625% over $200");
     }
 
     function test_getMinCollateralAmount() public view {
@@ -434,17 +594,18 @@ contract BazaarPairLensTest is Test {
     }
 
     /// @notice The loss deduction stops at free capital above the reserve. With a 100% target the
-    ///         reserve on ten units at 40 is 80, so of a 90 loss the fund bears 60 and the basis is
-    ///         the reserve itself; a redemption and the stored-mark view price off the same figure.
+    ///         reserve on ten units at 30 is 30, so of a 190 loss the fund bears the 110 above the
+    ///         reserve and the basis is the reserve itself — the auction charges the rest to
+    ///         winners; a redemption and the stored-mark view price off the same figure.
     function test_quoteInsurance_lossCappedAtFreeAboveReserve() public {
         pair.setInsurance(100 * SCALE, 150 * SCALE);
         pair.setPendingLiq(10 * SCALE, 500 * SCALE, 490 * SCALE, true);
         pair.setPendingLiqSeized(10 * SCALE);
         pair.setTargetInsuranceRatioBp(10_000);
-        assertEq(lens.quoteInsuranceDeposit(address(pair), 8 * SCALE, 40 * SCALE), 10 * SCALE, "8 / 0.8");
-        assertEq(lens.quoteInsuranceWithdrawal(address(pair), 20 * SCALE, 40 * SCALE), 16 * SCALE, "20 x 0.8");
-        pair.setMark(40 * SCALE);
-        assertEq(lens.getInsuranceSharePrice(address(pair)), 8 * SCALE / 10, "0.8 at the stored mark");
+        assertEq(lens.quoteInsuranceDeposit(address(pair), 3 * SCALE, 30 * SCALE), 10 * SCALE, "3 / 0.3");
+        assertEq(lens.quoteInsuranceWithdrawal(address(pair), 20 * SCALE, 30 * SCALE), 6 * SCALE, "20 x 0.3");
+        pair.setMark(30 * SCALE);
+        assertEq(lens.getInsuranceSharePrice(address(pair)), 3 * SCALE / 10, "0.3 at the stored mark");
     }
 
     /// @notice Quotes mirror the pair's par branches: an empty pool, or one a realized wipe is
@@ -561,34 +722,108 @@ contract BazaarPairLensTest is Test {
         assertFalse(eligible, "5.0 < opening threshold");
     }
 
+    // -------- each cohort ranks at its own price --------
+
+    /// @dev A long on the inventory's own side (the window's inventory is long: adlLongs=false),
+    ///      a candidate only against the deferred liquidations.
+    address constant DEFERRED_ALLY = address(0xD1F);
+
+    /// @notice An account on the inventory's own side closes against the deferred liquidations,
+    ///         which the chain ranks at the price the call attests, so the lens scores it at the
+    ///         pair's last stored price: a long from $80 on $10 is $20 up at the $100 snapshot
+    ///         but $40 up at the $120 mark, and a cohort sorted by the snapshot figure is
+    ///         refused on-chain.
+    function test_getAdlScore_deferredCohort_ranksAtTheStoredPrice() public {
+        _setupAdlWindow();
+        pair.setDeferredCount(1);
+        pair.setMark(120 * SCALE);
+        pair.setBucket(DEFERRED_ALLY, true, 1 * SCALE, 80 * SCALE, 10 * SCALE);
+        (uint256 score, bool eligible) = lens.getAdlScore(address(pair), DEFERRED_ALLY);
+        assertEq(score, 4 * SCALE, "$40 pnl at the $120 mark / $10, not the snapshot's $20");
+        assertTrue(eligible, "past the auction: threshold 1");
+    }
+
+    /// @notice The same cohort reads the live funding index, not the snapshot's: an index of +10
+    ///         per unit since entry debits a long $10, so at a $100 mark the long from $80 is
+    ///         $20 - $10 = $10 up on $10 collateral.
+    function test_getAdlScore_deferredCohort_ranksAtTheLiveFundingIndex() public {
+        _setupAdlWindow();
+        pair.setDeferredCount(1);
+        pair.setMark(100 * SCALE);
+        pair.setFundingIndex(10 * int256(SCALE));
+        pair.setBucket(DEFERRED_ALLY, true, 1 * SCALE, 80 * SCALE, 10 * SCALE);
+        (uint256 score,) = lens.getAdlScore(address(pair), DEFERRED_ALLY);
+        assertEq(score, 1 * SCALE, "($20 price pnl - $10 funding) / $10 at the live index");
+    }
+
+    /// @notice A profit that exists only at the snapshot is no profit for this cohort: the long
+    ///         from $80 is up at the $100 snapshot and under water at a $75 mark, so it scores 0.
+    function test_getAdlScore_deferredCohort_losingAtTheMark_zero() public {
+        _setupAdlWindow();
+        pair.setDeferredCount(1);
+        pair.setMark(75 * SCALE);
+        pair.setBucket(DEFERRED_ALLY, true, 1 * SCALE, 80 * SCALE, 10 * SCALE);
+        (uint256 score, bool eligible) = lens.getAdlScore(address(pair), DEFERRED_ALLY);
+        assertEq(score, 0, "no profit at the ranking price");
+        assertFalse(eligible);
+    }
+
+    /// @notice The same cohort ranks on its full collateral, as AdlLib._closeDeferred does: a
+    ///         deposit tagged to the live window is not subtracted, so the long from $80 on $10
+    ///         scores $20 / $10 at the $100 mark whatever its tag says, where the inventory's
+    ///         counterparties would be ranked on $10 - $9.
+    function test_getAdlScore_deferredCohort_windowDepositNotSubtracted() public {
+        _setupAdlWindow();
+        pair.setDeferredCount(1);
+        pair.setMark(100 * SCALE);
+        pair.setBucket(DEFERRED_ALLY, true, 1 * SCALE, 80 * SCALE, 10 * SCALE);
+        pair.setAdlScoreDeposit(DEFERRED_ALLY, 9 * SCALE);
+        (uint256 score,) = lens.getAdlScore(address(pair), DEFERRED_ALLY);
+        assertEq(score, 2 * SCALE, "$20 pnl / the full $10, not / ($10 - $9)");
+    }
+
+    /// @notice The inventory's counterparties keep ranking at the frozen snapshot whatever the
+    ///         mark and the funding index do since: the short from $150 scores 5.0 at the $100
+    ///         snapshot although at the $120 mark it is only $30 up and the live index has moved.
+    function test_getAdlScore_winners_stayAtTheSnapshotWhenTheMarkMoves() public {
+        _setupAdlWindow();
+        pair.setDeferredCount(1);
+        pair.setMark(120 * SCALE);
+        pair.setFundingIndex(10 * int256(SCALE));
+        pair.setBucket(WINNER, false, 1 * SCALE, 150 * SCALE, 10 * SCALE);
+        (uint256 score, bool eligible) = lens.getAdlScore(address(pair), WINNER);
+        assertEq(score, 5 * SCALE, "$50 pnl at the $100 snapshot / $10");
+        assertTrue(eligible);
+    }
+
     // ---------------- terminal entitlement ----------------
 
     function test_getTerminalEntitlement_windowOpen_payoutZero() public {
         pair.setBucket(WINNER, false, 0, 0, 500 * SCALE);
         pair.setTerminalClaim(WINNER, 100 * SCALE);
         pair.setTerminal(50_000 * SCALE, block.timestamp, 0, 0); // window open, ratios not frozen yet
-        (uint256 coll, uint256 claim, uint256 principalBp, uint256 profitBp, uint256 payout) =
+        (uint256 coll, uint256 claim, uint256 principalRatio, uint256 profitRatio, uint256 payout) =
             lens.getTerminalEntitlement(address(pair), WINNER);
         assertEq(coll, 500 * SCALE);
         assertEq(claim, 100 * SCALE, "claim registered during the window");
-        assertEq(principalBp, 0, "ratios not frozen until finalize");
-        assertEq(profitBp, 0);
+        assertEq(principalRatio, 0, "ratios not frozen until finalize");
+        assertEq(profitRatio, 0);
         assertEq(payout, 0, "payout unknown until finalize");
     }
 
     function test_getTerminalEntitlement_frozenRatios_payout() public {
         pair.setBucket(WINNER, false, 0, 0, 500 * SCALE);
         pair.setTerminalClaim(WINNER, 100 * SCALE);
-        pair.setTerminal(50_000 * SCALE, block.timestamp, 10_000, 8_000); // finalized: profits at 80%
-        (uint256 coll, uint256 claim, uint256 principalBp, uint256 profitBp, uint256 payout) =
+        pair.setTerminal(50_000 * SCALE, block.timestamp, SCALE, 8 * SCALE / 10); // finalized: profits at 80%
+        (uint256 coll, uint256 claim, uint256 principalRatio, uint256 profitRatio, uint256 payout) =
             lens.getTerminalEntitlement(address(pair), WINNER);
         assertEq(coll, 500 * SCALE);
         assertEq(claim, 100 * SCALE);
-        assertEq(principalBp, 10_000);
-        assertEq(profitBp, 8_000);
+        assertEq(principalRatio, SCALE);
+        assertEq(profitRatio, 8 * SCALE / 10);
         assertEq(payout, 580 * SCALE, "500 principal + 100 claim x 80%");
 
-        pair.setTerminal(50_000 * SCALE, block.timestamp, 7_500, 0); // cash short of principal
+        pair.setTerminal(50_000 * SCALE, block.timestamp, 75 * SCALE / 100, 0); // cash short of principal
         (,,,, payout) = lens.getTerminalEntitlement(address(pair), WINNER);
         assertEq(payout, 375 * SCALE, "500 x 75%, claim pays nothing");
     }
@@ -603,11 +838,12 @@ contract BazaarPairLensTest is Test {
     function test_getMaxWithdrawable_flatWithOrders_reservesOrderImr() public {
         pair.setBucket(WINNER, false, 0, 0, 100 * SCALE);
         pair.setMarginReqs(1_000, 500, 500); // IMR 10%
-        pair.setOrderExposure(50 * SCALE, 200 * SCALE); // larger side: $200 short
+        pair.setMark(100 * SCALE); // the synthetic orders sit at the mark: no loss is booked
+        pair.setOrderExposure(WINNER, 50 * SCALE, 200 * SCALE); // larger side: $200 short
         assertEq(
             lens.getMaxWithdrawable(address(pair), WINNER, 0),
-            80 * SCALE,
-            "collateral less 10% of the larger resting side"
+            80 * SCALE - 125 * SCALE / 10_000,
+            "collateral less 10% of the larger resting side, less the maker fee on both sides"
         );
     }
 
@@ -647,9 +883,11 @@ contract BazaarPairLensTest is Test {
     function test_getMaxWithdrawable_position_orderExposureWidensImr() public {
         pair.setMarginReqs(1_000, 500, 500);
         pair.setBucket(WINNER, true, 1 * SCALE, 100 * SCALE, 20 * SCALE);
-        pair.setOrderExposure(50 * SCALE, 0); // same-direction resting orders
-        // Worst case = $100 position + $50 same-dir orders -> IMR $15 -> slack $5.
-        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 100 * SCALE), 5 * SCALE);
+        pair.setMark(100 * SCALE); // the synthetic order sits at the mark: no loss is booked
+        pair.setOrderExposure(WINNER, 50 * SCALE, 0); // same-direction resting orders
+        // Worst case = $100 position + $50 same-dir orders -> IMR $15 -> slack $5, less the
+        // maker fee on the $50 order.
+        assertEq(lens.getMaxWithdrawable(address(pair), WINNER, 100 * SCALE), 5 * SCALE - 25 * SCALE / 10_000);
     }
 
     function test_getMaxWithdrawable_frozenStates_zero() public {
@@ -687,12 +925,14 @@ contract BazaarPairLensTest is Test {
     function test_getPendingLiquidationExposure_forwardsFields() public {
         pair.setPendingLiq(5 * SCALE, 250_000 * SCALE, 240_000 * SCALE, true);
         pair.setPendingLiqFundingIndex(-7 * int256(SCALE));
-        (uint256 size, uint256 entry, uint256 bk, int256 fundingIdx, bool isLong) =
+        pair.setPendingLiqSeizedTs(1_700_000_123);
+        (uint256 size, uint256 entry, uint256 bk, int256 fundingIdx, bool isLong, uint64 seizedTs) =
             lens.getPendingLiquidationExposure(address(pair));
         assertEq(size, 5 * SCALE);
         assertEq(entry, 250_000 * SCALE);
         assertEq(bk, 240_000 * SCALE);
         assertEq(fundingIdx, -7 * int256(SCALE), "entry funding index forwarded, sign preserved");
         assertTrue(isLong);
+        assertEq(seizedTs, 1_700_000_123, "seizure stamp forwarded: what the unload floor opens from");
     }
 }

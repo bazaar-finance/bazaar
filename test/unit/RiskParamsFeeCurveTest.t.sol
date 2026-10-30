@@ -19,12 +19,17 @@ contract FeeCurveHarness {
         lastPairPrice.emaVarianceBp = v;
     }
 
-    function setGap(int256 g) external {
-        liquidationGapEma.emaGapBp = g;
+    /// @dev In whole basis points; the stored line is unsigned, so a negative value stores as zero.
+    function setGap(int256 slip) external {
+        liquidationGapEma.slippage = slip > 0 ? uint256(slip) * RiskParamsLib.GAP_EMA_SCALE : 0;
+    }
+
+    function setDrift(int256 drift) external {
+        liquidationGapEma.drift = drift > 0 ? uint256(drift) * RiskParamsLib.GAP_EMA_SCALE : 0;
     }
 
     function setReopenGap(uint192 g) external {
-        reopenGapEma.gapEmaBp = g;
+        reopenGapEma.gapEmaBp = uint128(g);
     }
 
     function setOI(uint256 l, uint256 s) external {
@@ -100,16 +105,17 @@ contract RiskParamsFeeCurveTest is Test {
     }
 
     /// @notice Extreme variance on a 24/7 pair → stress move 450bp → target 4.5% → interpolated
-    ///         base closing fee 96 EBP: half the 9% IMR the same reading produces.
+    ///         base closing fee 159 EBP: half the 9% IMR the same reading produces.
     function test_closingFee_extremeVol() public {
         h.setVariance(BazaarTypes.VARIANCE_EXTREME);
         h.setGap(0);
-        assertEq(h.closingFeeEbp(), 96, "target 4.5% -> interpolated base");
+        assertEq(h.closingFeeEbp(), 159, "target 4.5% -> interpolated base");
     }
 
     /// @notice A NEGATIVE liquidation gap adds nothing to the stress move — fills landing better
-    ///         than bankruptcy are evidence the level holds, not licence to lower it — so the
-    ///         target is the vol leg's alone, here floored at 2% → 50 EBP.
+    ///         than bankruptcy are evidence the level holds, not licence to lower it, and the
+    ///         stored line records them as zero — so the target is the vol leg's alone, here
+    ///         floored at 2% → 50 EBP.
     function test_closingFee_negativeGap_usesVolLegAlone() public {
         h.setVariance(0);
         h.setGap(-500);
@@ -118,19 +124,19 @@ contract RiskParamsFeeCurveTest is Test {
 
     /// @notice A positive gap ADDS to the stress move and so raises the target: calm vol gives
     ///         150bp, a 100bp realized gap makes it 250bp → target 250 → base fee
-    ///         50 + (250-200)*150/800 = 59 EBP.
+    ///         50 + (250-200)*350/800 = 71 EBP.
     function test_closingFee_gapRaisesTarget() public {
         h.setVariance(0); // vol leg 150bp
         h.setGap(100);
-        assertEq(h.closingFeeEbp(), 59, "gap-driven target 2.5% -> interpolated base");
+        assertEq(h.closingFeeEbp(), 71, "gap-driven target 2.5% -> interpolated base");
     }
 
     /// @notice A large gap drives the target to the 10% ceiling: 150 + 900 = 1050bp of stress
-    ///         move, clamped to INSURANCE_TARGET_MAX → base fee 200 EBP.
+    ///         move, clamped to INSURANCE_TARGET_MAX → base fee 400 EBP.
     function test_closingFee_gapClampsAtMax() public {
         h.setVariance(0);
         h.setGap(900);
-        assertEq(h.closingFeeEbp(), 200, "target clamps at 10% -> 2 bp");
+        assertEq(h.closingFeeEbp(), 400, "target clamps at 10% -> 4 bp");
     }
 
     // ==================== taker fee: the above-target arm is flat at the base ====================
@@ -150,27 +156,27 @@ contract RiskParamsFeeCurveTest is Test {
 
     /// @notice A learned reopen gap reaches the target at FULL size, the same number the
     ///         maintenance level is set to survive: reopen 900 -> stress move 900 -> target
-    ///         900bp -> base fee 50 + 700x150/800 = 181 EBP. A continuously traded pair never
+    ///         900bp -> base fee 50 + 700x350/800 = 356 EBP. A continuously traded pair never
     ///         consumes the peak-hold, so the 50 EBP baseline is untouched by the same state.
     function test_closingFee_reopenGapRaisesTarget() public {
         h.setVariance(0);
         h.setGap(0);
         h.setReopenGap(900);
-        assertEq(h.closingFeeEbpNonContinuous(), 181, "reopen-driven target 9% -> interpolated base");
+        assertEq(h.closingFeeEbpNonContinuous(), 356, "reopen-driven target 9% -> interpolated base");
         assertEq(h.closingFeeEbp(), 50, "a 24/7 pair ignores the peak-hold");
     }
 
     /// @notice The same fund flips from above-target to deficit once the pair demonstrates a
     ///         tail: at 300bp coverage the calm 200bp target reads as over-covered (base fee
     ///         50 EBP), but a 900bp learned reopen lifts the target to 900bp -> 66% deficit ->
-    ///         the quadratic surcharge lands the fee at 4,121 EBP, just inside the 45 bp cap.
-    ///         Entry flow starts pre-funding the tail before any losses realize.
+    ///         the quadratic surcharge on the 356 EBP base (8,107 EBP uncapped) reaches the
+    ///         50 bp cap. Entry flow starts pre-funding the tail before any losses realize.
     function test_takerFee_reopenGapFlipsAboveTargetToDeficit() public {
         h.setVariance(0);
         h.setInsurance(30_000 * SCALE); // 300bp coverage
         assertEq(h.takerFeeEbp(PRICE), 50, "baseline: above the calm target, so the base rate");
         h.setReopenGap(900);
-        assertEq(h.takerFeeEbpNonContinuous(PRICE), 4_121, "deficit vs the reopen-raised target");
+        assertEq(h.takerFeeEbpNonContinuous(PRICE), 5_000, "deficit vs the reopen-raised target, at the cap");
     }
 
     // ==================== getInsuranceFundToOIRatio triples ====================

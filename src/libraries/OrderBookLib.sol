@@ -2,58 +2,114 @@
 pragma solidity 0.8.34;
 
 import {BazaarTypes} from "./BazaarTypes.sol";
+import {FundingLib} from "./FundingLib.sol";
 
 /// @title OrderBookLib
 /// @notice The pair's resting order book: two sorted doubly-linked lists threaded through the
 ///         orders mapping via Order.prevInBook/nextInBook, with heads in BazaarTypes.OrderBook.
-///         Bids sort by limitPrice DESC, asks by limitPrice ASC, ties by orderId ASC — an order
-///         at an occupied price always queues behind the orders already resting there.
+///         Bids sort by limitPrice DESC, asks by limitPrice ASC, ties by prioritySeq ASC — an
+///         order at an occupied price always queues behind the orders already resting there.
+///         prioritySeq is the order's id until the order joins its level late — an amend sends
+///         it to the back, or a keeper arms a StopLimit — when it takes a fresh value from the
+///         same counter (BazaarTypes.Order). Every link also stamps the order with the block it
+///         entered the book in (Order.restedBlock) and how far on the far side of the index it
+///         entered (Order.restedPremiumPpm): how long and where it has stood, which bound what
+///         its fills carry into the mark.
 /// @dev Internal library (inlined into callers, no DELEGATECALL hop). Every mutation preserves:
-///       • strict (limitPrice, orderId) ordering along nextInBook on both sides;
+///       • strict (limitPrice, prioritySeq) ordering along nextInBook on both sides;
 ///       • link reciprocity — orders[x].nextInBook == y iff orders[y].prevInBook == x, the head's
 ///         prevInBook is 0 and the tail's nextInBook is 0;
 ///       • inBook is true exactly for orders reachable from their side's head, and
-///         bidCount/askCount equal the traversal lengths.
+///         bidCount/askCount equal the traversal lengths;
+///       • a member's restedBlock is the block of the link that made it a member, and its
+///         restedPremiumPpm the far-side premium it stood at against that link's index.
 ///      insert never links at an unverified position: every candidate placement — hinted or
 ///      found by the repair walk — is checked against the actual neighbors, so a wrong hint can
-///      only fail placement, never mis-place an order. unlink is an unconditional no-op on
-///      non-members, so terminal-state writers (cancel, fill, expiry sweep, liquidation, ADL)
-///      can call it without knowing whether the order ever rested.
+///      only fail placement, never mis-place an order. locate is the read-only half of insert,
+///      for callers that must learn whether a slot is reachable before committing any state.
+///      unlink is an unconditional no-op on non-members, so terminal-state writers (cancel,
+///      fill, expiry sweep, liquidation, ADL) can call it without knowing whether the order
+///      ever rested.
 library OrderBookLib {
     error OrderBookLib__AlreadyInBook(uint256 orderId);
     error OrderBookLib__HintRepairExhausted(uint256 orderId);
 
     /// @notice Link a resting order into its side's list at the position determined by
-    ///         (limitPrice, orderId), using the caller-supplied predecessor hints.
-    /// @dev Placement resolution, in order:
-    ///       1. Head insert when the book side is empty or the order sorts before the head.
-    ///       2. Each non-zero hint in sequence: accepted only if it is live, on the right side,
-    ///          sorts before the new order, and its successor (if any) sorts after it.
-    ///       3. A repair walk from the first live hint (or the head when none is live), in
-    ///          whichever direction the ordering predicate points, capped at MAX_WALK_STEPS —
-    ///          drift between off-chain simulation and inclusion is a few nodes, and past the
-    ///          cap a stale book view should be recomputed off-chain, not searched for on-chain.
+    ///         (limitPrice, prioritySeq), using the caller-supplied predecessor hints.
+    /// @dev Resolves the slot with locate and links there. Reverts when locate gives up, so a
+    ///      caller placing its own order (createOrder) fails loudly and retries with hints
+    ///      recomputed off-chain — past the cap a stale book view should be recomputed, not
+    ///      searched for on-chain. A caller placing someone else's order in a batch of unrelated
+    ///      owners (executeTriggers) must instead call locate first and skip the order when it
+    ///      cannot be placed, since a revert here would unwind the whole batch.
     /// @param orders The pair's order storage.
     /// @param book The pair's book heads/counts.
     /// @param orderId The order to rest. Must carry a non-zero limitPrice and not be in the book.
     /// @param hints Predecessor candidates (see BazaarTypes.MatchHints).
+    /// @param restedBlock The current L2 block, stamped on the order as the start of its exposure
+    ///        (BazaarTypes.Order.restedBlock); the low 32 bits are what the stamp holds.
+    /// @param indexPrice The index the order's far-side premium is stamped against
+    ///        (BazaarTypes.Order.restedPremiumPpm): the caller's fresh oracle price, or 0 when it
+    ///        holds none, which stamps zero.
     function insert(
         mapping(uint256 => BazaarTypes.Order) storage orders,
         BazaarTypes.OrderBook storage book,
         uint256 orderId,
-        BazaarTypes.MatchHints memory hints
+        BazaarTypes.MatchHints memory hints,
+        uint64 restedBlock,
+        uint256 indexPrice
     ) internal {
         BazaarTypes.Order storage o = orders[orderId];
         if (o.inBook) revert OrderBookLib__AlreadyInBook(orderId);
+        (bool found, uint64 pred) = locate(orders, book, orderId, o.prioritySeq, hints);
+        if (!found) revert OrderBookLib__HintRepairExhausted(orderId);
         bool side = o.isLong;
-        // orderIds come from the pair's monotonic counter starting at 1; 2^64 is unreachable.
-        uint64 id = uint64(orderId);
+        uint64 next = pred == 0 ? (side ? book.bidHead : book.askHead) : uint64(orders[pred].nextInBook);
+        uint16 restedPremiumPpm = FundingLib.restedPremiumOf(side, o.limitPrice, indexPrice);
+        // orderIds come from the pair's monotonic counter starting at 1; 2^48 is unreachable.
+        _link(
+            orders, book, o, side, uint48(orderId), uint48(pred), uint48(next), uint32(restedBlock), restedPremiumPpm
+        );
+    }
+
+    /// @notice Find the predecessor an order would rest behind, without touching the book.
+    /// @dev Placement resolution, in order:
+    ///       1. The head when the side is empty or the order sorts before the current head.
+    ///       2. Each non-zero hint in sequence: accepted only if it is live, on the right side,
+    ///          sorts before the new order, and its successor (if any) sorts after it.
+    ///       3. A repair walk from the first live hint (or the head when none is live), in
+    ///          whichever direction the ordering predicate points, capped at MAX_WALK_STEPS —
+    ///          drift between off-chain simulation and inclusion is a few nodes.
+    ///      Never reverts: past the cap it reports not found, which lets a caller choose between
+    ///      reverting (its own order) and skipping (someone else's) before any state has changed.
+    ///      The answer holds for as long as the side's list is unchanged, and an exact hint of
+    ///      `pred` then resolves in step 2 without a walk.
+    /// @param orders The pair's order storage.
+    /// @param book The pair's book heads/counts.
+    /// @param orderId The order to place. Must carry a non-zero limitPrice and not be in the book.
+    /// @param seq The queue position to place it at. insert passes the stored prioritySeq; a
+    ///        caller about to give the order a new one (a StopLimit being armed) passes that
+    ///        value, so the slot is resolved before anything is written and the order must then
+    ///        carry it when insert runs.
+    /// @param hints Predecessor candidates (see BazaarTypes.MatchHints).
+    /// @return found False when no live hint brackets the order and the slot lies more than
+    ///         MAX_WALK_STEPS from the anchor.
+    /// @return pred The orderId to rest directly behind; 0 means the head of the side (and is
+    ///         also what a not-found result carries).
+    function locate(
+        mapping(uint256 => BazaarTypes.Order) storage orders,
+        BazaarTypes.OrderBook storage book,
+        uint256 orderId,
+        uint64 seq,
+        BazaarTypes.MatchHints memory hints
+    ) internal view returns (bool found, uint64 pred) {
+        BazaarTypes.Order storage o = orders[orderId];
+        bool side = o.isLong;
         uint256 price = o.limitPrice;
 
         uint64 head = side ? book.bidHead : book.askHead;
-        if (head == 0 || _precedes(side, price, id, orders[head].limitPrice, head)) {
-            _link(orders, book, o, side, id, 0, head);
-            return;
+        if (head == 0 || _precedesNode(side, price, seq, orders[head])) {
+            return (true, 0);
         }
 
         uint64 anchor = 0;
@@ -64,17 +120,16 @@ library OrderBookLib {
             BazaarTypes.Order storage p = orders[cand];
             if (!p.inBook || p.isLong != side) continue;
             if (anchor == 0) anchor = cand;
-            if (_precedes(side, p.limitPrice, cand, price, id)) {
+            if (_nodePrecedes(side, p, price, seq)) {
                 uint64 nxt = p.nextInBook;
-                if (nxt == 0 || _precedes(side, price, id, orders[nxt].limitPrice, nxt)) {
-                    _link(orders, book, o, side, id, cand, nxt);
-                    return;
+                if (nxt == 0 || _precedesNode(side, price, seq, orders[nxt])) {
+                    return (true, cand);
                 }
             }
         }
         if (anchor == 0) anchor = head;
 
-        _repairInsert(orders, book, o, side, id, price, anchor);
+        return _walkToSlot(orders, side, seq, price, anchor);
     }
 
     /// @notice Remove an order from its side's list; no-op when the order is not in the book.
@@ -85,8 +140,8 @@ library OrderBookLib {
     ) internal {
         BazaarTypes.Order storage o = orders[orderId];
         if (!o.inBook) return;
-        uint64 prv = o.prevInBook;
-        uint64 nxt = o.nextInBook;
+        uint48 prv = o.prevInBook;
+        uint48 nxt = o.nextInBook;
         bool side = o.isLong;
         if (prv == 0) {
             if (side) {
@@ -111,80 +166,134 @@ library OrderBookLib {
         }
     }
 
-    /// @dev Strict ordering predicate: does (priceA, idA) rest ahead of (priceB, idB) on this
-    ///      side? Bids put the higher price first, asks the lower; equal prices put the lower
-    ///      (older) orderId first, which is what enforces time priority within a price level.
-    function _precedes(bool isLongSide, uint256 priceA, uint64 idA, uint256 priceB, uint64 idB)
-        internal
-        pure
-        returns (bool)
-    {
-        if (priceA != priceB) return isLongSide ? priceA > priceB : priceA < priceB;
-        return idA < idB;
+    /// @notice Emit OrderUpdated for an order, reporting its stored state.
+    /// @dev Every payload field is read from storage, so a caller writes the change it reports
+    ///      (a cancel stamp, a capped size) before calling. The one place the payload is
+    ///      assembled, so every library that creates, triggers or cancels orders reports the
+    ///      same fields.
+    /// @param pairId The pair, for the event
+    /// @param orderId The order
+    /// @param o The order's storage
+    /// @param action The lifecycle step being reported
+    /// @param reason Why the order was canceled; None unless action is Canceled
+    function emitOrderUpdated(
+        bytes32 pairId,
+        uint256 orderId,
+        BazaarTypes.Order storage o,
+        BazaarTypes.OrderAction action,
+        BazaarTypes.CancelReason reason
+    ) internal {
+        emit BazaarTypes.OrderUpdated(
+            pairId,
+            orderId,
+            o.creator,
+            BazaarTypes.OrderUpdatePayload({
+                action: action,
+                orderType: o.orderType,
+                isLong: o.isLong,
+                isPostOnly: o.isPostOnly,
+                size: o.size,
+                filledSize: o.filledSize,
+                triggerPrice: o.triggerPrice,
+                limitPrice: o.limitPrice,
+                maxSlippageBp: o.maxSlippageBp,
+                canceledBlock: o.canceledBlock,
+                filledBlock: o.filledBlock,
+                expiryBlock: o.expiryBlock,
+                prioritySeq: o.prioritySeq,
+                tif: o.tif,
+                integrator: o.integrator,
+                cancelReason: reason
+            })
+        );
     }
 
-    /// @dev Walk from `anchor` toward the true slot and link there. Direction follows the
-    ///      ordering predicate: forward via nextInBook when the anchor sorts before the new
-    ///      order, backward via prevInBook otherwise (reaching the head links at the front).
-    ///      Capped at MAX_WALK_STEPS node advances; past it the whole transaction reverts and
-    ///      the submitter retries with freshly computed hints.
-    function _repairInsert(
+    /// @dev Strict ordering predicate: does an order at (price, seq) rest ahead of the resting
+    ///      node `n` on this side? Bids put the higher price first, asks the lower; equal prices
+    ///      put the lower prioritySeq first, which is what enforces time priority within a price
+    ///      level. The node's prioritySeq is read only on a price tie: it shares a slot with the
+    ///      links, so a walk that moves on to the node pays for it anyway, while one that stops
+    ///      at a different price never does.
+    function _precedesNode(bool isLongSide, uint256 price, uint64 seq, BazaarTypes.Order storage n)
+        private
+        view
+        returns (bool)
+    {
+        uint256 nPrice = n.limitPrice;
+        if (price != nPrice) return isLongSide ? price > nPrice : price < nPrice;
+        return seq < n.prioritySeq;
+    }
+
+    /// @dev The mirror of _precedesNode: does the resting node `n` rest ahead of an order at
+    ///      (price, seq)? Two distinct orders never share a prioritySeq, so exactly one of the
+    ///      two predicates holds for any pair.
+    function _nodePrecedes(bool isLongSide, BazaarTypes.Order storage n, uint256 price, uint64 seq)
+        private
+        view
+        returns (bool)
+    {
+        uint256 nPrice = n.limitPrice;
+        if (price != nPrice) return isLongSide ? nPrice > price : nPrice < price;
+        return n.prioritySeq < seq;
+    }
+
+    /// @dev Walk from `anchor` toward the true slot and report the predecessor found there.
+    ///      Direction follows the ordering predicate: forward via nextInBook when the anchor
+    ///      sorts before the new order, backward via prevInBook otherwise (reaching the head
+    ///      reports a predecessor of 0). Capped at MAX_WALK_STEPS node advances; past it the walk
+    ///      reports not found rather than reverting, so the caller chooses the disposition.
+    function _walkToSlot(
         mapping(uint256 => BazaarTypes.Order) storage orders,
-        BazaarTypes.OrderBook storage book,
-        BazaarTypes.Order storage o,
         bool side,
-        uint64 id,
+        uint64 seq,
         uint256 price,
         uint64 anchor
-    ) private {
+    ) private view returns (bool found, uint64 pred) {
         uint256 steps;
         uint64 cur = anchor;
-        if (_precedes(side, orders[anchor].limitPrice, anchor, price, id)) {
+        if (_nodePrecedes(side, orders[anchor], price, seq)) {
             while (true) {
                 uint64 nxt = orders[cur].nextInBook;
-                if (nxt == 0 || _precedes(side, price, id, orders[nxt].limitPrice, nxt)) {
-                    _link(orders, book, o, side, id, cur, nxt);
-                    return;
-                }
+                if (nxt == 0 || _precedesNode(side, price, seq, orders[nxt])) return (true, cur);
                 cur = nxt;
                 unchecked {
                     ++steps;
                 }
-                if (steps > BazaarTypes.MAX_WALK_STEPS) revert OrderBookLib__HintRepairExhausted(uint256(id));
+                if (steps > BazaarTypes.MAX_WALK_STEPS) return (false, 0);
             }
         } else {
             while (true) {
                 uint64 prv = orders[cur].prevInBook;
-                if (prv == 0) {
-                    _link(orders, book, o, side, id, 0, cur);
-                    return;
-                }
-                if (_precedes(side, orders[prv].limitPrice, prv, price, id)) {
-                    _link(orders, book, o, side, id, prv, cur);
-                    return;
-                }
+                if (prv == 0) return (true, 0);
+                if (_nodePrecedes(side, orders[prv], price, seq)) return (true, prv);
                 cur = prv;
                 unchecked {
                     ++steps;
                 }
-                if (steps > BazaarTypes.MAX_WALK_STEPS) revert OrderBookLib__HintRepairExhausted(uint256(id));
+                if (steps > BazaarTypes.MAX_WALK_STEPS) return (false, 0);
             }
         }
     }
 
-    /// @dev Splice the order in between `prev` and `next` (either may be 0 for head/tail) and
-    ///      update the side's head and count.
+    /// @dev Splice the order in between `prev` and `next` (either may be 0 for head/tail), stamp
+    ///      the block it joined in and the far-side premium it joined at, and update the side's
+    ///      head and count. The stamps land in the slot the links share, so they cost no write of
+    ///      their own.
     function _link(
         mapping(uint256 => BazaarTypes.Order) storage orders,
         BazaarTypes.OrderBook storage book,
         BazaarTypes.Order storage o,
         bool side,
-        uint64 id,
-        uint64 prev,
-        uint64 next
+        uint48 id,
+        uint48 prev,
+        uint48 next,
+        uint32 restedBlock,
+        uint16 restedPremiumPpm
     ) private {
         o.prevInBook = prev;
         o.nextInBook = next;
+        o.restedBlock = restedBlock;
+        o.restedPremiumPpm = restedPremiumPpm;
         o.inBook = true;
         if (prev == 0) {
             if (side) {

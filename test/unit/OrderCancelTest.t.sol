@@ -15,6 +15,7 @@ contract OrderCancelHarness {
     mapping(address => BazaarTypes.PositionBucket) internal positionBuckets;
     mapping(address => EnumerableSet.UintSet) internal userActiveLimitOrders;
     BazaarTypes.OrderBook internal book;
+    BazaarTypes.FeeEscrow internal feeEscrow;
 
     function seed(uint256 id, BazaarTypes.Order calldata o) external {
         orders[id] = o;
@@ -41,7 +42,7 @@ contract OrderCancelHarness {
     }
 
     function cancel(uint256 id, bytes32 pid, uint64 cb) external {
-        OrderManagementLib.cancelOrder(orders, positionBuckets, userActiveLimitOrders, book, id, pid, cb);
+        OrderManagementLib.cancelOrder(orders, positionBuckets, userActiveLimitOrders, book, feeEscrow, id, pid, cb);
     }
 
     function canceledBlock(uint256 id) external view returns (uint64) {

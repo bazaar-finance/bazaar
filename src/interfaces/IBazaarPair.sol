@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 pragma solidity 0.8.34;
 
+import {BazaarTypes} from "../libraries/BazaarTypes.sol";
+
 interface IBazaarPair {
     // ---- State getters used by BazaarPairTerminator ----
     function pairId() external view returns (bytes32);
@@ -9,6 +11,7 @@ interface IBazaarPair {
     function isPairTerminated() external view returns (bool);
     function scheduledTerminationTs() external view returns (uint256);
     function settlementPriceFixedTs() external view returns (uint256);
+    function auxState() external view returns (BazaarTypes.AuxState memory);
 
     // ---- Price helpers used by BazaarPairTerminator ----
     function lastPairPrice()
@@ -20,6 +23,9 @@ interface IBazaarPair {
     function totalInsuranceShares() external view returns (uint256);
     function insuranceShares(address user) external view returns (uint256);
     function getSharesAsOf(address user, uint64 atTs) external view returns (uint256);
+    /// @notice Raw storage read, for pair state that has no getter (see BazaarPairTerminator's
+    ///         PAIR_SLOT_SHARE_EPOCH).
+    function extsload(bytes32 slot) external view returns (bytes32);
 
     // ---- Setters called by BazaarPairTerminator ----
     function setScheduledTermination(uint256 lastTradingTs, address proposer) external;

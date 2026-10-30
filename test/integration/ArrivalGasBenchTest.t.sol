@@ -183,7 +183,7 @@ contract ArrivalGasBenchTest is IntegrationBase {
         uint256 sl = _placeStopLoss(bob, false, BTC / 10, 48_000 * BAZAAR_SCALE, 100);
         _placeLimitAt(dave, true, BTC / 10, 47_600 * BAZAAR_SCALE, 47_500);
 
-        vm.warp(vm.getBlockTimestamp() + 3);
+        vm.warp(vm.getBlockTimestamp() + 4);
         bytes[] memory pu = _priceUpdate(47_500, uint64(vm.getBlockTimestamp()));
         BazaarTypes.TriggerExec[] memory execs = new BazaarTypes.TriggerExec[](1);
         execs[0].orderId = uint64(sl);
@@ -226,6 +226,75 @@ contract ArrivalGasBenchTest is IntegrationBase {
         uint256 used = g0 - gasleft();
 
         emit log_named_uint("cancelOrders: 1 resting order (incl. unlink)", used);
+    }
+
+    // ============================================================
+    // Amending in place vs cancel + create
+    // ============================================================
+
+    function _triple(uint256 id, uint256 price, uint256 size) internal pure returns (uint256[] memory a) {
+        a = new uint256[](3);
+        (a[0], a[1], a[2]) = (id, price, size);
+    }
+
+    /// @notice One resting bid repriced in place, against the same move done as a cancel and a
+    ///         fresh order.
+    function test_gas_amendOrders_repriceOne_vsCancelAndCreate() public {
+        _deposit(alice, 60_000 * BAZAAR_SCALE);
+        uint256 id = _placeLimit(alice, true, BTC / 100, 49_000 * BAZAAR_SCALE);
+        bytes[] memory pu = _freshPrice();
+        vm.prank(alice);
+        uint256 g0 = gasleft();
+        pair.amendOrders(_triple(id, 48_000 * BAZAAR_SCALE, BTC / 100), pu, 0, 0, 0, "", "");
+        emit log_named_uint("amendOrders: reprice 1 resting order", g0 - gasleft());
+
+        uint256 other = _placeLimit(alice, true, BTC / 100, 47_000 * BAZAAR_SCALE);
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = other;
+        vm.prank(alice);
+        g0 = gasleft();
+        pair.cancelOrders(ids, 0, 0, 0, "", "");
+        uint256 cancel = g0 - gasleft();
+        pu = _freshPrice();
+        BazaarTypes.OrderSpec memory s = _limitSpec(true, BTC / 100, 46_000 * BAZAAR_SCALE);
+        vm.prank(alice);
+        g0 = gasleft();
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
+        emit log_named_uint("cancelOrders + createOrder: the same move", cancel + (g0 - gasleft()));
+    }
+
+    /// @notice One resting bid shrunk in place: no relink, no queue position drawn.
+    function test_gas_amendOrders_shrinkOne() public {
+        _deposit(alice, 60_000 * BAZAAR_SCALE);
+        uint256 id = _placeLimit(alice, true, BTC / 100, 49_000 * BAZAAR_SCALE);
+        bytes[] memory pu = _freshPrice();
+        vm.prank(alice);
+        uint256 g0 = gasleft();
+        pair.amendOrders(_triple(id, 49_000 * BAZAAR_SCALE, BTC / 200), pu, 0, 0, 0, "", "");
+        emit log_named_uint("amendOrders: shrink 1 resting order", g0 - gasleft());
+    }
+
+    /// @notice Ten resting bids repriced in one call, each relinked from its old neighbours.
+    function test_gas_amendOrders_repriceTen() public {
+        _deposit(alice, 600_000 * BAZAAR_SCALE);
+        uint256[] memory ids = new uint256[](10);
+        for (uint256 i; i < 10; ++i) {
+            ids[i] = _placeLimit(alice, true, BTC / 100, (49_000 - 10 * i) * BAZAAR_SCALE);
+        }
+        // Move the whole ladder down by $100; each order lands behind the one amended before it.
+        uint256[] memory words = new uint256[](30);
+        for (uint256 i; i < 10; ++i) {
+            words[3 * i] = ids[i];
+            words[3 * i + 1] = (48_900 - 10 * i) * BAZAAR_SCALE;
+            words[3 * i + 2] = BTC / 100;
+        }
+        bytes[] memory pu = _freshPrice();
+        vm.prank(alice);
+        uint256 g0 = gasleft();
+        pair.amendOrders(words, pu, 0, 0, 0, "", "");
+        uint256 used = g0 - gasleft();
+        emit log_named_uint("amendOrders: reprice 10 resting orders", used);
+        emit log_named_uint("amendOrders: per order of the ten", used / 10);
     }
 }
 

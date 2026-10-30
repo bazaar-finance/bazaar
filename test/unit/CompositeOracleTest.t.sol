@@ -401,19 +401,19 @@ contract CompositeOracleTest is Test {
         assertFalse(found, "no rung within the composed 2% cap");
     }
 
-    // ==================== fetchHistoricalPrice ====================
+    // ==================== fetchFirstPriceAtOrAfter ====================
 
-    function test_FetchHistorical_Composite() public {
+    function test_FetchFirstPrice_Composite() public {
         bytes32 compositeId = _registerJpyComposite();
         uint64 ts = uint64(block.timestamp - 50);
         bytes[] memory updates = _bothLegUpdates(2800e8, 0, 140e8, 0, ts);
         uint256 fee = oracle.getUpdateFee(updates);
 
-        uint256 spot = oracle.fetchHistoricalPrice{value: fee}(compositeId, updates, ts - 10, ts + 10);
+        uint256 spot = oracle.fetchFirstPriceAtOrAfter{value: fee}(compositeId, updates, ts, ts + 10);
         assertEq(spot, 20e18);
     }
 
-    function test_FetchHistorical_RevertsWhenQuoteLegMissing() public {
+    function test_FetchFirstPrice_RevertsWhenQuoteLegMissing() public {
         bytes32 compositeId = _registerJpyComposite();
         uint64 ts = uint64(block.timestamp - 50);
         bytes[] memory updates = new bytes[](1);
@@ -421,7 +421,136 @@ contract CompositeOracleTest is Test {
         uint256 fee = oracle.getUpdateFee(updates);
 
         vm.expectRevert(PythErrors.PriceFeedNotFoundWithinRange.selector);
-        oracle.fetchHistoricalPrice{value: fee}(compositeId, updates, ts - 10, ts + 10);
+        oracle.fetchFirstPriceAtOrAfter{value: fee}(compositeId, updates, ts, ts + 10);
+    }
+
+    /// @notice Each leg of a composite is pinned to its own first print in the window: a quote
+    ///         leg whose predecessor is already inside the window is refused even though the base
+    ///         leg is the first print, so a caller cannot pick the quote leg independently.
+    function test_FetchFirstPrice_Composite_EachLegMustBeItsFirstPrint() public {
+        bytes32 compositeId = _registerJpyComposite();
+        uint64 ts = uint64(block.timestamp - 50);
+        bytes[] memory updates = new bytes[](2);
+        updates[0] = _updateData(ASSET_JPY_FEED, 2800e8, 0, ts);
+        // Quote leg published 3 s into the window, after another print 1 s into it.
+        updates[1] = mockPyth.createPriceFeedUpdateData(USD_JPY_FEED, 140e8, 0, PYTH_EXPO, 140e8, 0, ts + 3, ts + 1);
+        uint256 fee = oracle.getUpdateFee(updates);
+
+        vm.expectRevert(PythErrors.PriceFeedNotFoundWithinRange.selector);
+        oracle.fetchFirstPriceAtOrAfter{value: fee}(compositeId, updates, ts, ts + 10);
+
+        // The same quote print settles once its predecessor sits before the window.
+        updates[1] = mockPyth.createPriceFeedUpdateData(USD_JPY_FEED, 140e8, 0, PYTH_EXPO, 140e8, 0, ts + 3, ts - 1);
+        assertEq(oracle.fetchFirstPriceAtOrAfter{value: fee}(compositeId, updates, ts, ts + 10), 20e18);
+    }
+
+    // ==================== fetchChainedMedian ====================
+
+    /// @dev Writes composite sample `k` into `set`: the base leg at `basePub` after a print at
+    ///      `basePrev`, and the FX leg at 140 JPY per USD, published at `quotePub` after a print at
+    ///      `quotePrev`.
+    function _sample(
+        bytes[] memory set,
+        uint256 k,
+        int64 basePrice,
+        uint64 basePub,
+        uint64 basePrev,
+        uint64 quotePub,
+        uint64 quotePrev
+    ) internal view {
+        set[2 * k] = mockPyth.createPriceFeedUpdateData(
+            ASSET_JPY_FEED, basePrice, 0, PYTH_EXPO, basePrice, 0, basePub, basePrev
+        );
+        set[2 * k + 1] =
+            mockPyth.createPriceFeedUpdateData(USD_JPY_FEED, 140e8, 0, PYTH_EXPO, 140e8, 0, quotePub, quotePrev);
+    }
+
+    /// @dev A composite chain from `t`: the equity leg silent until `t + 1 hours`, the FX leg
+    ///      printing throughout. The first sample's later leg is the equity open, so every later
+    ///      target is ten minutes past the sample before it, starting from the open. The samples
+    ///      price at $20.2, $20, $19.8, $20.4 and $19.6, so the median is the second.
+    function _compositeChain(uint64 t) internal view returns (bytes[] memory set) {
+        set = new bytes[](10);
+        uint64 open = t + 1 hours;
+        _sample(set, 0, 2828e8, open, t - 100, t + 1, t - 1);
+        uint64 target = open + 600;
+        _sample(set, 1, 2800e8, target, target - 1, target, target - 1);
+        target += 600;
+        _sample(set, 2, 2772e8, target, target - 1, target, target - 1);
+        target += 600;
+        _sample(set, 3, 2856e8, target, target - 1, target, target - 1);
+        target += 600;
+        _sample(set, 4, 2744e8, target, target - 1, target, target - 1);
+    }
+
+    /// @notice A composite sample's later leg sets the next target: with the equity leg silent
+    ///         until its open and the FX leg printing throughout, the second sample starts ten
+    ///         minutes after the open, and the median is taken over the five composed prices. A set
+    ///         that measured the second sample from the FX leg instead is refused.
+    function test_ChainedMedian_Composite_NextTargetFromTheLaterLeg() public {
+        bytes32 compositeId = _registerJpyComposite();
+        uint64 t = uint64(block.timestamp);
+        bytes[] memory set = _compositeChain(t);
+        uint256 fee = oracle.getSampleSetFee(compositeId, set);
+        assertEq(fee, 10, "one wei for each of the ten updates");
+        assertEq(oracle.fetchChainedMedian{value: fee}(compositeId, set, t, type(uint64).max, 600, 5), 20e18);
+
+        uint64 fxTarget = t + 1 + 600;
+        _sample(set, 1, 2828e8, t + 1 hours, t - 100, fxTarget, fxTarget - 1);
+        vm.expectRevert(PythErrors.PriceFeedNotFoundWithinRange.selector);
+        oracle.fetchChainedMedian{value: fee}(compositeId, set, t, type(uint64).max, 600, 5);
+    }
+
+    /// @notice The two legs of a composite sample may come in either order.
+    function test_ChainedMedian_Composite_LegOrderWithinASampleIsFree() public {
+        bytes32 compositeId = _registerJpyComposite();
+        uint64 t = uint64(block.timestamp);
+        bytes[] memory set = _compositeChain(t);
+        for (uint256 k = 0; k < 5; k++) {
+            (set[2 * k], set[2 * k + 1]) = (set[2 * k + 1], set[2 * k]);
+        }
+        uint256 fee = oracle.getSampleSetFee(compositeId, set);
+        assertEq(oracle.fetchChainedMedian{value: fee}(compositeId, set, t, type(uint64).max, 600, 5), 20e18);
+    }
+
+    /// @notice A composite set holds one update per leg for each sample: nine updates are refused,
+    ///         and the fee view counts only the complete samples among them.
+    function test_ChainedMedian_Composite_ShortSetRefused() public {
+        bytes32 compositeId = _registerJpyComposite();
+        uint64 t = uint64(block.timestamp);
+        bytes[] memory full = _compositeChain(t);
+        bytes[] memory nine = new bytes[](9);
+        for (uint256 i = 0; i < 9; i++) {
+            nine[i] = full[i];
+        }
+        uint256 fee = oracle.getSampleSetFee(compositeId, nine);
+        assertEq(fee, 8, "four complete samples");
+        vm.expectRevert(abi.encodeWithSelector(BazaarOracle.BazaarOracle__SampleCountMismatch.selector, 9, 10));
+        oracle.fetchChainedMedian{value: fee}(compositeId, nine, t, type(uint64).max, 600, 5);
+    }
+
+    /// @notice Every sample must be published no later than the bound: a set whose last sample
+    ///         lands a second past it is refused, and settles once the bound reaches it.
+    function test_ChainedMedian_EverySampleBounded() public {
+        bytes32 compositeId = _registerJpyComposite();
+        uint64 t = uint64(block.timestamp);
+        bytes[] memory set = _compositeChain(t);
+        uint64 lastSample = t + 1 hours + 4 * 600;
+        uint256 fee = oracle.getSampleSetFee(compositeId, set);
+        vm.expectRevert(PythErrors.PriceFeedNotFoundWithinRange.selector);
+        oracle.fetchChainedMedian{value: fee}(compositeId, set, t, lastSample - 1, 600, 5);
+        assertEq(oracle.fetchChainedMedian{value: fee}(compositeId, set, t, lastSample, 600, 5), 20e18);
+    }
+
+    /// @notice The value sent must equal the samples' fees exactly, so an overpayment is refused
+    ///         rather than left in the oracle.
+    function test_ChainedMedian_FeeMustMatchExactly() public {
+        bytes32 compositeId = _registerJpyComposite();
+        uint64 t = uint64(block.timestamp);
+        bytes[] memory set = _compositeChain(t);
+        uint256 fee = oracle.getSampleSetFee(compositeId, set);
+        vm.expectRevert(abi.encodeWithSelector(BazaarOracle.BazaarOracle__SampleFeeMismatch.selector, fee + 1, fee));
+        oracle.fetchChainedMedian{value: fee + 1}(compositeId, set, t, type(uint64).max, 600, 5);
     }
 }
 
@@ -432,6 +561,7 @@ contract CompositeFactoryTest is Test {
     bytes32 constant USD_JPY_FEED = keccak256("test.FX.USD/JPY");
     bytes32 constant ASSET_GBP_FEED = keccak256("test.EQUITY.LLOY/GBP");
     bytes32 constant GBP_USD_FEED = keccak256("test.FX.GBP/USD");
+    bytes32 constant JPY_USD_FEED = keccak256("test.FX.JPY/USD");
     int32 constant PYTH_EXPO = -8;
 
     uint256 constant BAZAAR_SCALE = 1e18;
@@ -534,8 +664,14 @@ contract CompositeFactoryTest is Test {
         assertTrue(_contains(claim, "Quote leg inverted: true"));
         assertTrue(_contains(claim, "QUOTE LEG CORRECTNESS"));
         assertTrue(_contains(claim, "Composite proposals MUST be marked 'false'"));
-        assertTrue(_contains(claim, "MUST be one of: EUR, GBP, JPY, CHF, CAD, AUD, NZD, SEK, NOK, DKK, SGD, HKD, CNH"));
+        assertTrue(_contains(claim, "ELIGIBLE BASE-FEED CURRENCIES"));
+        assertTrue(
+            _contains(
+                claim, "MUST be one of: EUR, GBP, JPY, CHF, CAD, AUD, NZD, SEK, NOK, DKK, SGD, HKD, CNH, CNY, KRW, TWD"
+            )
+        );
         assertTrue(_contains(claim, "onshore CNY must use the offshore USD/CNH FX feed"));
+        assertTrue(_contains(claim, "not the onshore USD/CNY feed"));
     }
 
     function test_TerminationClaim_ContainsStructuralChangeCatchAll() public {
@@ -552,9 +688,8 @@ contract CompositeFactoryTest is Test {
         BazaarPairTerminator terminator = factory.pairTerminator();
         vm.startPrank(user1);
         usdc.approve(address(terminator), terminator.TERMINATION_PROPOSAL_BOND());
-        bytes32 termAssertionId = terminator.proposeTermination(
-            pair, "Toyota on TSE", block.timestamp + 7 days, "Reverse split announced for next month."
-        );
+        bytes32 termAssertionId =
+            terminator.proposeTermination(pair, 3, block.timestamp + 7 days, "Reverse split announced for next month.");
         vm.stopPrank();
 
         bytes memory claim = mockOOv3.claims(termAssertionId);
@@ -642,5 +777,124 @@ contract CompositeFactoryTest is Test {
 
         (uint256 spot,,,,) = pair.lastPairPrice();
         assertEq(spot, 20e18);
+    }
+
+    // ==================== One market per asset ====================
+
+    /// @dev Proposes `feedId` from user1 and settles it approved once liveness has passed.
+    function _list(bytes32 feedId, bool continuous, string memory description) internal returns (address pair) {
+        usdc.mint(user1, PROPOSAL_TOTAL_USDC);
+        vm.startPrank(user1);
+        usdc.approve(address(factory), PROPOSAL_TOTAL_USDC);
+        bytes32 assertionId = factory.proposePairDeployment(feedId, continuous, PROPOSAL_TOTAL, description);
+        vm.stopPrank();
+        vm.warp(block.timestamp + factory.DEPLOYMENT_LIVENESS() + 1);
+        factory.settleDeploymentProposal(assertionId);
+        pair = factory.getPairAddress(feedId);
+        assertTrue(pair != address(0), "pair deployed");
+    }
+
+    /// @dev A proposal of `feedId` is refused because `holder` already prices the JPY base leg.
+    function _expectBaseLegHeld(bytes32 feedId, address holder) internal {
+        usdc.mint(user1, PROPOSAL_TOTAL_USDC);
+        vm.startPrank(user1);
+        usdc.approve(address(factory), PROPOSAL_TOTAL_USDC);
+        vm.expectRevert(
+            abi.encodeWithSelector(BazaarFactory.Factory__BaseFeedAlreadyListed.selector, ASSET_JPY_FEED, holder)
+        );
+        factory.proposePairDeployment(feedId, false, PROPOSAL_TOTAL, "Toyota again");
+        vm.stopPrank();
+    }
+
+    /// @notice The same stock through a different FX feed hashes to a different pair ID over the
+    ///         same base leg; the factory refuses it while the first market is live.
+    function test_OneMarketPerAsset_SameBaseLegThroughAnotherFxFeedIsRefused() public {
+        address pair = _list(compositeId, false, "Toyota on TSE");
+        assertEq(factory.pairAddressByBaseFeed(ASSET_JPY_FEED), pair, "holder indexed by base leg");
+
+        bytes32 viaJpyUsd = oracle.registerComposite(ASSET_JPY_FEED, JPY_USD_FEED, false);
+        assertTrue(viaJpyUsd != compositeId, "distinct pair ID");
+        _expectBaseLegHeld(viaJpyUsd, pair);
+    }
+
+    /// @notice The opposite inversion flag over the same two legs is another pair ID; refused too.
+    function test_OneMarketPerAsset_OppositeInversionIsRefused() public {
+        address pair = _list(compositeId, false, "Toyota on TSE");
+        bytes32 inverted = oracle.registerComposite(ASSET_JPY_FEED, USD_JPY_FEED, false);
+        _expectBaseLegHeld(inverted, pair);
+    }
+
+    /// @notice A composite over a feed that is already listed directly is refused: both would
+    ///         price the same asset.
+    function test_OneMarketPerAsset_CompositeOverADirectListingIsRefused() public {
+        PythSeed.seed(address(mockPyth), ASSET_JPY_FEED);
+        address direct = _list(ASSET_JPY_FEED, false, "Toyota quoted in JPY");
+        assertEq(factory.pairAddressByBaseFeed(ASSET_JPY_FEED), direct, "direct listing holds its own feed");
+        _expectBaseLegHeld(compositeId, direct);
+    }
+
+    /// @notice A direct listing of a live composite's base leg is refused the same way.
+    function test_OneMarketPerAsset_DirectListingOverACompositeIsRefused() public {
+        address pair = _list(compositeId, false, "Toyota on TSE");
+        PythSeed.seed(address(mockPyth), ASSET_JPY_FEED);
+        _expectBaseLegHeld(ASSET_JPY_FEED, pair);
+    }
+
+    /// @notice One proposal per asset in flight. A second composite over the same base leg is
+    ///         refused while the first is pending, naming the pending proposal's pair ID; a
+    ///         rejected first proposal releases the asset, and the second is settled in on the way.
+    function test_OneMarketPerAsset_PendingProposalHoldsTheAsset() public {
+        vm.startPrank(user1);
+        usdc.approve(address(factory), PROPOSAL_TOTAL_USDC);
+        bytes32 first = factory.proposePairDeployment(compositeId, false, PROPOSAL_TOTAL, "Toyota on TSE");
+        vm.stopPrank();
+        assertEq(factory.pendingDeploymentByBaseFeed(ASSET_JPY_FEED), first, "pending indexed by base leg");
+
+        bytes32 viaJpyUsd = oracle.registerComposite(ASSET_JPY_FEED, JPY_USD_FEED, false);
+        vm.startPrank(user1);
+        usdc.approve(address(factory), PROPOSAL_TOTAL_USDC);
+        vm.expectRevert(abi.encodeWithSelector(BazaarFactory.Factory__ProposalAlreadyPending.selector, compositeId));
+        factory.proposePairDeployment(viaJpyUsd, false, PROPOSAL_TOTAL, "Toyota via JPY/USD");
+        vm.stopPrank();
+
+        // The first proposal is disputed and voted down; the second proposal settles it on the
+        // way in and takes the slot.
+        address disputer = makeAddr("disputer");
+        uint256 bond = factory.requiredDeploymentBond();
+        usdc.mint(disputer, bond);
+        vm.startPrank(disputer);
+        usdc.approve(address(mockOOv3), bond);
+        mockOOv3.disputeAssertion(first, disputer);
+        vm.stopPrank();
+        mockOOv3.mockDvmResolve(first, false);
+
+        vm.prank(user1);
+        bytes32 second = factory.proposePairDeployment(viaJpyUsd, false, PROPOSAL_TOTAL, "Toyota via JPY/USD");
+        assertEq(factory.pendingDeploymentByBaseFeed(ASSET_JPY_FEED), second, "second proposal holds the asset");
+        assertEq(factory.pendingDeploymentByPairId(compositeId), bytes32(0), "rejected proposal released its pair ID");
+        assertEq(factory.pendingDeploymentByPairId(viaJpyUsd), second, "second proposal pending under its pair ID");
+        assertEq(factory.getPairAddress(compositeId), address(0), "rejected proposal deployed nothing");
+    }
+
+    /// @notice A terminated holder releases the asset: the next market over the same base leg,
+    ///         here through the other FX direction, lists and becomes the holder, while the old
+    ///         pair ID still resolves to the terminated pair.
+    function test_OneMarketPerAsset_ReleasedOnceTheHolderTerminates() public {
+        address first = _list(compositeId, false, "Toyota on TSE");
+        bytes32 viaJpyUsd = oracle.registerComposite(ASSET_JPY_FEED, JPY_USD_FEED, false);
+        _expectBaseLegHeld(viaJpyUsd, first);
+
+        // The pair never stored a price, so once it is older than the oracle-dead threshold the
+        // stale-feed path settles it, and with no positions open finalize follows at once.
+        BazaarPairTerminator terminator = factory.pairTerminator();
+        vm.warp(block.timestamp + 21 days + 1);
+        terminator.terminateStalePair(first);
+        BazaarPair(payable(first)).finalizeTermination();
+        assertTrue(BazaarPair(payable(first)).isPairTerminated(), "holder terminated");
+
+        address second = _list(viaJpyUsd, false, "Toyota via JPY/USD");
+        assertEq(factory.pairAddressByBaseFeed(ASSET_JPY_FEED), second, "new holder");
+        assertEq(factory.getPairAddress(compositeId), first, "old pair ID keeps the terminated pair");
+        assertEq(factory.getPairAddress(viaJpyUsd), second, "new pair ID resolves to the new pair");
     }
 }

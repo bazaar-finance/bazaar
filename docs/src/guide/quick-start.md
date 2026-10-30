@@ -46,7 +46,10 @@ make deploy-pair-anvil FEED_ID=0xff61491a931112ddf1bd8147cd1b641375f79f5825126d6
 # Push a fresh mock Pyth price
 make set-price-anvil FEED_ID=0xff61... PRICE=2000
 
-# Rest a limit order
+# Deposit collateral (USDC, whole dollars) — orders are margined against it
+make deposit-anvil PAIR=0x... AMOUNT=1000
+
+# Rest a limit order (its price update also sets the mock oracle to LIMIT_PRICE)
 make create-order-anvil PAIR=0x... LIMIT_PRICE=2000 SIZE=0.01 IS_LONG=true
 
 # Move time (funding, cooldowns, UMA liveness)

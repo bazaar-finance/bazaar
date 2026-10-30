@@ -28,7 +28,7 @@ contract TerminalRealizedPnlTest is IntegrationBase {
         view
         returns (bool isLong, uint256 size, uint256 entryValue, uint256 collateral)
     {
-        (isLong, size, entryValue, collateral,,,,,) = pair.positionBuckets(u);
+        (isLong, size, entryValue, collateral,,,) = pair.positionBuckets(u);
     }
 
     function _withdrawAll(address u) internal returns (uint256 total) {
@@ -82,8 +82,8 @@ contract TerminalRealizedPnlTest is IntegrationBase {
         _settleAliceAndCarolThenFinalize();
 
         BazaarTypes.AuxState memory aux = pair.auxState();
-        assertEq(aux.terminalPrincipalRatioBp, 10_000, "principal whole");
-        assertEq(aux.terminalProfitRatioBp, 10_000, "profit fully cash-backed");
+        assertEq(aux.terminalPrincipalRatio, BAZAAR_SCALE, "principal whole");
+        assertEq(aux.terminalProfitRatio, BAZAAR_SCALE, "profit fully cash-backed");
 
         uint256 aliceGot = _withdrawAll(alice);
         uint256 bobGot = _withdrawAll(bob);

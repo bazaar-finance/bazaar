@@ -2,43 +2,39 @@
 pragma solidity 0.8.34;
 
 import {Script} from "forge-std/Script.sol";
+import {VmSafe} from "forge-std/Vm.sol";
 import {console} from "forge-std/console.sol";
+import {LinkedLibraries} from "./LinkedLibraries.sol";
 
-/// @notice Step 1 of the two-step deployment: deploys every external library that BazaarPair
-///         carries a link reference for, then writes the `--libraries` flags for them to
-///         `deployments/<chainid>/libraries.args`.
-/// @dev    The output path is keyed by chain id because a library address is only meaningful on
-///         the chain it was deployed to. A single shared list would let a rehearsal network's
-///         addresses be linked into a production build, where those addresses hold no code and
-///         every DELEGATECALL from the pair would land on an empty account. Step 2 reads the file
-///         for the chain it is deploying to and refuses to run when it is absent.
-contract DeployLibraries is Script {
-    /// @notice Every externally-linked library, in one list.
-    /// @dev    This list is the only place a library is named. The artifact id, the link path and
-    ///         the emitted flag are all derived from it, so a library cannot be deployed but left
-    ///         out of the link flags (or vice versa). A new external library needs one edit here
-    ///         and a matching bump of the array length.
-    function _libNames() internal pure returns (string[10] memory names) {
-        names[0] = "InsuranceVaultLib";
-        names[1] = "LiquidationLib";
-        names[2] = "OrderManagementLib";
-        names[3] = "AdlLib";
-        names[4] = "MatchingEngineLib";
-        names[5] = "CollateralLib";
-        names[6] = "RiskParamsLib";
-        names[7] = "FundingLib";
-        names[8] = "TerminationLib";
-        names[9] = "MetaTxLib";
-    }
-
-    function _deployLib(string memory artifact) internal returns (address addr) {
-        bytes memory bytecode = vm.getCode(artifact);
-        assembly {
-            addr := create(0, add(bytecode, 0x20), mload(bytecode))
-        }
-        require(addr != address(0), string.concat("Failed to deploy ", artifact));
-    }
-
+/// @notice Step 1 of the two-step deployment: deploys every external library that BazaarPair,
+///         BazaarFactory or BazaarPairTerminator carries a link reference for, then writes the
+///         `--libraries` flags for them to `deployments/<chainid>/libraries.args`, except on a
+///         dry run.
+/// @dev    The library list, the flag format and the record path all come from `LinkedLibraries`,
+///         which step 2 shares: it reads the record for the chain it is deploying to, refuses to
+///         run when the record is absent, and checks that every recorded address still holds the
+///         code it links against, so a record from an earlier library build cannot be linked
+///         into a later pair implementation.
+///
+///         The libraries link each other: the ones that call RiskParamsLib's public functions
+///         carry its link placeholder in their own bytecode and cannot be deployed until it has
+///         an address. Forge resolves such placeholders only from `--libraries` flags, which are
+///         what this step produces, so the script resolves them itself: each library's creation
+///         code is read from its raw artifact, the placeholders of the libraries already deployed
+///         in this run are replaced by their addresses, and a library whose placeholders are not
+///         all resolvable yet waits for the next pass. Linking from this run's own addresses is
+///         what keeps the set consistent: every dependent delegates into the RiskParamsLib this
+///         run records, never into one from an earlier deployment.
+///
+///         Forge executes the script, file writes included, before it broadcasts anything, and a
+///         run without `--broadcast` stops there. A dry run's addresses are therefore simulated,
+///         and writing them would overwrite the committed record of the live set with addresses
+///         that hold no code. It prints the flags and leaves the record alone. A broadcast run
+///         writes its record before its transactions land, so an interrupted broadcast leaves
+///         addresses some of which hold no code yet. Step 2's code check refuses such a record;
+///         `forge script --resume` sends the run's remaining transactions at their recorded
+///         nonces without executing the script again, which makes it valid.
+contract DeployLibraries is Script, LinkedLibraries {
     /// @dev The Makefile's live-network targets set `EXPECTED_CHAIN_ID` to the chain the deploy is
     ///      meant for. Without it, an `--rpc-url` alias resolving to the wrong chain deploys a full
     ///      set of libraries there and records them under that chain's `deployments/` directory —
@@ -60,48 +56,74 @@ contract DeployLibraries is Script {
         );
     }
 
+    /// @dev Deploys the set in dependency order: each pass deploys every library whose link
+    ///      placeholders all name libraries deployed in an earlier pass, or none. A pass that
+    ///      deploys nothing means a remaining library links one outside `_libNames()`, and the
+    ///      run aborts there rather than deploy code that would delegate into an empty account.
+    function _deployAll() internal returns (address[12] memory addrs) {
+        string[12] memory names = _libNames();
+        bool[12] memory deployed;
+        uint256 left = names.length;
+        while (left != 0) {
+            uint256 before = left;
+            for (uint256 i; i < names.length; ++i) {
+                if (deployed[i]) continue;
+                (string memory object, bool resolved) =
+                    _linkCode(_artifactObject(names[i], false), names, addrs, deployed);
+                if (!resolved) continue;
+                addrs[i] = _create(vm.parseBytes(object), names[i]);
+                deployed[i] = true;
+                --left;
+            }
+            require(left < before, "a remaining library links one outside _libNames()");
+        }
+    }
+
+    function _create(bytes memory bytecode, string memory name) internal returns (address addr) {
+        assembly {
+            addr := create(0, add(bytecode, 0x20), mload(bytecode))
+        }
+        require(addr != address(0), string.concat("Failed to deploy ", name));
+    }
+
     function run() external {
         _assertExpectedChain();
 
-        string[10] memory names = _libNames();
-        address[10] memory addrs;
-
         vm.startBroadcast();
-        for (uint256 i; i < names.length; ++i) {
-            addrs[i] = _deployLib(string.concat(names[i], ".sol:", names[i]));
-        }
+        address[12] memory addrs = _deployAll();
         vm.stopBroadcast();
 
-        // One flag per library: `--libraries src/libraries/Foo.sol:Foo:0xADDR`, space-separated so
-        // the file can be splatted straight onto a forge command line.
+        // One flag per library, space-separated so the file can be splatted straight onto a forge
+        // command line.
+        string[12] memory names = _libNames();
         string memory args;
         for (uint256 i; i < names.length; ++i) {
-            args = string.concat(
-                args,
-                i == 0 ? "" : " ",
-                "--libraries src/libraries/",
-                names[i],
-                ".sol:",
-                names[i],
-                ":",
-                vm.toString(addrs[i])
-            );
+            args = string.concat(args, i == 0 ? "" : " ", _libLinkFlag(names[i], addrs[i]));
         }
 
-        string memory dir = string.concat("deployments/", vm.toString(block.chainid));
-        vm.createDir(dir, true);
-        string memory outPath = string.concat(dir, "/libraries.args");
-        vm.writeFile(outPath, args);
+        string memory outPath = _libArgsPath(block.chainid);
+        bool dryRun = vm.isContext(VmSafe.ForgeContext.ScriptDryRun);
+        if (!dryRun) {
+            vm.createDir(_libArgsDir(block.chainid), true);
+            vm.writeFile(outPath, args);
+        }
 
         console.log("----------------------------------------------------");
-        console.log("External libraries deployed on chain:", block.chainid);
+        if (dryRun) console.log("External libraries simulated for chain:", block.chainid);
+        else console.log("External libraries deployed on chain:", block.chainid);
         for (uint256 i; i < names.length; ++i) {
             console.log("  %s: %s", names[i], addrs[i]);
         }
         console.log("----------------------------------------------------");
-        console.log("Link flags written to:", outPath);
-        console.log("Step 2 reads this file automatically:");
-        console.log("  make deploy-arb-sepolia   (or make deploy-arb-mainnet)");
+        if (dryRun) {
+            console.log("Dry run: nothing was broadcast, so the record was NOT written:", outPath);
+            console.log("Link flags this run would have recorded:");
+            console.log(args);
+        } else {
+            console.log("Link flags written to:", outPath);
+            console.log("Step 2 reads this file automatically:");
+            console.log("  make deploy-arb-sepolia   (or make deploy-arb-mainnet)");
+        }
         console.log("----------------------------------------------------");
     }
 }

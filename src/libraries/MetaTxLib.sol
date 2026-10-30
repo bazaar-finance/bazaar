@@ -7,7 +7,7 @@ import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/Messa
 /// @title MetaTxLib
 /// @notice External library for EIP-712 meta-transaction verification.
 /// @dev    `verifyAndConsume` is `external`, so it is DEPLOYED SEPARATELY and linked (see
-///         script/DeployLibraries.s.sol and the `libraries` block in foundry.toml) — BazaarPair
+///         script/DeployLibraries.s.sol and the deploy targets' `--libraries` flags) — BazaarPair
 ///         reaches it via DELEGATECALL, so `nonces` stays in the pair's storage and msg.sender is
 ///         preserved. Keeping it external rather than inlined also keeps ECDSA.recover,
 ///         MessageHashUtils and the domain-separator keccak out of BazaarPair's runtime code,
@@ -51,6 +51,9 @@ library MetaTxLib {
 
     bytes32 internal constant CANCEL_ORDERS_TYPEHASH =
         keccak256("CancelOrders(uint256[] orderIds,uint256 nonce,uint256 deadline,uint256 relayerFee)");
+
+    bytes32 internal constant AMEND_ORDERS_TYPEHASH =
+        keccak256("AmendOrders(uint256[] amends,uint256 nonce,uint256 deadline,uint256 relayerFee)");
 
     bytes32 internal constant REQUEST_INSURANCE_WITHDRAWAL_TYPEHASH =
         keccak256("RequestInsuranceWithdrawal(uint256 shareAmount,uint256 nonce,uint256 deadline,uint256 relayerFee)");

@@ -5,6 +5,7 @@ import {Vm} from "forge-std/Vm.sol";
 import {StdStorage, stdStorage} from "forge-std/Test.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
+import {FundingLib} from "../../src/libraries/FundingLib.sol";
 import {IntegrationBase} from "./IntegrationBase.sol";
 
 /// @title AdlSettlementBookingTest
@@ -73,15 +74,15 @@ contract AdlSettlementBookingTest is IntegrationBase {
     }
 
     function _deficit() internal view returns (uint256 d) {
-        (,,,,,,,,,,, d,,) = pair.pairVault();
+        (,,,,,,,,,,, d,,,,,) = pair.pairVault();
     }
 
     function _inventory() internal view returns (Inventory memory inv) {
-        (,,,,,, inv.size, inv.entryNotional, inv.bkNotional, inv.entryFundingIndex,,,, inv.seized) = pair.pairVault();
+        (,,,,,, inv.size, inv.entryNotional, inv.bkNotional, inv.entryFundingIndex,,,, inv.seized,,,) = pair.pairVault();
     }
 
     function _winner(address user) internal view returns (Winner memory w) {
-        (, w.size, w.entryValue,, w.entryIdx,,,,) = pair.positionBuckets(user);
+        (, w.size, w.entryValue,, w.entryIdx,,) = pair.positionBuckets(user);
     }
 
     function _snapshot() internal view returns (Snapshot memory s) {
@@ -103,6 +104,47 @@ contract AdlSettlementBookingTest is IntegrationBase {
         int256 cur = int256(inv.size * price / BAZAAR_SCALE);
         int256 funding = (pair.currentFundingIndex() - inv.entryFundingIndex) * int256(inv.size) / int256(BAZAAR_SCALE);
         return cur - int256(inv.entryNotional) - funding; // the vault holds longs throughout
+    }
+
+    /// @dev The unload band the ADL gate reads: the lower of the current and the lagged
+    ///      maintenance rate, capped at LIQ_MAX_SLIPPAGE_BP.
+    function _bandBp() internal view returns (uint256 bandBp) {
+        (, bandBp,,) = pair.marginRequirements();
+        uint256 lagged = pair.getLaggedMmr();
+        if (lagged != 0 && lagged < bandBp) bandBp = lagged;
+        if (bandBp > BazaarTypes.LIQ_MAX_SLIPPAGE_BP) bandBp = BazaarTypes.LIQ_MAX_SLIPPAGE_BP;
+    }
+
+    /// @dev The ADL gate's release reading at `price`: the fund's free capital above its reserve
+    ///      and what finishing the inventory at the band edge would cost beyond its backing. With
+    ///      them, what one more unit closed at `price` would have moved the comparison by: its
+    ///      distance to the band edge, which a close there takes off the finish cost without
+    ///      costing the fund, plus the reserve it releases.
+    function _release(uint256 price) internal view returns (uint256 base, uint256 worstFinish, uint256 perUnit) {
+        (
+            uint256 longOi,
+            uint256 shortOi,,,,
+            uint256 fund,
+            uint256 pending,,,,
+            bool isLong,,
+            uint256 target,
+            uint256 seized,
+            uint256 arrears,,
+            uint128 trailing
+        ) = pair.pairVault();
+        uint256 longSide = isLong ? longOi + pending : longOi;
+        uint256 shortSide = isLong ? shortOi : shortOi + pending;
+        uint256 live = longSide > shortSide ? longSide : shortSide;
+        uint256 reserveOi = trailing != 0 && trailing < live ? trailing : live;
+        uint256 reserveRate = target * BazaarTypes.ADL_RESERVE_BP;
+        uint256 reserve = Math.mulDiv(Math.mulDiv(reserveOi, price, BAZAAR_SCALE), reserveRate, 1e8);
+        uint256 free = fund > seized ? fund - seized : 0;
+        base = free > reserve ? free - reserve : 0;
+        uint256 bandBp = _bandBp();
+        uint256 bandEdge = price * (10_000 - bandBp) / 10_000;
+        int256 net = int256(seized + arrears) + _estateValue(bandEdge);
+        worstFinish = net < 0 ? uint256(-net) : 0;
+        perUnit = Math.mulDiv(price, bandBp, 10_000) + Math.mulDiv(price, reserveRate, 1e8);
     }
 
     function _sumUnrealized(uint256 price) internal view returns (int256 total) {
@@ -202,23 +244,28 @@ contract AdlSettlementBookingTest is IntegrationBase {
         _placeLimitAt(carol, true, ESTATE_SIZE, entry, entryUsd);
         assertEq(_posSize(carol), ESTATE_SIZE, "carol long 5 against the winners");
 
-        _placeLimitAt(carol, false, ESTATE_SIZE, 52_000 * BAZAAR_SCALE, 52_000);
-        _roll(2);
-        _placeLimitAt(dave, true, ESTATE_SIZE, 52_000 * BAZAAR_SCALE, 52_000);
+        // Dave's bid rests $1,000 above the oracle for a full exposure window before carol sells
+        // into it, so this fill forms the mark at a premium over the index: about 0.5%, a quarter
+        // of the print's. The vault inherits dave's long and pays funding on it at that premium while
+        // it holds the inventory: the holding-window funding every tail scenario below is built on.
+        _placeLimitAt(dave, true, ESTATE_SIZE, 52_000 * BAZAAR_SCALE, 51_000);
+        _roll(FundingLib.MAKER_EXPOSURE_BLOCKS);
+        _placeLimitAt(carol, false, ESTATE_SIZE, 52_000 * BAZAAR_SCALE, 51_000);
         assertEq(_posSize(carol), 0, "carol flat");
         assertEq(_posSize(dave), ESTATE_SIZE, "dave long 5 @ 52k");
+        assertGt(lens.markPrice(address(pair)), 51_000 * BAZAAR_SCALE, "fixture: the last fill formed a premium");
         _assertIdentity(52_000 * BAZAAR_SCALE, "identity after the opens");
     }
 
     /// @dev Oracle $36k: dave's $60k collateral is gone against an $80k loss. The book is empty,
     ///      so the vault inherits his long at a bankruptcy price of (260k - 60k) / 5 = $40k.
     function _liquidateEstate() internal {
-        vm.warp(vm.getBlockTimestamp() + 3);
+        vm.warp(vm.getBlockTimestamp() + 4);
         bytes[] memory pu = _priceAt(36_000);
         vm.prank(seq);
         assertEq(pair.liquidate(_arr1(dave), pu), 1, "dave liquidated");
         assertTrue(pair.isAdlPending(), "ADL pending");
-        (,,,,,, uint256 pendSize,,,, bool pendIsLong,,,) = pair.pairVault();
+        (,,,,,, uint256 pendSize,,,, bool pendIsLong,,,,,,) = pair.pairVault();
         assertEq(pendSize, ESTATE_SIZE, "vault inherited 5 BTC");
         assertTrue(pendIsLong, "vault holds the long");
         _assertIdentity(PRICE_36K, "identity after the liquidation");
@@ -236,7 +283,7 @@ contract AdlSettlementBookingTest is IntegrationBase {
         bytes[] memory pu = _priceAt(36_000);
         vm.recordLogs();
         vm.prank(seq);
-        pair.executeAdl(winners, pu);
+        pair.executeAdl(winners, new address[](0), pu);
         logs = vm.getRecordedLogs();
     }
 
@@ -369,14 +416,16 @@ contract AdlSettlementBookingTest is IntegrationBase {
     ///         the band, so the gate holds and the batch settles at the mark rather than the
     ///         bankruptcy price. The winner is credited no better than market, the vault's loss
     ///         on the slice shrinks by the recovery so the fund keeps that much of its earmark,
-    ///         no reward is paid, and the pair leaves the window healthy.
+    ///         no reward is paid, and the pair leaves the window healthy. Every unit closed at
+    ///         the mark hands the fund the recovery on it and takes its band-edge finish cost
+    ///         off, so the batch closes only the part that puts the fund on the release line and
+    ///         carries the rest.
     function test_markAboveBankruptcy_settlesAtMark_fundKeepsTheRecovery() public {
         _openChain(60_000, false);
         _liquidateEstate();
 
         Snapshot memory s = _snapshot();
-        // Below the earmark by a margin: no free capital keeps the window open, and the margin
-        // keeps the batch sized to the whole inventory whatever sign the holding carry takes.
+        // Below the earmark: no free capital keeps the window open at the recovered mark.
         _writeInsurance(s.inv.seized - 500 * BAZAAR_SCALE);
         s.insBefore = _insuranceBal();
         uint256 mark = 40_200 * BAZAAR_SCALE;
@@ -386,27 +435,38 @@ contract AdlSettlementBookingTest is IntegrationBase {
         bytes[] memory pu = _priceAt(40_200);
         vm.recordLogs();
         vm.prank(seq);
-        pair.executeAdl(_arr1(bob), pu);
+        pair.executeAdl(_arr1(bob), new address[](0), pu);
         Close memory c = _findClose(vm.getRecordedLogs(), bob);
         int256 idxAfter = pair.currentFundingIndex();
 
         assertTrue(c.found, "bob closed");
-        assertEq(c.closedSize, ESTATE_SIZE, "the whole inventory closed against bob");
-        assertEq(_posSize(bob), 0, "bob deleveraged");
-        assertEq(_inventory().size, 0, "inventory closed");
+        uint256 closed = c.closedSize;
+        assertGt(closed, 0, "part of the inventory closed against bob");
+        assertLt(closed, ESTATE_SIZE, "and the rest is carried");
+        assertEq(_posSize(bob), ESTATE_SIZE - closed, "bob keeps the rest of his short");
+        assertEq(_inventory().size, ESTATE_SIZE - closed, "the rest of the inventory is held");
         assertFalse(pair.isAdlPending(), "window released");
         assertEq(c.withheld, 0, "nothing withheld: the earmark covers the smaller loss");
+        // On the release line: the fund can finish the rest at the band edge, and could not have
+        // with one unit less closed.
+        (uint256 base, uint256 worstFinish, uint256 perUnit) = _release(mark);
+        assertLe(worstFinish, base, "the fund can finish the rest inside the band");
+        assertLt(base - worstFinish, perUnit, "within one unit of the line");
 
-        // Winner: full PnL at the mark, below what the bankruptcy price would have paid.
+        // Winner: full PnL at the mark on the part closed, below what the bankruptcy price would
+        // have paid.
         (uint256 pnlAtMark,) = _winnerPnl(s.bob, mark, idxAfter);
         (uint256 pnlAtBankruptcy,) = _winnerPnl(s.bob, s.settlementPrice, idxAfter);
         assertLt(pnlAtMark, pnlAtBankruptcy, "fixture: the mark is the worse close for the winner");
-        assertApproxEqAbs(uint256(c.realizedPnl), pnlAtMark, 1e6, "bob credited his PnL at the mark");
+        assertApproxEqAbs(
+            uint256(c.realizedPnl), Math.mulDiv(pnlAtMark, closed, s.bob.size), 1e6, "bob credited his PnL at the mark"
+        );
         assertEq(_posCollateral(bob) - s.bobCollBefore, uint256(c.realizedPnl), "bucket grew by the credit");
 
-        // Vault: the loss at the bankruptcy price less the recovery to the mark, and no reward.
-        (uint256 lossAtBankruptcy,) = _vaultLoss(s.inv, idxAfter, ESTATE_SIZE);
-        uint256 loss = lossAtBankruptcy - Math.mulDiv(ESTATE_SIZE, mark - s.settlementPrice, BAZAAR_SCALE);
+        // Vault: the slice's loss at the bankruptcy price less the recovery to the mark, and no
+        // reward.
+        (uint256 lossAtBankruptcy,) = _vaultLoss(s.inv, idxAfter, closed);
+        uint256 loss = lossAtBankruptcy - Math.mulDiv(closed, mark - s.settlementPrice, BAZAAR_SCALE);
         assertApproxEqAbs(s.insBefore - _insuranceBal(), loss, 1e6, "insurance paid only the loss at the mark");
         assertApproxEqAbs(_totalDeposited() - s.depBefore, loss, 1e6, "deposits ledger gained the vault's loss");
         assertEq(_deficit(), 0, "no bad debt");

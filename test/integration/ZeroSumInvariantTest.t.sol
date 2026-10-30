@@ -134,12 +134,12 @@ contract ZeroSumInvariantTest is Test {
     ///      recipient and keepers that nobody has claimed yet. Cash the contract still holds
     ///      against a third-party claim, so the invariants count it on the claims side.
     function _escrowTotal() internal view returns (uint256 total) {
-        (, total) = pair.claimableFees(address(0));
+        (, total) = factory.lens().claimableFees(address(pair), address(0));
     }
 
     /// @dev Trader equity marked at (price P, funding index F): collateral + price PnL + funding PnL.
     function _equityAt(address u, uint256 p, int256 f) internal view returns (int256 equity) {
-        (bool isLong, uint256 size, uint256 entryValue, uint256 collateral, int256 entryFundingIdx,,,,) =
+        (bool isLong, uint256 size, uint256 entryValue, uint256 collateral, int256 entryFundingIdx,,) =
             pair.positionBuckets(u);
         equity = int256(collateral);
         if (size == 0) return equity;
@@ -156,7 +156,7 @@ contract ZeroSumInvariantTest is Test {
     ///      bases the unload walk settles against, so realizing inventory moves value to
     ///      insurance 1:1.
     function _vaultInventoryAt(uint256 p, int256 f) internal view returns (int256 value) {
-        (,,,,,, uint256 plSize, uint256 plEntry,, int256 plFundIdx, bool plIsLong,,,) = pair.pairVault();
+        (,,,,,, uint256 plSize, uint256 plEntry,, int256 plFundIdx, bool plIsLong,,,,,,) = pair.pairVault();
         if (plSize == 0) return 0;
 
         int256 notional = int256(plSize * p / BAZAAR_SCALE);
@@ -167,23 +167,27 @@ contract ZeroSumInvariantTest is Test {
     }
 
     /// @dev Assert THE invariant:
-    ///          Σ trader equity(P, F) + vault inventory(P, F) + insurance == actual USDC held.
+    ///          Σ trader equity(P, F) + vault inventory(P, F) + insurance + ledger arrears
+    ///              == actual USDC held.
     ///      Every transition must conserve this: PnL and funding are transfers between the three
     ///      parties, deposits/withdrawals/fee-payouts/rewards move claims and cash together.
+    ///      The arrears are the fund's claim on cash the deposits ledger holds for it: a seizure
+    ///      the ledger could only partly pay leaves the unpaid part there, owed to the fund and
+    ///      claimed by no bucket, so it counts on the claims side until settlement nets it.
     ///      (The deposits ledger D deliberately does NOT appear: D + I is a deposits-flow view
     ///      that legitimately lags realized-PnL redistribution until winners withdraw — the
     ///      protocol's Check-3 only requires cash >= D + I − tolerance, one-directional.)
     ///      `priceUsd` is only a marking price — conservation is price-independent because long
     ///      and short sizes (traders + vault inventory) always balance.
     function _assertZeroSum(uint256 priceUsd, string memory label) internal view {
-        (,,,,, uint256 I,,,,,, uint256 deficit,,) = pair.pairVault();
+        (,,,,, uint256 I,,,,,, uint256 deficit,,, uint256 arrears,,) = pair.pairVault();
         assertEq(deficit, 0, string.concat(label, ": no realized bad debt expected in this scenario"));
 
         uint256 p = priceUsd * BAZAAR_SCALE;
         int256 f = pair.currentFundingIndex();
         // Earned-but-unclaimed fees are a third-party claim on cash the contract still holds,
         // so they count as claims until someone calls claimFees.
-        int256 claims = int256(I) + int256(_escrowTotal());
+        int256 claims = int256(I) + int256(_escrowTotal()) + int256(arrears);
         for (uint256 i = 0; i < traders.length; i++) {
             claims += _equityAt(traders[i], p, f);
         }
@@ -191,6 +195,29 @@ contract ZeroSumInvariantTest is Test {
 
         int256 cash = int256(usdc.balanceOf(address(pair)) * 1e12);
         assertApproxEqAbs(claims, cash, CLAIMS_TOL, string.concat(label, ": total claims == actual USDC (zero-sum)"));
+    }
+
+    /// @dev The same identity in the states _assertZeroSum refuses: realized bad debt is netted
+    ///      off the claims side (the books describe exactly `deficit` of value the contract does
+    ///      not hold), and once a settlement price is fixed each settled winner's profit lives in
+    ///      its registered claim while a settled loser's uncovered loss sits in the bad-debt
+    ///      tally, the terminal twin of `deficit`. Marked at `priceUsd`, which after the fix must
+    ///      be the fixed price: every leg is realized at it, so nothing else keeps the sum exact
+    ///      once positions leave one side at a time.
+    function _assertZeroSumWithBadDebt(uint256 priceUsd, string memory label) internal view {
+        (,,,,, uint256 I,,,,,, uint256 deficit,,, uint256 arrears,,) = pair.pairVault();
+        BazaarTypes.AuxState memory aux = pair.auxState();
+        uint256 p = priceUsd * BAZAAR_SCALE;
+        int256 f = pair.currentFundingIndex();
+        int256 claims = int256(I) + int256(_escrowTotal()) + int256(arrears);
+        for (uint256 i = 0; i < traders.length; i++) {
+            claims += _equityAt(traders[i], p, f);
+            claims += int256(pair.terminalProfitClaim(traders[i]));
+        }
+        claims += _vaultInventoryAt(p, f);
+        claims -= int256(deficit) + int256(aux.terminalBadDebt);
+        int256 cash = int256(usdc.balanceOf(address(pair)) * 1e12);
+        assertApproxEqAbs(claims, cash, CLAIMS_TOL, string.concat(label, ": claims net of bad debt == actual USDC"));
     }
 
     // ╔══════════════════════════════════════════════════════════════╗
@@ -221,8 +248,10 @@ contract ZeroSumInvariantTest is Test {
         vm.stopPrank();
     }
 
-    /// @dev The newest orderId the pair has assigned. Ids are a gapless monotonic counter from 1,
-    ///      so probing forward from a watermark finds the last created order even when it is
+    /// @dev The newest orderId the pair has assigned. Ids are a monotonic counter from 1 with gaps
+    ///      only where amendOrders or a keeper arming a StopLimit drew queue positions, which the
+    ///      handler never does, so
+    ///      probing forward from a watermark finds the last created order even when it is
     ///      already terminal (a crossing placement fills in its own transaction, so the
     ///      active-order set is no source).
     function _lastCreatedOrderId() internal returns (uint256) {
@@ -248,9 +277,9 @@ contract ZeroSumInvariantTest is Test {
         internal
         returns (uint256)
     {
-        // +3s: past MAX_PRICE_STALENESS, so the pair consumes the supplied price rather than a
+        // +4s: past MAX_PRICE_STALENESS, so the pair consumes the supplied price rather than a
         // fresh-enough cache from a previous (possibly differently-priced) step.
-        _advance(3);
+        _advance(4);
         bytes[] memory pu = _pu(priceUsd);
         BazaarTypes.OrderSpec memory spec;
         spec.orderType = BazaarTypes.OrderType.Limit;
@@ -288,7 +317,7 @@ contract ZeroSumInvariantTest is Test {
     ///      The caller (seq) earns the insurance-funded unload reward on whatever unloads —
     ///      cash and the insurance claim fall together, so the zero-sum identity is unmoved.
     function _unloadAt(uint256 priceUsd) internal returns (uint256 unloadedSize) {
-        _advance(3);
+        _advance(4);
         bytes[] memory pu = _pu(priceUsd);
         vm.prank(seq);
         unloadedSize = pair.unloadVault(0, pu);
@@ -296,7 +325,7 @@ contract ZeroSumInvariantTest is Test {
 
     /// @dev Withdraw a flat user's full collateral (rounded down to USDC granularity).
     function _withdrawAll(address u) internal {
-        (, uint256 size,, uint256 coll,,,,,) = pair.positionBuckets(u);
+        (, uint256 size,, uint256 coll,,,) = pair.positionBuckets(u);
         assertEq(size, 0, "withdrawAll expects a flat user");
         uint256 amount = coll - (coll % 1e12);
         if (amount == 0) return;
@@ -393,7 +422,7 @@ contract ZeroSumInvariantTest is Test {
         _assertZeroSum(50_000, "after open");
 
         // Step the oracle down, then liquidate alice at $41k (equity ~$3k < MMR).
-        _advance(3);
+        _advance(4);
         address[] memory users = new address[](1);
         users[0] = alice;
         bytes[] memory liqPu = _pu(41_000);
@@ -406,7 +435,7 @@ contract ZeroSumInvariantTest is Test {
         _deposit(carol, 12_000 * BAZAAR_SCALE);
         _placeLimit(carol, true, 1 * BAZAAR_SCALE, 41_400 * BAZAAR_SCALE);
         assertEq(_unloadAt(41_000), 1 * BAZAAR_SCALE, "vault inventory closed");
-        (,,,,,, uint256 plSize,,,,,,,) = pair.pairVault();
+        (,,,,,, uint256 plSize,,,,,,,,,,) = pair.pairVault();
         assertEq(plSize, 0, "vault fully unwound");
         _assertZeroSum(41_000, "after vault close");
 
@@ -441,7 +470,7 @@ contract ZeroSumInvariantTest is Test {
         _assertZeroSum(50_000, "after open");
 
         // Spike to $59k: bob's equity ~$3k < MMR → liquidated; vault inherits his short at ~$50k basis.
-        _advance(3);
+        _advance(4);
         address[] memory users = new address[](1);
         users[0] = bob;
         bytes[] memory liqPu = _pu(59_000);
@@ -454,7 +483,7 @@ contract ZeroSumInvariantTest is Test {
         _deposit(carol, 12_000 * BAZAAR_SCALE);
         _placeLimitAt(carol, false, 1 * BAZAAR_SCALE, 48_200 * BAZAAR_SCALE, 48_000);
         assertEq(_unloadAt(48_000), 1 * BAZAAR_SCALE, "vault inventory closed at a profit");
-        (,,,,,, uint256 plSize,,,,,,,) = pair.pairVault();
+        (,,,,,, uint256 plSize,,,,,,,,,,) = pair.pairVault();
         assertEq(plSize, 0, "vault fully unwound");
         _assertZeroSum(48_000, "after profitable vault close");
 
@@ -471,10 +500,10 @@ contract ZeroSumInvariantTest is Test {
     /// @dev Total claims marked at `priceUsd` (same computation as _assertZeroSum, without the
     ///      equality assertion): insurance + unclaimed fee escrow + Σ trader equity + vault inventory.
     function _claimsAt(uint256 priceUsd) internal view returns (int256 claims) {
-        (,,,,, uint256 I,,,,,,,,) = pair.pairVault();
+        (,,,,, uint256 I,,,,,,,,, uint256 arrears,,) = pair.pairVault();
         uint256 p = priceUsd * BAZAAR_SCALE;
         int256 f = pair.currentFundingIndex();
-        claims = int256(I) + int256(_escrowTotal());
+        claims = int256(I) + int256(_escrowTotal()) + int256(arrears);
         for (uint256 i = 0; i < traders.length; i++) {
             claims += _equityAt(traders[i], p, f);
         }
@@ -482,12 +511,13 @@ contract ZeroSumInvariantTest is Test {
     }
 
     /// @notice A winner's realized-and-withdrawn profit leaves the deposits ledger below the
-    ///         loser's book collateral; the loser then goes insolvent. The seizure caps at the
-    ///         ledger (an uncapped debit would panic and leave the loser unliquidatable), the
-    ///         uncapped remainder becomes a cash surplus over claims rather than a deficit, the
-    ///         pair stays live, the estate-close walk runs with a zero fee budget (all fees
-    ///         waived — nothing charged, nothing paid), and the surviving winner withdraws in
-    ///         full once the estate settles.
+    ///         loser's book collateral; the loser then goes insolvent. The seizure takes what
+    ///         the ledger holds (an uncapped debit would panic and leave the loser
+    ///         unliquidatable) and carries the rest as the ledger's arrears to the fund rather
+    ///         than a deficit, the pair stays live, the estate-close walk runs with a zero fee
+    ///         budget (all fees waived — nothing charged, nothing paid), insurance funds the
+    ///         estate's loss net of the arrears so the ledger ends at exactly the survivor's
+    ///         claim, and the survivor withdraws in full with nothing stranded.
     function test_seizureCap_solventPairSurvivesThinLedger() public {
         _deposit(alice, 11_500 * BAZAAR_SCALE);
         _deposit(bob, 17_500 * BAZAAR_SCALE);
@@ -512,53 +542,57 @@ contract ZeroSumInvariantTest is Test {
 
         // Precondition of the whole scenario: bob's book collateral now exceeds the entire
         // deposits ledger, while bob's EQUITY is only just below zero (solvent boundary).
-        (,,, uint256 bobBook,,,,,) = pair.positionBuckets(bob);
-        (,,,, uint256 dBefore, uint256 iBefore,,,,,,,,) = pair.pairVault();
+        (,,, uint256 bobBook,,,) = pair.positionBuckets(bob);
+        (,,,, uint256 dBefore, uint256 iBefore,,,,,,,,,,,) = pair.pairVault();
         assertGt(bobBook, dBefore, "bob's book must exceed the deposits ledger");
 
         int256 gapBefore = int256(usdc.balanceOf(address(pair)) * 1e12) - _claimsAt(68_500);
 
         // Liquidate bob. The seizure credits insurance with the whole remaining ledger, floors
         // the ledger at zero, books NO deficit, and the pair stays live.
-        _advance(3);
+        _advance(4);
         address[] memory users = new address[](1);
         users[0] = bob;
         vm.prank(dave);
         assertEq(pair.liquidate(users, _pu(68_500)), 1, "liquidation must survive the thin ledger");
 
+        uint256 arrears;
         {
-            (,,,, uint256 dAfter, uint256 iAfter,,,,,, uint256 deficit,,) = pair.pairVault();
+            (,,,, uint256 dAfter, uint256 iAfter,,,,,, uint256 deficit,,, uint256 owed,,) = pair.pairVault();
+            arrears = owed;
             assertEq(dAfter, 0, "ledger seized to exactly zero");
             assertEq(deficit, 0, "no deficit: solvency is decided at estate settlement");
             // Insurance received the capped amount (the liquidator reward moves out of I into the
             // fee escrow, so bound rather than pin it).
             assertGe(iAfter + 20e18, iBefore + dBefore, "insurance credited the capped seizure");
             assertLe(iAfter, iBefore + dBefore, "insurance never credited above the ledger");
+            assertEq(arrears, bobBook - dBefore, "the unpaid remainder is the ledger's arrears to the fund");
         }
 
-        // The dropped remainder (book minus ledger) turns into cash surplus over claims — the
-        // conservative direction: unclaimable surplus, never an unbacked claim.
+        // The remainder is neither dropped nor a deficit: counted as the fund's claim, the books
+        // stay exactly whole through the seizure.
         int256 gapAfter = int256(usdc.balanceOf(address(pair)) * 1e12) - _claimsAt(68_500);
-        assertApproxEqAbs(gapAfter - gapBefore, int256(bobBook - dBefore), CLAIMS_TOL, "surplus == dropped seizure");
+        assertApproxEqAbs(gapAfter, gapBefore, CLAIMS_TOL, "arrears keep claims == cash across the seizure");
+        _assertZeroSum(68_500, "after the capped seizure");
 
         // Estate close through the unload walk with the deposits ledger at ZERO: the walk's fee
         // budget is zero, so carol's closing fill is charged NO fee and no fee is paid out.
         // Insurance funds the estate's entry-basis loss into the ledger, which re-covers carol's
         // claim, and separately pays the caller's unload reward as cash.
-        (,, uint256 carolEntry, uint256 carolCollBefore, int256 carolFundIdx,,,,) = pair.positionBuckets(carol);
-        (,,,,, uint256 iPreClose,,,, int256 plFundIdx,,,,) = pair.pairVault();
+        (,, uint256 carolEntry, uint256 carolCollBefore, int256 carolFundIdx,,) = pair.positionBuckets(carol);
+        (,,,,, uint256 iPreClose,,,, int256 plFundIdx,,,,,,,) = pair.pairVault();
 
         _placeLimitAt(carol, false, 1 * BAZAAR_SCALE, 68_500 * BAZAAR_SCALE, 68_500);
         assertEq(_unloadAt(68_500), 1 * BAZAAR_SCALE, "estate closed against carol");
 
         {
-            (,,,,,, uint256 plSize,,,,,,,) = pair.pairVault();
+            (,,,,,, uint256 plSize,,,,,,,,,,) = pair.pairVault();
             assertEq(plSize, 0, "vault fully unwound");
         }
         {
             // Carol's collateral moved by exactly her realized PnL + funding — zero fee. Any
             // charged fee would break this equality.
-            (,,, uint256 carolCollAfter,,,,,) = pair.positionBuckets(carol);
+            (,,, uint256 carolCollAfter,,,) = pair.positionBuckets(carol);
             int256 realized = int256(68_500 * BAZAAR_SCALE) - int256(carolEntry);
             int256 rawFunding =
                 (pair.currentFundingIndex() - carolFundIdx) * int256(1 * BAZAAR_SCALE) / int256(BAZAAR_SCALE);
@@ -566,34 +600,121 @@ contract ZeroSumInvariantTest is Test {
             assertApproxEqAbs(int256(carolCollAfter), expected, 1e12, "close charged no fee (budget exhausted)");
         }
         {
-            // Insurance paid the estate's full entry-basis loss (price leg + funding leg) into
-            // the deposits ledger, paid the caller's unload reward (2 bp of the $68.5k unloaded
-            // notional — above the $0.10 floor), and received nothing else — no insurance fee
-            // was collected in the waived walk, so any fee credit would break these equalities.
+            // Insurance paid the estate's entry-basis loss (price leg + funding leg) into the
+            // deposits ledger NET of the arrears the ledger owed it, paid the caller's unload
+            // reward (2 bp of the $68.5k unloaded notional — above the flat reward), and received
+            // nothing else — no insurance fee was collected in the waived walk, so any fee credit
+            // would break these equalities. The fund's outlay is therefore bob's loss beyond his
+            // collateral, and the ledger lands on exactly the survivor's claim.
             uint256 expectedLoss = uint256(int256(17_500 * BAZAAR_SCALE) - (pair.currentFundingIndex() - plFundIdx));
+            uint256 netPaid = expectedLoss - arrears;
             uint256 unloadReward = 68_500 * BAZAAR_SCALE * BazaarTypes.LIQUIDATION_FEE_EBP / BazaarTypes.EBP_SCALE;
-            (,,,, uint256 dPost, uint256 iPost,,,,,, uint256 deficit,,) = pair.pairVault();
+            (,,,, uint256 dPost, uint256 iPost,,,,,, uint256 deficit,,, uint256 arrearsPost,,) = pair.pairVault();
             assertEq(deficit, 0, "estate loss fully funded by insurance");
+            assertEq(arrearsPost, 0, "the settlement netted the whole arrears");
             assertApproxEqAbs(
-                iPreClose - iPost, expectedLoss + unloadReward, 1e12, "insurance funded the loss + unload reward"
+                iPreClose - iPost,
+                netPaid + unloadReward,
+                1e12,
+                "insurance funded the loss net of arrears + unload reward"
             );
-            assertApproxEqAbs(dPost, expectedLoss, 1e12, "ledger re-covered for the survivor");
-            assertGe(dPost, carolCollAfterOf(), "ledger covers carol's full claim");
+            assertApproxEqAbs(dPost, netPaid, 1e12, "ledger credited the net loss");
+            assertApproxEqAbs(
+                dPost, carolCollAfterOf(), CLAIMS_TOL, "ledger is exactly carol's claim: nothing stranded"
+            );
         }
+        _assertZeroSum(68_500, "after the estate settled");
 
-        // The survivor exits whole through the live path — the pair never terminated.
+        // The survivor exits whole through the live path — the pair never terminated — and the
+        // ledger empties with her: no cash is left behind that no bucket can claim.
         _withdrawAll(bob); // seized to zero — no-op
         _withdrawAll(carol);
         {
-            (,,, uint256 carolCollFinal,,,,,) = pair.positionBuckets(carol);
+            (,,, uint256 carolCollFinal,,,) = pair.positionBuckets(carol);
             assertLt(carolCollFinal, 1e12, "carol withdrew her entire claim");
-            (,,,,,,,,,,, uint256 deficit,,) = pair.pairVault();
+            (,,,, uint256 dFinal,,,,,,, uint256 deficit,,,,,) = pair.pairVault();
             assertEq(deficit, 0, "pair ends live and solvent");
+            assertLt(dFinal, CLAIMS_TOL, "ledger empties with the last claim: nothing stranded");
         }
     }
 
+    /// @notice The same thin-ledger seizure, but the pair terminates before the estate settles,
+    ///         so the arrears are still outstanding at finalize. Finalize subtracts them from
+    ///         what traders are owed: the survivor's principal is reserved at exactly her bucket
+    ///         and paid whole, and the cash the ledger holds for the fund reaches the insurers'
+    ///         residual instead of being reserved for a bucket that does not exist.
+    function test_seizureCap_terminationPaysSurvivorWholeAndArrearsToInsurers() public {
+        _deposit(alice, 11_500 * BAZAAR_SCALE);
+        _deposit(bob, 17_500 * BAZAAR_SCALE);
+        _deposit(carol, 15_500 * BAZAAR_SCALE);
+        _deposit(dave, 9_000 * BAZAAR_SCALE);
+        _cross(alice, 51_000 * BAZAAR_SCALE, bob, 49_000 * BAZAAR_SCALE, 1 * BAZAAR_SCALE);
+        _crossAt(carol, 68_500 * BAZAAR_SCALE, alice, 67_500 * BAZAAR_SCALE, 1 * BAZAAR_SCALE, 68_500);
+        _withdrawAll(alice);
+        _withdrawAll(dave);
+
+        (,,, uint256 bobBook,,,) = pair.positionBuckets(bob);
+        (,,,, uint256 dBefore,,,,,,,,,,,,) = pair.pairVault();
+        assertGt(bobBook, dBefore, "bob's book must exceed the deposits ledger");
+
+        _advance(4);
+        address[] memory users = new address[](1);
+        users[0] = bob;
+        vm.prank(dave);
+        assertEq(pair.liquidate(users, _pu(68_500)), 1, "liquidation must survive the thin ledger");
+        assertEq(_vaultArrears(), bobBook - dBefore, "arrears outstanding against the unsettled estate");
+        _assertZeroSum(68_500, "after the capped seizure");
+
+        // Terminate with the estate still in the vault: fix the price, settle the one open
+        // position at it, finalize.
+        vm.prank(pair.umaContract());
+        pair.fixSettlementPrice(68_500 * BAZAAR_SCALE);
+        users[0] = carol;
+        pair.liquidate(users, new bytes[](0));
+        pair.finalizeTermination();
+        assertTrue(pair.isPairTerminated(), "pair terminated");
+        assertEq(_vaultArrears(), 0, "finalize collected the arrears");
+
+        uint256 entitlement = _assertFinalizeReservedOnlyTheSurvivor();
+        uint256 iResidual = _vaultInsurance();
+
+        // Both ratios are whole: the survivor collects her bucket and her registered claim in
+        // full, and the residual does not move.
+        uint256 amount = entitlement - (entitlement % 1e12);
+        uint256 carolBefore = usdc.balanceOf(carol);
+        vm.prank(carol);
+        pair.withdrawCollateral(amount, new bytes[](0), 0, 0, 0, "");
+        assertEq(usdc.balanceOf(carol) - carolBefore, amount / 1e12, "survivor paid at a 100% principal ratio");
+        assertLt(carolCollAfterOf(), 1e12, "survivor withdrew her whole entitlement");
+        assertEq(_vaultInsurance(), iResidual, "trader withdrawals never touch the insurers' residual");
+    }
+
+    /// @dev After finalize: the principal reserved is the survivor's bucket alone — the arrears
+    ///      were subtracted from the derived total instead of being reserved for a bucket nobody
+    ///      holds — and everything the pot holds beyond her bucket and registered claim is the
+    ///      insurers' residual. Returns her whole entitlement (bucket + claim).
+    function _assertFinalizeReservedOnlyTheSurvivor() internal view returns (uint256 entitlement) {
+        uint256 carolColl = carolCollAfterOf();
+        uint256 claim = pair.terminalProfitClaim(carol);
+        (,,,, uint256 principal, uint256 I,,,,,,,,,,,) = pair.pairVault();
+        assertApproxEqAbs(principal, carolColl, CLAIMS_TOL, "principal reserved == the survivor's bucket");
+        uint256 pot = usdc.balanceOf(address(pair)) * 1e12 - _escrowTotal();
+        assertApproxEqAbs(
+            I, pot - carolColl - claim, CLAIMS_TOL, "insurers' residual == pot less the survivor's entitlement"
+        );
+        entitlement = carolColl + claim;
+    }
+
+    function _vaultArrears() internal view returns (uint256 arrears) {
+        (,,,,,,,,,,,,,, arrears,,) = pair.pairVault();
+    }
+
+    function _vaultInsurance() internal view returns (uint256 I) {
+        (,,,,, I,,,,,,,,,,,) = pair.pairVault();
+    }
+
     function carolCollAfterOf() internal view returns (uint256 coll) {
-        (,,, coll,,,,,) = pair.positionBuckets(carol);
+        (,,, coll,,,) = pair.positionBuckets(carol);
     }
 
     /// @notice Mixed-direction liquidations: a long is liquidated on the way down, then a short
@@ -608,15 +729,16 @@ contract ZeroSumInvariantTest is Test {
         _cross(alice, 51_000 * BAZAAR_SCALE, bob, 49_000 * BAZAAR_SCALE, 1 * BAZAAR_SCALE);
 
         // Phase 2: the market drops; carol shorts 1 vs dave long 1 near the bottom (~$41k) on
-        // thin margin. Both fills complete at placement, so no resting order is left for the
-        // liquidation's inline unload to consume.
-        _deposit(carol, 8_500 * BAZAAR_SCALE);
+        // thin margin: initial margin at the $41k mark, the $500 her $40.5k ask could book at
+        // its own limit, and the maker fee, with little to spare. Both fills complete at
+        // placement, so no resting order is left for the liquidation's inline unload to consume.
+        _deposit(carol, 8_800 * BAZAAR_SCALE);
         _deposit(dave, 15_000 * BAZAAR_SCALE);
         _crossAt(dave, 41_500 * BAZAAR_SCALE, carol, 40_500 * BAZAAR_SCALE, 1 * BAZAAR_SCALE, 41_000);
         _assertZeroSum(41_000, "after bottom open");
 
         // Now liquidate alice at $41k: the vault inherits her long.
-        _advance(3);
+        _advance(4);
         address[] memory users = new address[](1);
         users[0] = alice;
         vm.prank(dave);
@@ -628,14 +750,14 @@ contract ZeroSumInvariantTest is Test {
         // while the vault still holds alice's long fires the opposing-netting arm.
         uint256 liqPriceUsd;
         {
-            (,, uint256 carolEntry, uint256 carolColl,,,,,) = pair.positionBuckets(carol);
+            (,, uint256 carolEntry, uint256 carolColl,,,) = pair.positionBuckets(carol);
             liqPriceUsd = (carolEntry + carolColl) / BAZAAR_SCALE - 300;
         }
-        _advance(3);
+        _advance(4);
         users[0] = carol;
         vm.prank(bob);
         assertEq(pair.liquidate(users, _pu(liqPriceUsd)), 1, "carol liquidated");
-        (,,,,,, uint256 plSize,,,,,,,) = pair.pairVault();
+        (,,,,,, uint256 plSize,,,,,,,,,,) = pair.pairVault();
         assertEq(plSize, 0, "1-vs-1 netting fully cleared the vault");
         _assertZeroSum(49_000, "after opposing netting");
 
@@ -669,12 +791,103 @@ contract ZeroSumInvariantTest is Test {
         _assertZeroSum(50_000, "after funding accrual");
 
         // Liquidate alice at $41k while she carries an unsettled funding balance.
-        _advance(3);
+        _advance(4);
         address[] memory users = new address[](1);
         users[0] = alice;
         bytes[] memory liqPu = _pu(41_000);
         vm.prank(dave);
         assertEq(pair.liquidate(users, liqPu), 1, "alice liquidated");
         _assertZeroSum(41_000, "after liquidation of funded position");
+    }
+
+    /// @notice An opposing liquidation whose netting the fund cannot afford is deferred: the
+    ///         position stays open and listed, the window it needs stays pending with no bad debt
+    ///         anywhere, and one auction batch then closes each cohort against its own
+    ///         counterparties — the deferred account against the inventory's side at its
+    ///         bankruptcy price, the inventory against the other side. The identity must hold at
+    ///         every step, and nothing is ever booked as deficit.
+    ///
+    ///         The netting arm runs only when its loss fits in the fund's free capital above the
+    ///         reserve plus the seizure of the two slices it cancels and the ledger's arrears; the
+    ///         loss here is the $50k entry gap over 0.72, far past that, so the seizure is refused
+    ///         rather than run at a loss the fund would have to book as deficit.
+    function test_zeroSum_unaffordableNetting_defersAndClosesEachCohortAgainstItsOwn() public {
+        // Top of the range: dave long 0.72 vs bob short 0.72 at $80k, a third of notional each.
+        _deposit(dave, 19_200 * BAZAAR_SCALE);
+        _deposit(bob, 16_000 * BAZAAR_SCALE);
+        _crossAt(dave, 80_000 * BAZAAR_SCALE, bob, 80_000 * BAZAAR_SCALE, 72 * BAZAAR_SCALE / 100, 80_000);
+        _assertZeroSum(80_000, "after top open");
+
+        // Bottom of the range: alice short 0.88 vs carol long 0.88 at $30k, half of notional each.
+        // Opened before dave is seized: the window his seizure opens freezes matching.
+        _deposit(alice, 13_200 * BAZAAR_SCALE);
+        _deposit(carol, 13_200 * BAZAAR_SCALE);
+        _crossAt(carol, 30_000 * BAZAAR_SCALE, alice, 30_000 * BAZAAR_SCALE, 88 * BAZAAR_SCALE / 100, 30_000);
+        _assertZeroSum(30_000, "after bottom open");
+
+        // Seize dave at $30k: the vault inherits a 0.72 long from $80k with his $19,200 earmarked
+        // against it, $36,000 under water — far past what the seed can absorb, so ADL latches.
+        address[] memory users = new address[](1);
+        users[0] = dave;
+        _advance(4);
+        vm.prank(seq);
+        assertEq(pair.liquidate(users, _pu(30_000)), 1, "dave liquidated");
+        assertTrue(pair.isAdlPending(), "the estate's loss exceeds the fund");
+        _assertZeroSum(30_000, "after long seizure");
+
+        // Recover to $52,600: alice's $30k short is $19,888 under water on her collateral, and
+        // netting 0.72 of it against the vault's long would realize the $36,000 entry gap. The
+        // fund's free capital above its reserve, the two slices' seizure and the (empty) arrears
+        // are nowhere near it, so she is deferred: open, listed, and nothing seized or booked.
+        (,,, uint256 aliceColl,,,) = pair.positionBuckets(alice);
+        uint256 iBefore;
+        {
+            (,,,,, uint256 I,,,,,,,,,,,) = pair.pairVault();
+            iBefore = I;
+        }
+        users[0] = alice;
+        _advance(4);
+        vm.prank(seq);
+        assertEq(pair.liquidate(users, _pu(52_600)), 0, "alice deferred, not seized");
+        assertEq(pair.auxState().deferredCount, 1, "one deferred liquidation");
+        assertEq(pair.deferredLiquidations(0), alice, "alice is listed");
+        {
+            (, uint256 aliceSize,, uint256 aliceCollNow,,,) = pair.positionBuckets(alice);
+            assertEq(aliceSize, 88 * BAZAAR_SCALE / 100, "her position is left open");
+            assertEq(aliceCollNow, aliceColl, "and her collateral untouched");
+            (,,,,, uint256 I, uint256 plSize,,,,, uint256 deficit,,,,,) = pair.pairVault();
+            assertEq(plSize, 72 * BAZAAR_SCALE / 100, "the vault's long is untouched");
+            assertEq(deficit, 0, "nothing booked as bad debt");
+            assertEq(I, iBefore - BazaarTypes.MIN_LIQUIDATOR_REWARD, "the fund paid the recording tip and nothing else");
+        }
+        assertTrue(pair.isAdlPending(), "the window stays open for her");
+        assertEq(pair.settlementPriceFixedTs(), 0, "no insolvency verdict");
+        _assertZeroSum(52_600, "after the deferral");
+
+        // One batch, both cohorts. Carol — alice's counterparty, on the inventory's own side — is
+        // closed against alice at alice's bankruptcy price, where alice's whole collateral is
+        // exactly the profit carol is credited; bob is closed against the vault's long. The fund
+        // moves only by the executor's rewards, and the list and the window are released.
+        (,,, uint256 carolColl,,,) = pair.positionBuckets(carol);
+        address[] memory cohort = new address[](1);
+        cohort[0] = carol;
+        users[0] = bob;
+        _advance(15 minutes + 1);
+        vm.prank(seq);
+        pair.executeAdl(users, cohort, _pu(52_600));
+        {
+            (, uint256 aliceSize,,,,,) = pair.positionBuckets(alice);
+            (, uint256 carolSize,, uint256 carolCollNow,,,) = pair.positionBuckets(carol);
+            assertEq(aliceSize, 0, "alice seized in the batch");
+            assertEq(carolSize, 0, "carol closed against her");
+            assertApproxEqAbs(
+                carolCollNow, carolColl + aliceColl, 1e12, "credited alice's bankruptcy: her whole collateral"
+            );
+            (,,,,,,,,,,, uint256 deficit,,,,,) = pair.pairVault();
+            assertEq(deficit, 0, "still nothing booked as bad debt");
+        }
+        assertEq(pair.auxState().deferredCount, 0, "list emptied");
+        assertFalse(pair.isAdlPending(), "window released");
+        _assertZeroSum(52_600, "after the two-cohort batch");
     }
 }

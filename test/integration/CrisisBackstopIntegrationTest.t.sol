@@ -22,7 +22,7 @@ contract CrisisBackstopIntegrationTest is IntegrationBase {
     function test_e2e_Deficit_TerminatesPairOnNextHealthCheck() public {
         // Record phantom bad debt directly (the netting-overrun producer is unit-tested elsewhere).
         _stdstore.target(address(pair)).sig("pairVault()").depth(11).checked_write(100 * BAZAAR_SCALE);
-        (,,,,,,,,,,, uint256 deficit,,) = pair.pairVault();
+        (,,,,,,,,,,, uint256 deficit,,,,,) = pair.pairVault();
         assertEq(deficit, 100 * BAZAAR_SCALE, "deficit seeded");
 
         // Any liquidation re-runs isVaultHealthy; Check 0 fires before everything else.
@@ -148,15 +148,20 @@ contract CrisisBackstopIntegrationTest is IntegrationBase {
         // auction is owed a fresh-priced window before anyone may pull the plug, so that a feed
         // outage spanning the deadline cannot leave both paths unblocking in the same block.
         assertEq(
-            pair.adlTerminationTs(),
+            lens.adlTerminationTs(address(pair)),
             vm.getBlockTimestamp() + BazaarTypes.ADL_TERMINATION_GRACE,
             "runway armed off the stored price"
         );
         assertEq(pair.settlementPriceFixedTs(), 0, "arming must not terminate in the same block");
 
-        // Let the runway lapse; the next priced call fires the expired clock.
-        vm.warp(pair.adlTerminationTs());
-        pair.refreshPrice(_freshPrice());
+        // Let the runway lapse; the next priced call fires the expired clock, and the pair
+        // announces the fix itself with the timeout's verdict.
+        vm.warp(lens.adlTerminationTs(address(pair)));
+        bytes[] memory pu = _freshPrice();
+        bytes32 pid = pair.pairId();
+        vm.expectEmit(true, false, false, true, address(pair));
+        emit BazaarPair.InsolvencySettlementFixed(pid, 50_000 * BAZAAR_SCALE, 2);
+        pair.refreshPrice(pu);
 
         // Two-stage: the timed-out ADL is treated as price-driven insolvency → fix the price and
         // open the settlement window, then finalize to settle via the equity path.
@@ -175,12 +180,13 @@ contract CrisisBackstopIntegrationTest is IntegrationBase {
         // behind, since reaching it requires the runway to have been armed and elapsed, and a
         // survivor would show a window that both has and has not ended.
         assertEq(pair.adlPendingSince(), 0, "finalize clears the termination clock");
-        assertEq(pair.adlTerminationTs(), 0, "finalize clears the runway");
+        assertEq(lens.adlTerminationTs(address(pair)), 0, "finalize clears the runway");
         assertEq(pair.adlAuctionStartTs(), 0, "finalize clears the decay clock");
     }
 
-    /// @notice Insurer-vote consensus that outlives the 7-day execution window: the proposer's bond
-    ///         is refunded (consensus was real) but the pair is NOT terminated at a weeks-stale vote.
+    /// @notice Insurer-vote consensus nobody executed before the cutoff: the proposer's bond is
+    ///         refunded (consensus was real) but the pair is NOT scheduled off a vote whose cutoff
+    ///         has passed.
     function test_e2e_InsurerVote_ConsensusExpiredWindow_RefundsWithoutTerminating() public {
         BazaarPairTerminator terminator = factory.pairTerminator();
 
@@ -188,28 +194,30 @@ contract CrisisBackstopIntegrationTest is IntegrationBase {
         _assertBooksSettled("insurervote: after insurance deposit");
         vm.warp(vm.getBlockTimestamp() + 7 days + 1 hours); // share maturity
 
-        uint256 bond = 500 * USDC_SCALE;
+        uint256 bond = 1_000 * USDC_SCALE; // INSURER_TERMINATION_BOND_USDC
         uint256 totalAtProposal = pair.totalInsuranceShares();
         usdc.mint(carol, bond);
         vm.startPrank(carol);
         usdc.approve(address(terminator), bond);
-        terminator.proposeInsurerTermination(address(pair));
+        bytes32 id = terminator.proposeInsurerTermination(address(pair), uint64(vm.getBlockTimestamp()) + 1 days);
         vm.stopPrank();
         uint256 carolAfterPropose = usdc.balanceOf(carol);
 
         assertGe(9_500 * BAZAAR_SCALE, totalAtProposal * 6_000 / 10_000, "vote clears 60%");
         vm.prank(carol);
-        terminator.voteForInsurerTermination(address(pair), 9_500 * BAZAAR_SCALE);
+        terminator.voteForInsurerTermination(address(pair), id, 9_500 * BAZAAR_SCALE);
 
-        // Past votingEnd (7d) AND the 7d execution window.
-        vm.warp(vm.getBlockTimestamp() + 14 days + 1);
-        terminator.executeInsurerTermination(address(pair), new bytes[](0));
+        // The cutoff passes with nobody executing.
+        (,,,, uint256 cutoffTs,,,,,,,,,,,) = terminator.insurerProposals(id);
+        vm.warp(cutoffTs + 1);
+        terminator.executeInsurerTermination(address(pair), id);
 
+        assertEq(pair.scheduledTerminationTs(), 0, "stale consensus must not schedule");
         assertFalse(pair.isPairTerminated(), "stale consensus must not terminate");
         assertEq(usdc.balanceOf(carol), carolAfterPropose + bond, "bond refunded on real consensus");
-        (,,,,,, bool resolved, bool executed) = terminator.insurerProposals(address(pair));
+        (,,,,,,,,,, bool resolved, bool scheduled,,,,) = terminator.insurerProposals(id);
         assertTrue(resolved, "proposal resolved");
-        assertFalse(executed, "but not executed");
+        assertFalse(scheduled, "but not scheduled");
 
         // The pair itself was never touched by the vote (bond flows through the terminator), so its
         // books stay exactly balanced.

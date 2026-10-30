@@ -6,6 +6,7 @@ import {BazaarPair} from "../../src/BazaarPair.sol";
 import {BazaarPairTerminator} from "../../src/BazaarPairTerminator.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
 import {MockOptimisticOracleV3} from "../mocks/MockOptimisticOracleV3.sol";
+import {PythChain} from "../PythChain.sol";
 
 /// @title GovernanceIntegrationTest
 /// @notice End-to-end UMA governance flows: scheduled pair termination through the real Terminator
@@ -61,7 +62,7 @@ contract GovernanceIntegrationTest is IntegrationBase {
         uint256 lastTradingTs = vm.getBlockTimestamp() + 7 days;
         _bondProposer(alice);
         vm.prank(alice);
-        bytes32 aid = terminator.proposeTermination(address(pair), "BTC/USD", lastTradingTs, "Reverse split announced.");
+        bytes32 aid = terminator.proposeTermination(address(pair), 3, lastTradingTs, "Reverse split announced.");
 
         // Settle truthfully after the 12h liveness: schedules the cutoff, pair keeps trading.
         vm.warp(vm.getBlockTimestamp() + terminator.TERMINATION_PROPOSAL_LIVENESS() + 1);
@@ -99,7 +100,7 @@ contract GovernanceIntegrationTest is IntegrationBase {
         uint64 lastTradingTs = uint64(vm.getBlockTimestamp() + 1 days);
         _bondProposer(carol);
         vm.prank(carol);
-        bytes32 aid = terminator.proposeTermination(address(pair), "BTC/USD", lastTradingTs, "Delisting announced.");
+        bytes32 aid = terminator.proposeTermination(address(pair), 2, lastTradingTs, "Delisting announced.");
 
         vm.warp(vm.getBlockTimestamp() + terminator.TERMINATION_PROPOSAL_LIVENESS() + 1);
         terminator.settleTerminationProposal(aid);
@@ -108,10 +109,12 @@ contract GovernanceIntegrationTest is IntegrationBase {
         assertFalse(pair.isPairTerminated(), "acceptance alone does not terminate");
         assertEq(pair.scheduledTerminationTs(), lastTradingTs, "cutoff scheduled");
 
-        // Past the cutoff, anyone fixes the price with the archived Pyth update from that moment;
-        // the price is verified on-chain against that payload, not read from the proposal.
+        // Past the cutoff, anyone fixes the price with the archived Pyth update from that moment —
+        // the feed's first print in the 3 s window ending at the cutoff, its predecessor published
+        // before the window opened. The price is verified on-chain against that payload, not read
+        // from the proposal.
         vm.warp(uint256(lastTradingTs) + 1);
-        bytes[] memory tick = _priceUpdate(50_000, lastTradingTs);
+        bytes[] memory tick = _priceUpdateFor(BTC_USD_FEED_ID, 50_000, lastTradingTs, lastTradingTs - 4);
         uint256 fee = oracle.getUpdateFee(tick);
         vm.deal(address(this), fee);
         terminator.terminateScheduledPair{value: fee}(address(pair), tick);
@@ -143,7 +146,7 @@ contract GovernanceIntegrationTest is IntegrationBase {
     // ============================ identifier upgrade ============================
 
     /// @notice Identifier-upgrade governance: propose a new UMA identifier (whitelist-validated),
-    ///         wait out the liveness window, settle (queues the swap), wait out the 14-day
+    ///         wait out the liveness window, settle (queues the swap), wait out the 12-day
     ///         activation timelock — the users' exit window — then anyone activates and the
     ///         protocol asserts under the new identifier. The oracle address never moves — it is
     ///         immutable; the identifier is the axis UMA actually changes.
@@ -186,9 +189,7 @@ contract GovernanceIntegrationTest is IntegrationBase {
         _bondProposer(alice);
         vm.prank(alice);
         vm.expectRevert(BazaarPairTerminator.BazaarPairTerminator__UmaIdentifierNotLive.selector);
-        terminator.proposeTermination(
-            address(pair), "BTC/USD", vm.getBlockTimestamp() + 7 days, "Reverse split announced."
-        );
+        terminator.proposeTermination(address(pair), 3, vm.getBlockTimestamp() + 7 days, "Reverse split announced.");
     }
 
     // ============================ disputed termination ============================
@@ -198,8 +199,7 @@ contract GovernanceIntegrationTest is IntegrationBase {
     function test_e2e_DisputedTermination_ResolvedFalse_PairUnaffected() public {
         _bondProposer(alice);
         vm.prank(alice);
-        bytes32 aid =
-            terminator.proposeTermination(address(pair), "BTC/USD", vm.getBlockTimestamp() + 7 days, "Bogus claim.");
+        bytes32 aid = terminator.proposeTermination(address(pair), 2, vm.getBlockTimestamp() + 7 days, "Bogus claim.");
 
         // Bob disputes with a matching $1000 bond, and the DVM sides with him.
         uint256 bond = terminator.TERMINATION_PROPOSAL_BOND();
@@ -220,9 +220,10 @@ contract GovernanceIntegrationTest is IntegrationBase {
 
     // ============================ insurer-vote termination ============================
 
-    /// @notice Insurer-vote termination (no UMA): a majority insurer proposes, votes 60%+ of the share
-    ///         snapshot with mature shares, waits out the 7-day voting period, and executes — the pair
-    ///         terminates at the live oracle price and the proposer's bond is refunded.
+    /// @notice Insurer-vote termination (no UMA): a majority insurer proposes a cutoff, votes 60%+ of
+    ///         the share snapshot with mature shares, and executes at once — the pair is scheduled to
+    ///         stop trading at the cutoff, settles at the median of the chain of prints from it, and the
+    ///         proposer's bond is refunded.
     function test_e2e_InsurerVoteTermination_MajorityExecutes() public {
         // Carol becomes the majority insurer: 10,000 shares vs the 4,000-share deployment seed.
         _depositInsurance(carol, 10_000 * BAZAAR_SCALE);
@@ -232,32 +233,36 @@ contract GovernanceIntegrationTest is IntegrationBase {
         // Shares must be mature (held >= 7 days before the proposal) to vote.
         vm.warp(vm.getBlockTimestamp() + 7 days + 1 hours);
 
-        uint256 bond = 500 * USDC_SCALE; // INSURER_TERMINATION_BOND_USDC
+        uint256 bond = 1_000 * USDC_SCALE; // INSURER_TERMINATION_BOND_USDC
         uint256 totalAtProposal = pair.totalInsuranceShares(); // carol's 10k + the deployment seed
         usdc.mint(carol, bond);
         vm.startPrank(carol);
         usdc.approve(address(terminator), bond);
-        terminator.proposeInsurerTermination(address(pair));
+        bytes32 id = terminator.proposeInsurerTermination(address(pair), uint64(vm.getBlockTimestamp()) + 1 days);
         vm.stopPrank();
         uint256 carolAfterPropose = usdc.balanceOf(carol);
 
         // 9,500 votes — above the 60% threshold of the snapshot (carol holds the clear majority).
         assertGe(9_500 * BAZAAR_SCALE, totalAtProposal * 6_000 / 10_000, "vote clears the 60% threshold");
         vm.prank(carol);
-        terminator.voteForInsurerTermination(address(pair), 9_500 * BAZAAR_SCALE);
+        terminator.voteForInsurerTermination(address(pair), id, 9_500 * BAZAAR_SCALE);
 
-        // Voting closes after 7 days; execution succeeds inside the 7-day window with a fresh price.
-        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
-        bytes[] memory pu = _freshPrice();
-        terminator.executeInsurerTermination(address(pair), pu);
+        // The threshold schedules the pair at the cutoff at once; a bare vote settles at the median
+        // of five prints chained from the cutoff.
+        terminator.executeInsurerTermination(address(pair), id);
+        (,,,, uint256 cutoffTs,,,,,,,,,,,) = terminator.insurerProposals(id);
+        assertEq(pair.scheduledTerminationTs(), cutoffTs, "scheduled at the proposal's cutoff");
+        bytes[] memory pu = PythChain.flat(mockPyth, BTC_USD_FEED_ID, 50_000, uint64(cutoffTs), uint64(cutoffTs) - 1);
+        vm.warp(PythChain.lastPublish(uint64(cutoffTs)) + 10);
+        terminator.terminateScheduledPair{value: oracle.getSampleSetFee(BTC_USD_FEED_ID, pu)}(address(pair), pu);
         pair.finalizeTermination();
 
         assertTrue(pair.isPairTerminated(), "pair terminated by insurer consensus");
-        (,,,, uint256 yesShares, uint256 snapshot, bool resolved, bool executed) =
-            terminator.insurerProposals(address(pair));
+        (,,,,,, uint256 yesShares, uint256 snapshot,,, bool resolved, bool scheduled,,,,) =
+            terminator.insurerProposals(id);
         assertEq(yesShares, 9_500 * BAZAAR_SCALE, "votes tallied");
         assertEq(snapshot, totalAtProposal, "snapshot froze total shares at proposal");
-        assertTrue(resolved && executed, "proposal resolved and executed");
+        assertTrue(resolved && scheduled, "proposal resolved by scheduling");
         assertEq(usdc.balanceOf(carol), carolAfterPropose + bond, "successful consensus refunds the bond");
     }
 
@@ -291,9 +296,9 @@ contract GovernanceIntegrationTest is IntegrationBase {
 
         // Nothing is left open (dave was liquidated), so finalize runs at once.
         pair.finalizeTermination();
-        uint256 ratioBp = pair.auxState().terminalPrincipalRatioBp;
-        assertGt(ratioBp, 0, "principal ratio set");
-        assertLt(ratioBp, 10_000, "ratio reflects the missing USDC");
+        uint256 ratio = pair.auxState().terminalPrincipalRatio;
+        assertGt(ratio, 0, "principal ratio set");
+        assertLt(ratio, BAZAAR_SCALE, "ratio reflects the missing USDC");
     }
 
     // ============================ composite pairs ============================
@@ -332,9 +337,8 @@ contract GovernanceIntegrationTest is IntegrationBase {
         // The termination claim for a composite spells out the either-leg-decommission grounds.
         _bondProposer(alice);
         vm.prank(alice);
-        bytes32 termAid = terminator.proposeTermination(
-            address(cpair), "Toyota on TSE", vm.getBlockTimestamp() + 7 days, "Delisting announced."
-        );
+        bytes32 termAid =
+            terminator.proposeTermination(address(cpair), 2, vm.getBlockTimestamp() + 7 days, "Delisting announced.");
         bytes memory claim = mockOO.claims(termAid);
         assertTrue(_contains(claim, "decommissioning of EITHER leg"), "claim covers either-leg decommission");
     }

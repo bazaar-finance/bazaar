@@ -12,7 +12,8 @@ import {CollateralLib} from "../../src/libraries/CollateralLib.sol";
 ///         (any consensual cross prints at the maker's price — the margin gates and FundingLib's
 ///         index clamp carry the defense); Limit placement is refused outside
 ///         ±MAX_PLACEMENT_DEVIATION_BP of the mark; and both the creation margin gate and the
-///         withdrawal order-exposure gate reserve fresh exposure at no less than the mark.
+///         withdrawal order-exposure gate reserve fresh exposure at no less than the mark, with
+///         the maker fee on top.
 contract FreshArrivalGuardsTest is IntegrationBase {
     uint256 constant SHARE = 1e18;
     uint256 constant PX = 200; // AAPL mark in whole USD; placement band $100..$300
@@ -27,7 +28,7 @@ contract FreshArrivalGuardsTest is IntegrationBase {
     /// @dev Push a fresh price so every subsequent same-timestamp call rides the oracle cache
     ///      (no per-call update needed, and the margin curve stays put between calls).
     function _refreshAt(uint256 priceUsd) internal {
-        vm.warp(vm.getBlockTimestamp() + 3);
+        vm.warp(vm.getBlockTimestamp() + 4);
         bytes[] memory pu = _priceUpdateFor(AAPL_USD_FEED_ID, priceUsd, uint64(vm.getBlockTimestamp()));
         aaplPair.refreshPrice{value: 0}(pu);
     }
@@ -79,7 +80,7 @@ contract FreshArrivalGuardsTest is IntegrationBase {
 
         assertEq(_aaplFilled(bid), 1 * SHARE, "fresh cross fills regardless of distance from mark");
         assertEq(_aaplFilled(ask), 1 * SHARE);
-        (, uint256 sz, uint256 entry,,,,,,) = aaplPair.positionBuckets(alice);
+        (, uint256 sz, uint256 entry,,,,) = aaplPair.positionBuckets(alice);
         assertEq(sz, 1 * SHARE);
         assertEq(entry, 212 * BAZAAR_SCALE, "at the maker's price");
     }
@@ -93,7 +94,7 @@ contract FreshArrivalGuardsTest is IntegrationBase {
 
         assertEq(_aaplFilled(cheapAsk), 1 * SHARE, "best-priced maker fills, wherever it sits vs the mark");
         assertEq(_aaplFilled(deeperAsk), 0, "worse-priced maker untouched");
-        (, uint256 sz, uint256 entry,,,,,,) = aaplPair.positionBuckets(alice);
+        (, uint256 sz, uint256 entry,,,,) = aaplPair.positionBuckets(alice);
         assertEq(sz, 1 * SHARE);
         assertEq(entry, 188 * BAZAAR_SCALE);
         assertEq(_aaplFilled(bid), 1 * SHARE);
@@ -155,10 +156,12 @@ contract FreshArrivalGuardsTest is IntegrationBase {
     // -------------------- reservation at the mark --------------------
 
     function test_creation_bidBelowMark_reservesAtMark() public {
-        (uint256 imrBp,,,,) = aaplPair.marginRequirements();
-        // 10 shares bid at $120 under a $200 mark: reserved at the mark, not the limit.
-        uint256 needAtMark = Math_mulDiv(10 * 200 * BAZAAR_SCALE, imrBp, 10_000);
-        uint256 needAtLimit = Math_mulDiv(10 * 120 * BAZAAR_SCALE, imrBp, 10_000);
+        (uint256 imrBp,,,) = aaplPair.marginRequirements();
+        // 10 shares bid at $120 under a $200 mark: reserved at the mark, not the limit, plus the
+        // maker fee on the limit notional (a bid under the mark books no loss when it fills).
+        uint256 fee = 10 * 120 * BAZAAR_SCALE * BazaarTypes.MAKER_INSURANCE_FEE_EBP / BazaarTypes.EBP_SCALE;
+        uint256 needAtMark = Math_mulDiv(10 * 200 * BAZAAR_SCALE, imrBp, 10_000) + fee;
+        uint256 needAtLimit = Math_mulDiv(10 * 120 * BAZAAR_SCALE, imrBp, 10_000) + fee;
 
         address dave = makeAddr("dave");
         usdc.mint(dave, INITIAL_USER_BALANCE);
@@ -186,13 +189,15 @@ contract FreshArrivalGuardsTest is IntegrationBase {
     }
 
     function test_withdraw_ordersReservedAtMark() public {
-        (uint256 imrBp,,,,) = aaplPair.marginRequirements();
+        (uint256 imrBp,,,) = aaplPair.marginRequirements();
         address erin = makeAddr("erin");
         usdc.mint(erin, INITIAL_USER_BALANCE);
         _aaplDeposit(erin, 10_000 * BAZAAR_SCALE);
         _place(erin, true, 1 * SHARE, 120 * BAZAAR_SCALE, false); // resting bid below the mark
 
-        uint256 orderImrReq = Math_mulDiv(200 * BAZAAR_SCALE, imrBp, 10_000); // at the mark
+        // Initial margin at the mark plus the maker fee on the limit notional.
+        uint256 orderImrReq = Math_mulDiv(200 * BAZAAR_SCALE, imrBp, 10_000)
+            + 120 * BAZAAR_SCALE * BazaarTypes.MAKER_INSURANCE_FEE_EBP / BazaarTypes.EBP_SCALE;
         uint256 maxOut = 10_000 * BAZAAR_SCALE - orderImrReq;
 
         vm.prank(erin);

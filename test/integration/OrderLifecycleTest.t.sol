@@ -43,7 +43,7 @@ contract OrderLifecycleTest is IntegrationBase {
     function _placeShortLived(address user, bool isLong, uint256 size, uint256 price) internal returns (uint256) {
         bytes[] memory pu = _freshPrice();
         BazaarTypes.OrderSpec memory s = _limitSpec(isLong, size, price);
-        s.expirationBlock = uint64(vm.getBlockNumber() + 12); // MIN_ORDER_LIFETIME_BLOCKS
+        s.expirationBlock = uint64(vm.getBlockNumber()) + BazaarTypes.MIN_ORDER_LIFETIME_BLOCKS;
         vm.prank(user);
         pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
         return _lastCreatedOrderId(pair);
@@ -56,7 +56,7 @@ contract OrderLifecycleTest is IntegrationBase {
         (uint64 bidsBefore,) = _bookCounts();
         assertEq(bidsBefore, 1);
 
-        _roll(20); // past expiry
+        _roll(BazaarTypes.MIN_ORDER_LIFETIME_BLOCKS + 1); // past expiry
 
         // Anyone may sweep — dave has no relationship to the order.
         vm.prank(dave);
@@ -66,7 +66,7 @@ contract OrderLifecycleTest is IntegrationBase {
         assertFalse(_inBook(id), "unlinked from the book");
         (uint64 bidsAfter,) = _bookCounts();
         assertEq(bidsAfter, 0, "side count decremented");
-        (, uint256 count,,) = pair.getUserActiveLimitOrders(alice);
+        (, uint256 count,,) = lens.getUserActiveLimitOrders(address(pair), alice);
         assertEq(count, 0, "removed from the owner's active set");
     }
 
@@ -74,7 +74,7 @@ contract OrderLifecycleTest is IntegrationBase {
         _deposit(alice, 60_000 * BAZAAR_SCALE);
         _deposit(bob, 60_000 * BAZAAR_SCALE);
         uint256 stale = _placeShortLived(alice, true, BTC / 10, 49_000 * BAZAAR_SCALE);
-        _roll(20);
+        _roll(BazaarTypes.MIN_ORDER_LIFETIME_BLOCKS + 1);
         vm.prank(dave);
         pair.sweepExpired(_ids(stale));
 
@@ -111,7 +111,7 @@ contract OrderLifecycleTest is IntegrationBase {
     function test_sweepExpired_isGatedWhenHalted() public {
         _deposit(alice, 60_000 * BAZAAR_SCALE);
         uint256 id = _placeShortLived(alice, true, BTC / 10, 49_000 * BAZAAR_SCALE);
-        _roll(20);
+        _roll(BazaarTypes.MIN_ORDER_LIFETIME_BLOCKS + 1);
         _setTerminated();
 
         vm.prank(dave);
@@ -124,7 +124,7 @@ contract OrderLifecycleTest is IntegrationBase {
     function test_lazySweep_onCreate_unlinksExpiredFromBook() public {
         _deposit(alice, 60_000 * BAZAAR_SCALE);
         uint256 stale = _placeShortLived(alice, true, BTC / 10, 49_000 * BAZAAR_SCALE);
-        _roll(20);
+        _roll(BazaarTypes.MIN_ORDER_LIFETIME_BLOCKS + 1);
 
         _placeLimit(alice, true, BTC / 10, 48_000 * BAZAAR_SCALE); // triggers the sweep
 
@@ -198,7 +198,7 @@ contract OrderLifecycleTest is IntegrationBase {
 
         uint256 first = _placeMarket(alice, true, BTC / 100, 300);
         BazaarTypes.Order memory fo = OrderView.order(pair, first);
-        (uint64 creation, uint64 expiry) = (fo.creationBlock, fo.expiryBlock);
+        (uint64 creation, uint64 expiry) = (uint64(vm.getBlockNumber()), fo.expiryBlock);
         assertEq(expiry, creation, "market orders expire in their creation block");
         assertGt(_canceledBlock(first), 0, "unfilled market order is terminal immediately");
 
@@ -207,6 +207,80 @@ contract OrderLifecycleTest is IntegrationBase {
         uint256 second = _placeMarket(alice, true, BTC / 100, 300);
         assertGt(second, first, "second market order created");
         assertGt(_canceledBlock(second), 0, "and is likewise terminal");
+    }
+
+    // ============================================================
+    // IOC-limit terminality
+    // ============================================================
+
+    /// @dev Fill `user`'s active-order set to MAX_ACTIVE_LIMIT_ORDERS_PER_USER with small bids
+    ///      resting well below the mark, each a dollar above the last so that every one sorts
+    ///      first and inserts at the head without hints.
+    function _fillActiveCap(address user) internal {
+        uint256 cap = BazaarTypes.MAX_ACTIVE_LIMIT_ORDERS_PER_USER;
+        for (uint256 i; i < cap; ++i) {
+            _placeLimit(user, true, BTC / 1000, (40_000 + i) * BAZAAR_SCALE);
+        }
+        (, uint256 count,,) = lens.getUserActiveLimitOrders(address(pair), user);
+        assertEq(count, cap, "the active set is at the cap");
+    }
+
+    /// @notice An IOC limit never rests, so it takes no slot in its owner's active set: an owner
+    ///         whose resting orders fill the cap, and who could not add another GTC limit, can
+    ///         still send one. It fills what crosses, cancels the rest within its own transaction
+    ///         and leaves the set as it found it.
+    function test_iocLimit_atActiveCap_acceptedAndNeverJoinsSet() public {
+        _deposit(alice, 60_000 * BAZAAR_SCALE);
+        _deposit(bob, 60_000 * BAZAAR_SCALE);
+        _fillActiveCap(alice);
+        uint256 ask = _placeLimit(bob, false, BTC / 10, 50_200 * BAZAAR_SCALE);
+
+        // The cap binds: the order sent GTC is refused.
+        BazaarTypes.OrderSpec memory s = _limitSpec(true, BTC / 5, 50_500 * BAZAAR_SCALE);
+        bytes[] memory pu = _freshPrice();
+        vm.prank(alice);
+        vm.expectRevert(OrderManagementLib.OrderManagementLib__TooManyActiveLimitOrders.selector);
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
+
+        s.tif = BazaarTypes.TimeInForce.IOC;
+        pu = _freshPrice();
+        vm.prank(alice);
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
+        uint256 ioc = _lastCreatedOrderId(pair);
+
+        assertEq(_filledSize(ioc), BTC / 10, "the IOC filled the crossing ask");
+        assertEq(_filledSize(ask), BTC / 10, "which it consumed");
+        assertGt(_canceledBlock(ioc), 0, "the remainder is canceled in the same transaction");
+        assertFalse(_inBook(ioc), "and never rests");
+
+        (uint256[] memory ids, uint256 count,,) = lens.getUserActiveLimitOrders(address(pair), alice);
+        assertEq(count, BazaarTypes.MAX_ACTIVE_LIMIT_ORDERS_PER_USER, "the set holds exactly the resting bids");
+        for (uint256 i; i < ids.length; ++i) {
+            assertTrue(ids[i] != ioc, "the IOC is not in the set");
+        }
+    }
+
+    /// @notice An IOC limit is terminal within its own transaction, so it ignores the expiry
+    ///         field: a zero expiration block is accepted, and the order's expiry is stamped at
+    ///         its creation block, as a market order's is.
+    function test_iocLimit_ignoresExpirationBlock_stampedAtCreation() public {
+        _deposit(alice, 60_000 * BAZAAR_SCALE);
+        _deposit(bob, 60_000 * BAZAAR_SCALE);
+        _placeLimit(bob, false, BTC / 10, 50_200 * BAZAAR_SCALE);
+
+        BazaarTypes.OrderSpec memory s = _limitSpec(true, BTC / 10, 50_500 * BAZAAR_SCALE);
+        s.tif = BazaarTypes.TimeInForce.IOC;
+        s.expirationBlock = 0;
+        bytes[] memory pu = _freshPrice();
+        vm.prank(alice);
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
+        uint256 ioc = _lastCreatedOrderId(pair);
+
+        BazaarTypes.Order memory o = OrderView.order(pair, ioc);
+        assertEq(uint256(o.expiryBlock), vm.getBlockNumber(), "expiry stamped at the creation block");
+        assertEq(o.filledSize, o.size, "filled in full against the resting ask");
+        (, uint256 count,,) = lens.getUserActiveLimitOrders(address(pair), alice);
+        assertEq(count, 0, "an IOC limit never registers as an active limit order");
     }
 
     // ============================================================

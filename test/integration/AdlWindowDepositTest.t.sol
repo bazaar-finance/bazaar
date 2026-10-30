@@ -11,8 +11,8 @@ contract AdlWindowDepositTest is IntegrationBase {
     // adlDepositEpoch / adlWindowDeposits are internal mappings (no getter); slots from
     // `forge inspect BazaarPair storage-layout`. The guard assertions below fail loudly if the
     // layout ever shifts, so hardcoding the slot can't silently read the wrong word.
-    uint256 constant SLOT_ADL_DEPOSIT_EPOCH = 121;
-    uint256 constant SLOT_ADL_WINDOW_DEPOSITS = 122;
+    uint256 constant SLOT_ADL_DEPOSIT_EPOCH = 95;
+    uint256 constant SLOT_ADL_WINDOW_DEPOSITS = 96;
 
     function _adlDepositEpoch(address u) internal view returns (uint256) {
         return uint256(vm.load(address(pair), keccak256(abi.encode(u, SLOT_ADL_DEPOSIT_EPOCH))));
@@ -46,7 +46,7 @@ contract AdlWindowDepositTest is IntegrationBase {
     ///         same window takes the accumulate arm: window deposits ADD.
     function test_deposit_duringAdlWindow_tagsAndAccumulates() public {
         _triggerAdl();
-        uint64 epoch = pair.adlEpoch();
+        uint64 epoch = lens.adlEpoch(address(pair));
         assertEq(epoch, 1, "first ADL window is epoch 1");
 
         // carol has no position and no prior tag (adlDepositEpoch defaults to 0 != epoch) → reset arm.

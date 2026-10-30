@@ -30,7 +30,7 @@ contract TerminatorDisputeUpheldTest is IntegrationBase {
         _bondProposer(alice);
         uint256 lastTradingTs = vm.getBlockTimestamp() + 7 days;
         vm.prank(alice);
-        bytes32 aid = terminator.proposeTermination(address(pair), "BTC/USD", lastTradingTs, "Legit delisting.");
+        bytes32 aid = terminator.proposeTermination(address(pair), 2, lastTradingTs, "Legit delisting.");
         uint256 aliceAfterPropose = usdc.balanceOf(alice); // bond now escrowed in the OO
 
         // Bob disputes with a matching bond; the DVM upholds the PROPOSER (resolves true).

@@ -153,7 +153,7 @@ contract FillOrKillTest is IntegrationBase {
         assertEq(_canceledBlock(taker), 0, "a completed fill-or-kill order is filled, not canceled");
         assertGt(OrderView.order(pair, taker).filledBlock, 0, "stamped terminal by the completing fill");
 
-        (, uint256 sz,,,,,,,) = pair.positionBuckets(alice);
+        (, uint256 sz,,,,,) = pair.positionBuckets(alice);
         assertEq(sz, BTC / 5, "position opened for the full size");
         _assertBooks("after a complete fill-or-kill");
     }
@@ -291,7 +291,7 @@ contract FillOrKillTest is IntegrationBase {
         _fund(bob);
         _placeLimit(bob, false, BTC / 10, 50_200 * BAZAAR_SCALE);
 
-        (, uint256 countBefore,,) = pair.getUserActiveLimitOrders(alice);
+        (, uint256 countBefore,,) = lens.getUserActiveLimitOrders(address(pair), alice);
         assertEq(countBefore, 0, "alice starts with no active limit orders");
 
         uint256 taker = _submit(alice, _fokLimitSpec(true, BTC / 10, 50_500 * BAZAAR_SCALE));
@@ -300,11 +300,54 @@ contract FillOrKillTest is IntegrationBase {
         assertEq(uint256(o.expiryBlock), vm.getBlockNumber(), "stamped expired at the creation block");
         assertEq(o.filledSize, o.size, "and completely filled");
 
-        (, uint256 countAfter,,) = pair.getUserActiveLimitOrders(alice);
+        (, uint256 countAfter,,) = lens.getUserActiveLimitOrders(address(pair), alice);
         assertEq(countAfter, 0, "a fill-or-kill limit never registers as an active limit order");
 
-        (uint256 longExp,, uint256 longSz,) = pair.outstandingOrderExposure(alice);
+        (uint256 longExp,, uint256 longSz,) = lens.outstandingOrderExposure(address(pair), alice);
         assertEq(longExp, 0, "and contributes no outstanding order exposure");
         assertEq(longSz, 0);
+    }
+
+    /// @dev Fill `user`'s active-order set to MAX_ACTIVE_LIMIT_ORDERS_PER_USER with small bids
+    ///      resting well below the mark, each a dollar above the last so that every one sorts
+    ///      first and inserts at the head without hints.
+    function _fillActiveCap(address user) internal {
+        uint256 cap = BazaarTypes.MAX_ACTIVE_LIMIT_ORDERS_PER_USER;
+        for (uint256 i; i < cap; ++i) {
+            _placeLimit(user, true, BTC / 1000, (40_000 + i) * BAZAAR_SCALE);
+        }
+        (, uint256 count,,) = lens.getUserActiveLimitOrders(address(pair), user);
+        assertEq(count, cap, "the active set is at the cap");
+    }
+
+    /// @notice A fill-or-kill limit takes no slot in its owner's active set: an owner whose
+    ///         resting orders fill the cap, and who could not add another GTC limit, can still
+    ///         send one, with no expiry, and it completes without touching the set.
+    function test_fok_limit_atActiveCap_acceptedWithoutExpiry() public {
+        _fund(alice);
+        _fund(bob);
+        _fillActiveCap(alice);
+        _placeLimit(bob, false, BTC / 10, 50_200 * BAZAAR_SCALE);
+
+        // The cap binds: the order sent GTC is refused.
+        BazaarTypes.OrderSpec memory s = _limitSpec(true, BTC / 10, 50_500 * BAZAAR_SCALE);
+        bytes[] memory pu = _freshPrice();
+        vm.prank(alice);
+        vm.expectRevert(OrderManagementLib.OrderManagementLib__TooManyActiveLimitOrders.selector);
+        pair.createOrder(s, _hintsNone(), pu, 0, 0, 0, "", "");
+
+        s.tif = BazaarTypes.TimeInForce.FOK;
+        s.expirationBlock = 0;
+        uint256 taker = _submit(alice, s);
+
+        BazaarTypes.Order memory o = OrderView.order(pair, taker);
+        assertEq(o.filledSize, o.size, "completely filled");
+        assertEq(uint256(o.expiryBlock), vm.getBlockNumber(), "expiry stamped at the creation block");
+
+        (uint256[] memory ids, uint256 count,,) = lens.getUserActiveLimitOrders(address(pair), alice);
+        assertEq(count, BazaarTypes.MAX_ACTIVE_LIMIT_ORDERS_PER_USER, "the set holds exactly the resting bids");
+        for (uint256 i; i < ids.length; ++i) {
+            assertTrue(ids[i] != taker, "the fill-or-kill limit is not in the set");
+        }
     }
 }

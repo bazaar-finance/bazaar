@@ -10,7 +10,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @title MockOptimisticOracleV3
 /// @notice Realistic mock of UMA's Optimistic Oracle V3 that mirrors the real sandbox behavior.
-///         Supports bond pulling, liveness enforcement, disputes with callbacks, and proper settlement.
+///         Supports bond pulling, liveness enforcement, disputes with callbacks, proper settlement,
+///         and the reentrancy lock OOv3 holds across its callbacks.
 contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
     bytes32 public constant DEFAULT_IDENTIFIER = "ASSERT_TRUTH";
     IERC20Minimal public immutable currency;
@@ -18,7 +19,7 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
 
     uint256 private _nextAssertionNonce;
 
-    struct Assertion {
+    struct AssertionRecord {
         address asserter;
         address callbackRecipient;
         address escalationManager;
@@ -33,7 +34,20 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
         bool settlementResolution;
     }
 
-    mapping(bytes32 => Assertion) public assertions;
+    mapping(bytes32 => AssertionRecord) public assertions;
+
+    // ---- Reentrancy lock ----
+    // OOv3 guards assertTruth, disputeAssertion and settleAssertion with one lock and fires its
+    // callbacks while holding it, so a callback recipient that calls back into any of the three
+    // reverts. The revert string is the one OOv3's Lockable uses.
+    bool private _entered;
+
+    modifier nonReentrant() {
+        require(!_entered, "ReentrancyGuard: reentrant call");
+        _entered = true;
+        _;
+        _entered = false;
+    }
 
     // ---- Mock DVM resolution (for disputed assertions) ----
     mapping(bytes32 => bool) private _dvmResolutionSet;
@@ -56,6 +70,7 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
     error Assertion__AlreadySettled();
     error Assertion__NotExpired();
     error Assertion__AlreadyDisputed();
+    error Assertion__Expired();
     error Assertion__DoesNotExist();
     error Assertion__DisputedNotResolved();
 
@@ -126,7 +141,7 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
         uint256 bond,
         bytes32 identifier,
         bytes32 /* domainId */
-    ) external override returns (bytes32 assertionId) {
+    ) external override nonReentrant returns (bytes32 assertionId) {
         // Mirrors OOv3's own gate, so a caller that posts a bond below UMA's minimum fails here the
         // way it would on mainnet.
         require(bond >= _minimumBond, "Bond amount too low");
@@ -137,7 +152,7 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
         assertionId = keccak256(abi.encodePacked(_nextAssertionNonce++, block.timestamp, asserter));
         claims[assertionId] = claim;
 
-        assertions[assertionId] = Assertion({
+        assertions[assertionId] = AssertionRecord({
             asserter: asserter,
             callbackRecipient: callbackRecipient,
             escalationManager: escalationManager,
@@ -165,11 +180,12 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
     )
         external
         override
+        nonReentrant
         returns (bytes32 assertionId)
     {
         assertionId = keccak256(abi.encodePacked(_nextAssertionNonce++, block.timestamp, asserter));
 
-        assertions[assertionId] = Assertion({
+        assertions[assertionId] = AssertionRecord({
             asserter: asserter,
             callbackRecipient: callbackRecipient,
             escalationManager: address(0),
@@ -196,11 +212,15 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
     }
 
     /// @notice Dispute an assertion. Disputer must post matching bond. Calls assertionDisputedCallback.
-    function disputeAssertion(bytes32 assertionId, address disputer) external {
-        Assertion storage a = assertions[assertionId];
+    ///         Refused from expirationTime on, as on OOv3: an assertion that reaches its expiration
+    ///         undisputed can only resolve truthful.
+    function disputeAssertion(bytes32 assertionId, address disputer) external nonReentrant {
+        require(disputer != address(0), "Disputer can't be 0");
+        AssertionRecord storage a = assertions[assertionId];
         if (a.asserter == address(0)) revert Assertion__DoesNotExist();
         if (a.settled) revert Assertion__AlreadySettled();
         if (a.disputed) revert Assertion__AlreadyDisputed();
+        if (block.timestamp >= a.expirationTime) revert Assertion__Expired();
 
         // Pull matching bond from disputer
         if (a.bond > 0) {
@@ -222,9 +242,16 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
     ///         - Undisputed + past liveness → resolves true, bond returned to asserter
     ///         - Disputed + DVM resolved → bond goes to winner
     function settleAndGetAssertionResult(bytes32 assertionId) external override returns (bool) {
-        Assertion storage a = assertions[assertionId];
+        AssertionRecord storage a = assertions[assertionId];
         if (a.asserter == address(0)) revert Assertion__DoesNotExist();
-        if (a.settled) return a.settlementResolution;
+        // As on OOv3, only the settlement itself takes the lock: reading back the result of an
+        // assertion that is already settled works from inside a callback.
+        if (!a.settled) _settle(assertionId);
+        return a.settlementResolution;
+    }
+
+    function _settle(bytes32 assertionId) private nonReentrant {
+        AssertionRecord storage a = assertions[assertionId];
 
         bool result;
 
@@ -257,35 +284,23 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
         if (a.callbackRecipient != address(0)) {
             IOptimisticOracleV3CallbackRecipient(a.callbackRecipient).assertionResolvedCallback(assertionId, result);
         }
-
-        return result;
     }
 
-    function getAssertion(bytes32 assertionId)
-        external
-        view
-        returns (
-            address asserter,
-            uint64 assertionTime,
-            uint64 expirationTime,
-            IERC20Minimal _currency,
-            uint256 bond,
-            bool settled,
-            bool disputed,
-            bool settlementResolution
-        )
-    {
-        Assertion storage a = assertions[assertionId];
-        return (
-            a.asserter,
-            a.assertionTime,
-            a.expirationTime,
-            a.bondCurrency,
-            a.bond,
-            a.settled,
-            a.disputed,
-            a.settlementResolution
-        );
+    /// @notice The assertion's record in OOv3's own struct layout; all-zero for an unknown id. Takes
+    ///         no lock, as on OOv3.
+    function getAssertion(bytes32 assertionId) external view override returns (Assertion memory out) {
+        AssertionRecord storage a = assertions[assertionId];
+        out.escalationManagerSettings.escalationManager = a.escalationManager;
+        out.asserter = a.asserter;
+        out.assertionTime = a.assertionTime;
+        out.settled = a.settled;
+        out.currency = a.bondCurrency;
+        out.expirationTime = a.expirationTime;
+        out.settlementResolution = a.settlementResolution;
+        out.identifier = a.identifier;
+        out.bond = a.bond;
+        out.callbackRecipient = a.callbackRecipient;
+        out.disputer = a.disputer;
     }
 
     // ==================== Test Helpers ====================
@@ -295,7 +310,7 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
 
     /// @notice Resolve a disputed assertion via the mock DVM (simulates UMA voter resolution).
     function mockDvmResolve(bytes32 assertionId, bool result) external {
-        Assertion storage a = assertions[assertionId];
+        AssertionRecord storage a = assertions[assertionId];
         require(a.disputed, "Not disputed");
         require(!a.settled, "Already settled");
         _dvmResolutionSet[assertionId] = true;
@@ -305,7 +320,7 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
     /// @notice Force-settle an assertion immediately, bypassing liveness and dispute checks.
     ///         For quick testing when you don't want to deal with time.
     function mockForceSettle(bytes32 assertionId, bool result) external {
-        Assertion storage a = assertions[assertionId];
+        AssertionRecord storage a = assertions[assertionId];
         require(a.asserter != address(0), "Assertion does not exist");
         require(!a.settled, "Already settled");
 

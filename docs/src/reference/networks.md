@@ -16,6 +16,8 @@ This page is the **canonical registry of official Bazaar deployments**. If an ad
 
 Individual markets are discoverable on-chain from the factory (`getAllPairs()` / `getPairAddress(pairId)`) — the factory is the root of trust for what counts as a real Bazaar pair.
 
+The twelve external libraries these contracts link — eleven by the `BazaarPair` implementation, `ClaimTextLib` by the factory and the terminator — are recorded in `deployments/42161/libraries.args` by deploy step 1 (see [Self-Deployment](../guide/deployment.md)); the record is regenerated whenever the library set changes.
+
 External dependencies on Arbitrum One:
 
 | Contract | Address |
@@ -36,16 +38,18 @@ External dependencies on Arbitrum One:
 | `BazaarPairLens` | *TBD* |
 | `BazaarPair` implementation | *TBD* |
 
+The twelve external libraries are recorded in `deployments/421614/libraries.args` by deploy step 1, regenerated whenever the library set changes.
+
 External dependencies on Arbitrum Sepolia:
 
 | Contract | Address |
 |---|---|
 | Pyth | `0x0B73614636C855Bf23F342F307FB981A3e47f42B` |
 | USDC (testnet) | `0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d` |
-| UMA OOv3 | **mock** (deployed with 2 h liveness) — UMA has no official Arbitrum Sepolia deployment |
+| UMA OOv3 | **mock**, deployed by the script (Bazaar's assertions set their own liveness periods) — UMA has no official Arbitrum Sepolia deployment |
 
 ## Anvil (31337)
 
-`make deploy-anvil` deploys `MockPyth`, `MockUSDC` (mints 10,000 to your wallet), and `MockOptimisticOracleV3` (2 h liveness). Bazaar protocol addresses are written to `.anvil-addresses`.
+`make deploy-anvil` deploys `MockPyth`, `MockUSDC` (mints 10,000 to your wallet), and `MockOptimisticOracleV3` (Bazaar's assertions set their own liveness periods), and etches `MockArbSys` at the `ArbSys` precompile address (`0x64`). Forge deploys the twelve libraries itself in the same run, so no `libraries.args` record is kept for anvil. The Bazaar protocol addresses, with the `MockUSDC` and `MockOptimisticOracleV3` addresses, are written to `.anvil-addresses`, which the other anvil make targets read.
 
 External-dependency configuration for every network lives in `script/HelperConfig.s.sol`.

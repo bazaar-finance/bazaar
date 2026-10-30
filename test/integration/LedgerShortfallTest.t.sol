@@ -64,7 +64,7 @@ contract LedgerShortfallTest is IntegrationBase {
         _openPosition(alice, bob, true, 1 * BAZAAR_SCALE);
         _writeDeposited(0);
 
-        vm.warp(vm.getBlockTimestamp() + 3);
+        vm.warp(vm.getBlockTimestamp() + 4);
         bytes[] memory pu = _priceUpdate(50_000, uint64(vm.getBlockTimestamp()));
 
         uint256 amount = 1 * BAZAAR_SCALE;

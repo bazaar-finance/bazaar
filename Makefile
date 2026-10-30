@@ -14,9 +14,11 @@ help:
 	@echo "  make deploy-libs-arb-mainnet  - Step 1/2: deploy libraries to Arbitrum Mainnet"
 	@echo "  make deploy-arb-mainnet       - Step 2/2: deploy Bazaar to Arbitrum Mainnet"
 	@echo "  make set-price-anvil          - Set mock price (FEED_ID=0x... PRICE=2000)"
+	@echo "  make deposit-anvil            - Deposit collateral into a pair (PAIR=0x... AMOUNT=1000)"
 	@echo "  make create-order-anvil       - Create limit order (PAIR=0x... LIMIT_PRICE=2000 SIZE=0.01 IS_LONG=true)"
 	@echo "  make warp-anvil SECONDS=N     - Warp Anvil forward N seconds"
 	@echo "  make build                    - Build the project"
+	@echo "  make abis                     - Build, then export indexer/frontend ABIs to abi/"
 	@echo "  make test                     - Run tests"
 	@echo "  make balance-usdc             - Check USDC balance (ADDR=0x... optional)"
 	@echo "  make clean                    - Clean build artifacts"
@@ -26,6 +28,12 @@ help:
 .PHONY: build
 build:
 	forge build
+
+# ABIs for indexers and frontends. The exported BazaarPair.json adds the events and errors of the
+# libraries the pair links, which its compiled ABI omits (see script/export-abis.sh).
+.PHONY: abis
+abis: build
+	bash script/export-abis.sh
 
 # Test
 .PHONY: test
@@ -65,7 +73,7 @@ deploy-anvil:
 	ORACLE_ADDR=$$(grep "BazaarOracle:" /tmp/bazaar-deploy.log | head -1 | awk '{print $$NF}') && \
 	PAIR_IMPL_ADDR=$$(grep "BazaarPair implementation:" /tmp/bazaar-deploy.log | head -1 | awk '{print $$NF}') && \
 	LENS_ADDR=$$(grep "BazaarPairLens:" /tmp/bazaar-deploy.log | head -1 | awk '{print $$NF}') && \
-	TERMINATOR_ADDR=$$(grep "BazaarTerminatePair:" /tmp/bazaar-deploy.log | head -1 | awk '{print $$NF}') && \
+	TERMINATOR_ADDR=$$(grep "BazaarPairTerminator:" /tmp/bazaar-deploy.log | head -1 | awk '{print $$NF}') && \
 	USDC_ADDR=$$(grep "USDC:" /tmp/bazaar-deploy.log | head -1 | awk '{print $$NF}') && \
 	OOV3_ADDR=$$(grep "OptimisticOracleV3:" /tmp/bazaar-deploy.log | head -1 | awk '{print $$NF}') && \
 	echo "" && \
@@ -89,7 +97,7 @@ deploy-anvil:
 	echo "  BazaarOracle:          $$ORACLE_ADDR" && \
 	echo "  BazaarPair (impl):     $$PAIR_IMPL_ADDR" && \
 	echo "  BazaarPairLens:        $$LENS_ADDR" && \
-	echo "  BazaarTerminatePair:   $$TERMINATOR_ADDR" && \
+	echo "  BazaarPairTerminator:  $$TERMINATOR_ADDR" && \
 	printf "OOV3=%s\nUSDC=%s\nFACTORY=%s\nORACLE=%s\nPAIR_IMPL=%s\nLENS=%s\nTERMINATOR=%s\n" \
 		$$OOV3_ADDR $$USDC_ADDR $$FACTORY_ADDR $$ORACLE_ADDR $$PAIR_IMPL_ADDR $$LENS_ADDR $$TERMINATOR_ADDR \
 		> .anvil-addresses
@@ -113,14 +121,16 @@ balance-usdc:
 
 # Set mock Pyth price on Anvil
 # Usage: make set-price-anvil FEED_ID=0x... PRICE=2000 (USD price as integer)
-# Sets both the base feed and USDC/USD feed (at $1.00)
+# Sets both the base feed and USDC/USD feed (at $1.00). Anvil mines a block only when a transaction
+# arrives, so the latest block's timestamp can be long past; the update is stamped one second after
+# it and the block carrying it is pinned to that second, so the price is fresh when it lands.
 USDC_FEED_ID=0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a
 .PHONY: set-price-anvil
 set-price-anvil:
 	@if [ -z "$(FEED_ID)" ] || [ -z "$(PRICE)" ]; then echo "Usage: make set-price-anvil FEED_ID=0x... PRICE=2000"; exit 1; fi
 	@. ./.anvil-addresses && \
 	PYTH=$$(cast call $$ORACLE "pyth()(address)" --rpc-url $(ANVIL_RPC_URL)) && \
-	TIMESTAMP=$$(cast block latest --rpc-url $(ANVIL_RPC_URL) --json | jq -r '.timestamp' | xargs printf "%d") && \
+	TIMESTAMP=$$(( $$(cast block latest --rpc-url $(ANVIL_RPC_URL) --json | jq -r '.timestamp' | xargs printf "%d") + 1 )) && \
 	echo "=== Setting base price: $(PRICE) USD ===" && \
 	BASE_UPDATE=$$(cast call $$PYTH \
 		"createPriceFeedUpdateData(bytes32,int64,uint64,int32,int64,uint64,uint64,uint64)(bytes)" \
@@ -132,6 +142,7 @@ set-price-anvil:
 		$(USDC_FEED_ID) 100000000 0 -8 100000000 0 $$TIMESTAMP $$((TIMESTAMP - 1)) \
 		--rpc-url $(ANVIL_RPC_URL)) && \
 	echo "=== Updating MockPyth ===" && \
+	cast rpc evm_setNextBlockTimestamp $$TIMESTAMP --rpc-url $(ANVIL_RPC_URL) > /dev/null && \
 	cast send $$PYTH \
 		"updatePriceFeeds(bytes[])" "[$$BASE_UPDATE,$$USDC_UPDATE]" \
 		--rpc-url $(ANVIL_RPC_URL) \
@@ -141,10 +152,31 @@ set-price-anvil:
 	echo "=== Price update data for Remix (pass as priceUpdate) ===" && \
 	echo "[\"$$BASE_UPDATE\",\"$$USDC_UPDATE\"]"
 
+# Deposit collateral into a pair on Anvil
+# Usage: make deposit-anvil PAIR=0x... AMOUNT=1000 (USD, whole dollars; at least 5)
+.PHONY: deposit-anvil
+deposit-anvil:
+	@if [ -z "$(PAIR)" ] || [ -z "$(AMOUNT)" ]; then echo "Usage: make deposit-anvil PAIR=0x... AMOUNT=1000"; exit 1; fi
+	@. ./.anvil-addresses && \
+	echo "=== Approving $(AMOUNT) USDC for the pair ===" && \
+	cast send $$USDC "approve(address,uint256)" $(PAIR) $(AMOUNT)000000 \
+		--rpc-url $(ANVIL_RPC_URL) \
+		--private-key $(ANVIL_PRIVATE_KEY) > /dev/null && \
+	echo "=== Depositing $(AMOUNT) USDC as collateral ===" && \
+	cast send $(PAIR) \
+		"depositCollateral(uint256,uint256,uint256,uint256,bytes,bytes)" \
+		$$(cast to-wei $(AMOUNT)) 0 0 0 0x 0x \
+		--rpc-url $(ANVIL_RPC_URL) \
+		--private-key $(ANVIL_PRIVATE_KEY) > /dev/null && \
+	echo "Done. Deposited $(AMOUNT) USDC into $(PAIR)"
+
 # Create a limit order on Anvil (generates fresh price data in the same command)
 # Usage: make create-order-anvil PAIR=0x... LIMIT_PRICE=2000 SIZE=0.01 IS_LONG=true
-# LIMIT_PRICE is in USD (integer), SIZE is in units of the asset (e.g. 0.01 ETH)
-# Expiration is passed as uint64-max, which the contract clamps to the ~1-year protocol max.
+# LIMIT_PRICE is in USD (integer), SIZE is in units of the asset (e.g. 0.01 ETH). The order is
+# margined against collateral already in the pair (make deposit-anvil). It is a GTC limit that
+# expires 100,000 blocks from now; the pair accepts lifetimes from 240 blocks to ~1 year. The price
+# update carries the limit price as the oracle price and is stamped with the timestamp the order's
+# block is pinned to, since the pair refuses an update more than 3 s old.
 .PHONY: create-order-anvil
 create-order-anvil:
 	@if [ -z "$(PAIR)" ] || [ -z "$(LIMIT_PRICE)" ] || [ -z "$(SIZE)" ]; then \
@@ -152,7 +184,8 @@ create-order-anvil:
 	@. ./.anvil-addresses && \
 	PYTH=$$(cast call $$ORACLE "pyth()(address)" --rpc-url $(ANVIL_RPC_URL)) && \
 	BASE_FEED=$$(cast call $(PAIR) "baseFeedId()(bytes32)" --rpc-url $(ANVIL_RPC_URL)) && \
-	TIMESTAMP=$$(cast block latest --rpc-url $(ANVIL_RPC_URL) --json | jq -r '.timestamp' | xargs printf "%d") && \
+	TIMESTAMP=$$(( $$(cast block latest --rpc-url $(ANVIL_RPC_URL) --json | jq -r '.timestamp' | xargs printf "%d") + 1 )) && \
+	EXPIRATION=$$(( $$(cast block-number --rpc-url $(ANVIL_RPC_URL)) + 100000 )) && \
 	BASE_UPDATE=$$(cast call $$PYTH \
 		"createPriceFeedUpdateData(bytes32,int64,uint64,int32,int64,uint64,uint64,uint64)(bytes)" \
 		$$BASE_FEED $(LIMIT_PRICE)00000000 0 -8 $(LIMIT_PRICE)00000000 0 $$TIMESTAMP $$((TIMESTAMP - 1)) \
@@ -168,11 +201,12 @@ create-order-anvil:
 	echo "  Size:        $(SIZE) ($$SIZE_WEI)" && \
 	echo "  Limit price: $(LIMIT_PRICE) USD" && \
 	echo "  Long:        $(or $(IS_LONG),true)" && \
+	cast rpc evm_setNextBlockTimestamp $$TIMESTAMP --rpc-url $(ANVIL_RPC_URL) > /dev/null && \
 	cast send $(PAIR) \
-		"createOrder((uint8,bool,bool,bool,uint256,uint256,uint256,uint256,uint64,address),(uint64,uint64,uint64,uint64,uint32),bytes[],uint256,uint256,uint256,bytes)" \
-		"(1,$(or $(IS_LONG),true),false,false,$$SIZE_WEI,0,$$LIMIT_WEI,0,18446744073709551615,0x0000000000000000000000000000000000000000)" \
+		"createOrder((uint8,bool,bool,uint8,uint256,uint256,uint256,uint256,uint64,address),(uint64,uint64,uint64,uint64,uint32),bytes[],uint256,uint256,uint256,bytes,bytes)" \
+		"(1,$(or $(IS_LONG),true),false,0,$$SIZE_WEI,0,$$LIMIT_WEI,0,$$EXPIRATION,0x0000000000000000000000000000000000000000)" \
 		"(0,0,0,0,0)" \
-		"[$$BASE_UPDATE,$$USDC_UPDATE]" 0 0 0 0x \
+		"[$$BASE_UPDATE,$$USDC_UPDATE]" 0 0 0 0x 0x \
 		--rpc-url $(ANVIL_RPC_URL) \
 		--private-key $(ANVIL_PRIVATE_KEY) \
 		--gas-limit 5000000 && \
@@ -232,8 +266,9 @@ deploy-pair-anvil:
 	echo "  Pair Address: $$PAIR_ADDR"
 
 # ---------- Two-step deployment ----------
-# BazaarPair links ten external libraries by address, so every network needs its own library
-# deployment before the Bazaar deploy can be linked. DeployLibraries writes that chain's
+# The core contracts link twelve external libraries by address (eleven in BazaarPair, ClaimTextLib in
+# the factory and the terminator), so every network needs its own library deployment before the
+# Bazaar deploy can be linked. DeployLibraries writes that chain's
 # `--libraries` flags to deployments/<chainid>/libraries.args; the deploy targets below splat the
 # file for their own chain, so one network's addresses can never be linked into another's build.
 #
@@ -242,6 +277,11 @@ deploy-pair-anvil:
 # EXPECTED_CHAIN_ID, and both scripts abort before broadcasting if block.chainid disagrees. The
 # chain id is written once per network below and feeds both the args path and the assertion, so
 # the two cannot drift apart.
+#
+# The `test -f` below is only the fast failure. Step 2 reads the record back before it broadcasts
+# and requires each recorded address to hold the code the build links against
+# (DeployBazaar._assertLinkedLibraries), so a record left over from an earlier library build, or
+# one missing a library, aborts the run instead of linking the pair to stale code.
 
 ARB_SEPOLIA_CHAIN_ID := 421614
 ARB_MAINNET_CHAIN_ID := 42161

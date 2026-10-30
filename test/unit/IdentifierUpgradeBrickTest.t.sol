@@ -51,7 +51,8 @@ contract IdentifierUpgradeBrickTest is Test {
     /// the single pendingIdentifierUpgradeAssertionId slot is never cleared. Nothing else can clear
     /// it — no owner, no timeout on the assertion, and `oo` is immutable — so absent
     /// expireStuckIdentifierUpgradeProposal the jam would be permanent and the identifier could
-    /// never move again. This walks the whole jam, then shows the expiry releasing the slot.
+    /// never move again. This walks the whole jam, then shows the expiry releasing the slot by
+    /// approving the unchallenged proposal.
     function test_BlacklistedProposerStallsUpgradePathUntilExpiry() public {
         vm.startPrank(user1);
         usdc.approve(address(factory), type(uint256).max);
@@ -97,14 +98,21 @@ contract IdentifierUpgradeBrickTest is Test {
         // the identifier, and the live identifier is still whitelisted. The expiry is the whole
         // recovery.
 
-        // This proposal was never disputed, so a settlement that keeps failing past liveness is
-        // proof the payout itself is blocked rather than evidence of an unresolved dispute — anyone
-        // may discard it immediately, no grace period, and governance resumes.
+        // This proposal was never disputed, so past liveness approval is the only outcome the
+        // oracle has left for it. Anyone may have the factory apply that outcome, no grace period:
+        // the slot is released and the upgrade queued, with only the bond left on the oracle.
         factory.expireStuckIdentifierUpgradeProposal();
         assertEq(factory.pendingIdentifierUpgradeAssertionId(), bytes32(0), "slot finally released");
+        (bytes32 queuedId, bytes32 queuedIdentifier, uint256 queuedTs) = factory.queuedIdentifierUpgrade();
+        assertEq(queuedId, idU, "the unchallenged proposal is approved");
+        assertEq(queuedIdentifier, bytes32("ASSERT_TRUTH5"), "its identifier is queued");
+        assertEq(queuedTs, vm.getBlockTimestamp() + timelock, "behind the usual timelock");
 
+        // Once the timelock runs out the upgrade activates and the track takes new proposals.
+        vm.warp(queuedTs);
         vm.prank(user2);
         assertTrue(factory.proposeUmaIdentifierUpgrade("ASSERT_TRUTH6") != bytes32(0), "governance resumed");
+        assertEq(factory.umaIdentifier(), bytes32("ASSERT_TRUTH5"), "approved upgrade activated");
     }
 
     /// If the assertion is DISPUTED and the DVM rules TRUE, the payout still goes to the

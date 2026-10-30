@@ -12,8 +12,13 @@ remappings = [
     "@pythnetwork/pyth-sdk-solidity/=node_modules/@pythnetwork/pyth-sdk-solidity",
     "@openzeppelin/=lib/openzeppelin-contracts/",
 ]
-# DeployLibraries.s.sol records each chain's library addresses under deployments/<chainid>/.
-fs_permissions = [{ access = "read-write", path = "./deployments" }]
+# DeployLibraries.s.sol records each chain's library addresses under deployments/<chainid>/, and
+# reads each library's raw artifact under out/ to resolve the link placeholders the libraries
+# that call RiskParamsLib carry (vm.getCode refuses an artifact that still carries one).
+fs_permissions = [
+    { access = "read-write", path = "./deployments" },
+    { access = "read", path = "./out" },
+]
 
 # optimizer_runs is 150 for every contract. MatchingEngineLib and BazaarPair are the two
 # artifacts nearest the EIP-170 ceiling, and a single global value keeps the artifact that the
@@ -24,17 +29,24 @@ fs_permissions = [{ access = "read-write", path = "./deployments" }]
 # matters least.
 
 # dynamic_test_linking makes test contracts resolve library addresses at deploy time inside the test
-# EVM rather than at compile time. BazaarPair links the ten external libraries that
-# DeployLibraries.s.sol deploys, and most of the suite reaches BazaarPair transitively, so this is
-# what keeps a one-line edit to any library body from re-running the IR pipeline over nearly the
-# whole dependency graph. That is the dominant build cost: via_ir is mandatory here — BazaarPair
+# EVM rather than at compile time. BazaarPair links eleven of the twelve external libraries that
+# DeployLibraries.s.sol deploys (BazaarFactory and BazaarPairTerminator link the twelfth,
+# ClaimTextLib), and most of the suite reaches BazaarPair transitively, so this is what keeps a
+# one-line edit to any library body from re-running the IR pipeline over nearly the whole
+# dependency graph. That is the dominant build cost: via_ir is mandatory here — BazaarPair
 # exceeds the stack limit under legacy codegen — and the IR pipeline is bounded by solc's peak
 # memory rather than by CPU. Deployed bytecode is byte-identical with the setting on or off, so
 # ContractSizeTest still gates the artifact that ships.
 
 [invariant]
 runs = 64
-depth = 64
+# Depth is one sequence's call count, split across the handler's action menu, so it sets both how
+# many times each action is attempted and how long a chain of interactions the invariants are
+# checked over. Most actions here have preconditions — a position to withdraw against, an
+# underwater account to seize, inventory to unload — so they need attempts to spare, not just one
+# each: the liquidation regime is only reached by a move landing after a position exists. Held at
+# roughly 20 calls per action; the stateful suite runs in seconds, so the headroom is cheap.
+depth = 160
 fail_on_revert = false
 
 # `unsafe-typecast` fires on every explicit numeric conversion with no dataflow analysis, and src/

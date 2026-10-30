@@ -8,6 +8,7 @@
 - [Trading](guide/trading.md)
 - [Earning on Bazaar](guide/earning.md)
 - [Integrators: Earn Referral Fees](guide/integrators.md)
+- [Batching Orders](guide/batching.md)
 - [Local Development](guide/quick-start.md)
 - [Self-Deployment](guide/deployment.md)
 

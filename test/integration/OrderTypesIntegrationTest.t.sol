@@ -53,13 +53,16 @@ contract OrderTypesIntegrationTest is IntegrationBase {
     /// @notice A StopLoss (sell stop closing a long) rests untriggered outside the book, then the
     ///         permissionless keeper fires it once the oracle falls to/below its trigger. The
     ///         execution fills against the resting bid at the maker's price, closes the position,
-    ///         and pays the keeper the trigger tip from the owner's collateral.
+    ///         and pays the keeper the bounty the owner escrowed with the order.
     function test_e2e_StopLoss_TriggersAndCloses() public {
         uint256 size = BAZAAR_SCALE / 10;
         _openPosition(alice, bob, true, size); // alice LONG, bob SHORT
 
         // Sell stop closing alice's long: fires when oracle <= $49.5k (untriggered at the $50k print).
-        uint256 slId = _placeStopLoss(alice, false, size, 49_500 * BAZAAR_SCALE, 500);
+        // It carries a $0.25 keeper bounty, escrowed from alice's wallet at creation.
+        _approveWallet(alice, BAZAAR_SCALE / 4);
+        uint256 slId =
+            _placeStopLoss(alice, false, size, _withBounty(49_500 * BAZAAR_SCALE, BAZAAR_SCALE / 4), 500);
         _deposit(carol, 20_000 * BAZAAR_SCALE);
         uint256 carolLong = _placeLimit(carol, true, size, 49_500 * BAZAAR_SCALE); // resting counterparty bid
         _roll(2);
@@ -69,7 +72,7 @@ contract OrderTypesIntegrationTest is IntegrationBase {
         assertEq(_posSize(alice), 0, "alice closed via stop-loss");
         assertEq(_filledSize(slId), size, "stop order fully filled");
         assertEq(_filledSize(carolLong), size, "counterparty bid filled");
-        assertEq(_claimFees(seq), USDC_SCALE / 4, "keeper earned the $0.25 trigger tip");
+        assertEq(_claimFees(seq), USDC_SCALE / 4, "keeper earned the whole $0.25 bounty for the full close");
     }
 
     /// @notice The same StopLoss is skipped — not filled, not canceled, no tip — while the oracle

@@ -24,7 +24,7 @@ contract RetainedCollateralFloorTest is IntegrationBase {
     function _floorForLong(uint256 sizeWad, uint256 spotUsd) internal view returns (uint256) {
         uint256 lowPrice = (spotUsd - spotUsd / 1000) * BAZAAR_SCALE;
         uint256 notional = sizeWad * lowPrice / BAZAAR_SCALE;
-        (, uint256 mmrBp,,,) = pair.marginRequirements();
+        (, uint256 mmrBp,,) = pair.marginRequirements();
         return notional * mmrBp / BazaarTypes.BP_SCALE;
     }
 
@@ -34,7 +34,7 @@ contract RetainedCollateralFloorTest is IntegrationBase {
         _openPosition(alice, bob, true, 1 * BAZAAR_SCALE); // alice long 1 BTC
 
         // Price doubles: unrealized profit alone would satisfy the equity-based margin check.
-        vm.warp(vm.getBlockTimestamp() + 3);
+        vm.warp(vm.getBlockTimestamp() + 4);
         bytes[] memory pu = _priceUpdate(100_000, uint64(vm.getBlockTimestamp()));
 
         uint256 col = _posCollateral(alice);
@@ -70,7 +70,7 @@ contract RetainedCollateralFloorTest is IntegrationBase {
         _openPosition(alice, bob, true, 1 * BAZAAR_SCALE);
         _deposit(carol, 200_000 * BAZAAR_SCALE); // counterparty with plenty of margin
 
-        vm.warp(vm.getBlockTimestamp() + 3);
+        vm.warp(vm.getBlockTimestamp() + 4);
         bytes[] memory pu = _priceUpdate(100_000, uint64(vm.getBlockTimestamp()));
         uint256 col = _posCollateral(alice);
         uint256 floorAmt = _floorForLong(1 * BAZAAR_SCALE, 100_000);
@@ -98,7 +98,7 @@ contract RetainedCollateralFloorTest is IntegrationBase {
         _placeLimit(bob, false, BAZAAR_SCALE / 500, 49_000 * BAZAAR_SCALE);
         assertEq(_posSize(alice), BAZAAR_SCALE / 500, "small position opened");
 
-        vm.warp(vm.getBlockTimestamp() + 3);
+        vm.warp(vm.getBlockTimestamp() + 4);
         bytes[] memory pu = _priceUpdate(100_000, uint64(vm.getBlockTimestamp()));
         uint256 floorAmt = _floorForLong(BAZAAR_SCALE / 500, 100_000);
         uint256 col = _posCollateral(alice);

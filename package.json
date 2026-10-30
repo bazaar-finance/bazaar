@@ -1,7 +1,7 @@
 {
   "name": "bazaar",
   "version": "1.0.0",
-  "description": "Permissionless perpetual futures protocol on Arbitrum — on-chain CLOB, bonded sequencers with fraud proofs, UMA-governed listings.",
+  "description": "Permissionless perpetual futures protocol on Arbitrum — on-chain CLOB with arrival matching, Pyth pricing, UMA-governed listings.",
   "main": "index.js",
   "directories": {
     "lib": "lib",
