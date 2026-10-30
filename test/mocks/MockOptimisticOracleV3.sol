@@ -95,7 +95,7 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
 
     mapping(bytes32 => bool) private _unsupportedIdentifiers;
 
-    function setIdentifierSupported(bytes32 identifier, bool supported) external {
+    function setIdentifierSupported(bytes32 identifier, bool supported) public virtual {
         if (supported) delete _unsupportedIdentifiers[identifier];
         else _unsupportedIdentifiers[identifier] = true;
     }
@@ -117,7 +117,7 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
     // their own floors; raise it to exercise UMA outgrowing those floors.
     uint256 private _minimumBond;
 
-    function setMinimumBond(uint256 amount) external {
+    function setMinimumBond(uint256 amount) public virtual {
         _minimumBond = amount;
     }
 
@@ -304,12 +304,16 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
     }
 
     // ==================== Test Helpers ====================
+    // The two state-changing helpers below are open to any caller, as are setIdentifierSupported
+    // and setMinimumBond above, which only a local chain can afford. OwnedMockOptimisticOracleV3
+    // restricts all four to an owner for a public chain, so a state-changing helper added here
+    // needs a matching override there.
 
     /// @notice Warp past liveness so the assertion can be settled. Use vm.warp in tests instead if available.
     ///         This is a convenience for cast-based testing on Anvil.
 
     /// @notice Resolve a disputed assertion via the mock DVM (simulates UMA voter resolution).
-    function mockDvmResolve(bytes32 assertionId, bool result) external {
+    function mockDvmResolve(bytes32 assertionId, bool result) public virtual {
         AssertionRecord storage a = assertions[assertionId];
         require(a.disputed, "Not disputed");
         require(!a.settled, "Already settled");
@@ -319,7 +323,7 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
 
     /// @notice Force-settle an assertion immediately, bypassing liveness and dispute checks.
     ///         For quick testing when you don't want to deal with time.
-    function mockForceSettle(bytes32 assertionId, bool result) external {
+    function mockForceSettle(bytes32 assertionId, bool result) public virtual {
         AssertionRecord storage a = assertions[assertionId];
         require(a.asserter != address(0), "Assertion does not exist");
         require(!a.settled, "Already settled");

@@ -6,6 +6,7 @@ import {Script} from "forge-std/Script.sol";
 import {MockUSDC} from "../test/mocks/MockUSDC.sol";
 import {MockPyth} from "@pythnetwork/pyth-sdk-solidity/MockPyth.sol";
 import {MockOptimisticOracleV3} from "../test/mocks/MockOptimisticOracleV3.sol";
+import {OwnedMockOptimisticOracleV3} from "../test/mocks/OwnedMockOptimisticOracleV3.sol";
 
 contract HelperConfig is Script {
     // if we are on a local anvil, we deploy mocks
@@ -63,18 +64,29 @@ contract HelperConfig is Script {
     }
 
     // -------------------- Arbitrum Sepolia --------------------
-    // Uses real USDC and Pyth on Arbitrum Sepolia, but mocks UMA OOv3
-    // since UMA has no official testnet deployment on Arbitrum Sepolia.
+    // Uses Circle's test USDC and Pyth on Arbitrum Sepolia, but deploys its own mock OOv3 instead of
+    // UMA's OptimisticOracleV3 on that chain (0x1037A21a30aEfF90c269b01c3933eB9a5285d9b8), which
+    // cannot adjudicate Bazaar's assertions: the USDC below is not on its CollateralWhitelist, so
+    // every USDC-bonded assertTruth reverts; its default currency is an 18-decimal test token, which
+    // cannot stand in for USDC; and its DVM stand-in, MockOracleAncillary, lets anyone push the
+    // resolution of any dispute.
 
     /// @dev Same sourcing rule as the mainnet config: `usdcContract` is the Arbitrum Sepolia test
     ///      USDC and `pythFeed` the Pyth Core contract for that chain, both read from the issuer's
     ///      published list. The mock OOv3 is constructed against the same USDC it will price bonds
     ///      in, so a wrong USDC here surfaces as a broken listing flow on the rehearsal rather than
     ///      on mainnet.
+    ///
+    ///      The mock is the owner-gated variant, owned by the broadcaster. The chain is public, and
+    ///      the base mock's helpers would let anyone settle any assertion with any result; here only
+    ///      the owner can force-settle, resolve disputes, or set the identifier whitelist and the
+    ///      minimum bond.
     function getOrCreateArbitrumSepoliaConfig() public returns (NetworkConfig memory) {
         if (activeNetworkConfig.optimisticOracleV3 == address(0)) {
             vm.startBroadcast();
-            MockOptimisticOracleV3 mockOO = new MockOptimisticOracleV3(0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d, 7200);
+            (, address broadcaster,) = vm.readCallers();
+            OwnedMockOptimisticOracleV3 mockOO =
+                new OwnedMockOptimisticOracleV3(0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d, 7200, broadcaster);
             vm.stopBroadcast();
 
             return NetworkConfig({

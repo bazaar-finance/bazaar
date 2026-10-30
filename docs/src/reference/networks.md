@@ -46,7 +46,7 @@ External dependencies on Arbitrum Sepolia:
 |---|---|
 | Pyth | `0x0B73614636C855Bf23F342F307FB981A3e47f42B` |
 | USDC (testnet) | `0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d` |
-| UMA OOv3 | **mock**, deployed by the script (Bazaar's assertions set their own liveness periods) — UMA has no official Arbitrum Sepolia deployment |
+| UMA OOv3 | **mock** (`OwnedMockOptimisticOracleV3`), deployed by the script and owned by the deploying account, which alone can force-settle assertions, resolve disputes, and set the identifier whitelist and minimum bond (Bazaar's assertions set their own liveness periods). UMA's own Arbitrum Sepolia OOv3 is not used: it does not accept Circle's test USDC as bond collateral, and its stand-in DVM lets anyone resolve a dispute |
 
 ## Anvil (31337)
 
