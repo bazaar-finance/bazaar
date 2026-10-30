@@ -120,9 +120,8 @@ contract InsuranceMetaTxTest is IntegrationBase {
         uint256 permitDeadline = vm.getBlockTimestamp() + 30;
         bytes32 permitTypehash =
             keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
-        bytes32 structHash = keccak256(
-            abi.encode(permitTypehash, user, address(pair), usdcValue, usdc.nonces(user), permitDeadline)
-        );
+        bytes32 structHash =
+            keccak256(abi.encode(permitTypehash, user, address(pair), usdcValue, usdc.nonces(user), permitDeadline));
         (uint8 v, bytes32 r, bytes32 s) =
             vm.sign(userPk, MessageHashUtils.toTypedDataHash(usdc.DOMAIN_SEPARATOR(), structHash));
         return abi.encode(usdcValue, permitDeadline, v, r, s);

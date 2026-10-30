@@ -628,7 +628,9 @@ library OrderManagementLib {
         if (o.orderType != BazaarTypes.OrderType.Limit || o.tif != BazaarTypes.TimeInForce.GTC) {
             revert OrderManagementLib__NotAmendable(orderId);
         }
-        if (o.canceledBlock != 0 || o.filledBlock != 0 || !o.inBook) revert OrderManagementLib__OrderIsNotActive(orderId);
+        if (o.canceledBlock != 0 || o.filledBlock != 0 || !o.inBook) {
+            revert OrderManagementLib__OrderIsNotActive(orderId);
+        }
         if (params.currentBlock > o.expiryBlock) revert OrderManagementLib__OrderAlreadyExpired(orderId);
 
         if (newPrice == 0) revert OrderManagementLib__ZeroLimitPrice();
@@ -726,8 +728,9 @@ library OrderManagementLib {
         uint256 shortExposure,
         uint256 fillDebit
     ) private view {
-        BazaarTypes.BucketState memory state =
-            BucketLib.calculateState(bucket, params.currentPrice, params.currentFundingIndex, marginReqs);
+        BazaarTypes.BucketState memory state = BucketLib.calculateState(
+            bucket, params.currentPrice, params.currentFundingIndex, marginReqs
+        );
         bool flat = bucket.size == 0;
         uint256 posNotional = flat ? 0 : state.currentNotional;
         uint256 worst = CollateralLib._worstCaseNotional(bucket.isLong, posNotional, longExposure, shortExposure);

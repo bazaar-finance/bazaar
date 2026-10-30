@@ -1610,7 +1610,8 @@ contract BazaarPairTest is Test {
         assertTrue(isLong);
 
         // Verify tracked in userActiveLimitOrders
-        (uint256[] memory activeOrders, uint256 count,,) = factory.lens().getUserActiveLimitOrders(address(btcPair), user1);
+        (uint256[] memory activeOrders, uint256 count,,) =
+            factory.lens().getUserActiveLimitOrders(address(btcPair), user1);
         assertEq(count, 1);
         assertEq(activeOrders[0], 1);
     }
@@ -2808,7 +2809,8 @@ contract BazaarPairTest is Test {
         );
 
         // Both orders tracked
-        (uint256[] memory activeOrders, uint256 count,,) = factory.lens().getUserActiveLimitOrders(address(btcPair), user1);
+        (uint256[] memory activeOrders, uint256 count,,) =
+            factory.lens().getUserActiveLimitOrders(address(btcPair), user1);
         assertEq(count, 2);
     }
 
@@ -3184,7 +3186,8 @@ contract BazaarPairTest is Test {
         uint256 orderId = _createLimitOrder(user1, USER1_PK, true, POSITION_SIZE, BTC_SPOT_PRICE);
 
         // Verify order is in active set
-        (uint256[] memory activeBefore, uint256 countBefore,,) = factory.lens().getUserActiveLimitOrders(address(btcPair), user1);
+        (uint256[] memory activeBefore, uint256 countBefore,,) =
+            factory.lens().getUserActiveLimitOrders(address(btcPair), user1);
         assertEq(countBefore, 1);
         assertEq(activeBefore[0], orderId);
 

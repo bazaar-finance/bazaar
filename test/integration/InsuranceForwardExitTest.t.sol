@@ -233,9 +233,7 @@ contract InsuranceForwardExitTest is IntegrationBase {
         _stageHeldInventory(50_000 * BAZAAR_SCALE + fund + 1_000 * BAZAAR_SCALE, fund / 2);
         vm.warp(opensTs);
         _expectRedemptionRevert(
-            pair,
-            _priceAt(50_000),
-            abi.encodeWithSelector(InsuranceVaultLib.InsuranceVaultLib__AdlBlocking.selector)
+            pair, _priceAt(50_000), abi.encodeWithSelector(InsuranceVaultLib.InsuranceVaultLib__AdlBlocking.selector)
         );
         assertEq(pair.insuranceShares(carol), shares, "shares retained while blocked");
 
@@ -575,8 +573,8 @@ contract InsuranceForwardExitTest is IntegrationBase {
         pair.finalizeTermination();
         assertTrue(pair.isPairTerminated(), "fixture: terminated");
 
-        uint256 terminalValue = pair.insuranceWithdrawalRequestShareAmount(carol) * _insuranceBal()
-            / pair.totalInsuranceShares();
+        uint256 terminalValue =
+            pair.insuranceWithdrawalRequestShareAmount(carol) * _insuranceBal() / pair.totalInsuranceShares();
         assertGt(terminalValue, lockedAmount, "fixture: the terminal value exceeds the old lock");
         bytes32 lockSlot = keccak256(abi.encode(carol, uint256(112))); // insuranceWithdrawalLock
         assertGt(uint256(vm.load(address(pair), lockSlot)), 0, "fixture: the pin reads the live lock");

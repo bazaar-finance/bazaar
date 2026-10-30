@@ -82,9 +82,7 @@ contract LiqRewardHarness {
             BazaarTypes.LiquidateParams({
                 currentPrice: price,
                 currentFundingIndex: 0,
-                marginReqs: BazaarTypes.MarginRequirements({
-                    imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0
-                }),
+                marginReqs: BazaarTypes.MarginRequirements({imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0}),
                 pairId: bytes32("TEST"),
                 currentBlock: 1
             })
@@ -521,9 +519,7 @@ contract NettingHarness {
             BazaarTypes.LiquidateParams({
                 currentPrice: price,
                 currentFundingIndex: fundingIndex,
-                marginReqs: BazaarTypes.MarginRequirements({
-                    imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0
-                }),
+                marginReqs: BazaarTypes.MarginRequirements({imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0}),
                 pairId: bytes32("TEST"),
                 currentBlock: 1
             })
@@ -545,9 +541,7 @@ contract NettingHarness {
             BazaarTypes.LiquidateParams({
                 currentPrice: price,
                 currentFundingIndex: fundingIndex,
-                marginReqs: BazaarTypes.MarginRequirements({
-                    imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0
-                }),
+                marginReqs: BazaarTypes.MarginRequirements({imrBp: 300, mmrBp: 150, lastUpdateTs: 0, laggedMmrBp: 0}),
                 pairId: bytes32("TEST"),
                 currentBlock: 1
             })

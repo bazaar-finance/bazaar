@@ -199,13 +199,7 @@ library MatchingEngineLib {
         _walkTaker(orders, positionBuckets, userActiveLimitOrders, book, takerId, hints, cap, ctx, res);
         if (triggerGated) {
             _settleBounty(
-                orders,
-                feeEscrow,
-                ctx.pairId,
-                takerId,
-                filledBefore,
-                res.takerRemainingAtStart,
-                orders[takerId].creator
+                orders, feeEscrow, ctx.pairId, takerId, filledBefore, res.takerRemainingAtStart, orders[takerId].creator
             );
         }
         _finalizeTx(pairVault, feeEscrow, ctx, res);
@@ -748,9 +742,9 @@ library MatchingEngineLib {
             // behind the liquidity. The owner's own order is theirs to cancel when they want
             // the stop to proceed past it. Post-only and the stale band cannot reach a trigger
             // order: creation refuses the flag and the stale fallback never fires one.
-            if (
-                _isTriggerGated(t.order.orderType) && t.cancelReason != BazaarTypes.CancelReason.PositionClosed
-            ) return;
+            if (_isTriggerGated(t.order.orderType) && t.cancelReason != BazaarTypes.CancelReason.PositionClosed) {
+                return;
+            }
             _autoCancelOrder(orders, positionBuckets, userActiveLimitOrders, book, t, ctx);
             return;
         }

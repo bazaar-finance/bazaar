@@ -61,8 +61,7 @@ contract OrderTypesIntegrationTest is IntegrationBase {
         // Sell stop closing alice's long: fires when oracle <= $49.5k (untriggered at the $50k print).
         // It carries a $0.25 keeper bounty, escrowed from alice's wallet at creation.
         _approveWallet(alice, BAZAAR_SCALE / 4);
-        uint256 slId =
-            _placeStopLoss(alice, false, size, _withBounty(49_500 * BAZAAR_SCALE, BAZAAR_SCALE / 4), 500);
+        uint256 slId = _placeStopLoss(alice, false, size, _withBounty(49_500 * BAZAAR_SCALE, BAZAAR_SCALE / 4), 500);
         _deposit(carol, 20_000 * BAZAAR_SCALE);
         uint256 carolLong = _placeLimit(carol, true, size, 49_500 * BAZAAR_SCALE); // resting counterparty bid
         _roll(2);

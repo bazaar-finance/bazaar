@@ -67,9 +67,7 @@ library OrderBookLib {
         uint64 next = pred == 0 ? (side ? book.bidHead : book.askHead) : uint64(orders[pred].nextInBook);
         uint16 restedPremiumPpm = FundingLib.restedPremiumOf(side, o.limitPrice, indexPrice);
         // orderIds come from the pair's monotonic counter starting at 1; 2^48 is unreachable.
-        _link(
-            orders, book, o, side, uint48(orderId), uint48(pred), uint48(next), uint32(restedBlock), restedPremiumPpm
-        );
+        _link(orders, book, o, side, uint48(orderId), uint48(pred), uint48(next), uint32(restedBlock), restedPremiumPpm);
     }
 
     /// @notice Find the predecessor an order would rest behind, without touching the book.

@@ -196,8 +196,8 @@ contract FreshArrivalGuardsTest is IntegrationBase {
         _place(erin, true, 1 * SHARE, 120 * BAZAAR_SCALE, false); // resting bid below the mark
 
         // Initial margin at the mark plus the maker fee on the limit notional.
-        uint256 orderImrReq = Math_mulDiv(200 * BAZAAR_SCALE, imrBp, 10_000)
-            + 120 * BAZAAR_SCALE * BazaarTypes.MAKER_INSURANCE_FEE_EBP / BazaarTypes.EBP_SCALE;
+        uint256 orderImrReq = Math_mulDiv(200 * BAZAAR_SCALE, imrBp, 10_000) + 120 * BAZAAR_SCALE
+            * BazaarTypes.MAKER_INSURANCE_FEE_EBP / BazaarTypes.EBP_SCALE;
         uint256 maxOut = 10_000 * BAZAAR_SCALE - orderImrReq;
 
         vm.prank(erin);

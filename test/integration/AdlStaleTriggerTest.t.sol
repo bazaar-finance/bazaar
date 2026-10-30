@@ -213,7 +213,11 @@ contract AdlStaleTriggerTest is IntegrationBase {
         emit BazaarPair.AdlTerminationArmed(aaplPair.pairId(), armedAt + ADL_TERMINATION_GRACE);
         aaplPair.refreshPrice(new bytes[](0));
 
-        assertEq(lens.adlTerminationTs(address(aaplPair)), armedAt + ADL_TERMINATION_GRACE, "runway armed off the stored price");
+        assertEq(
+            lens.adlTerminationTs(address(aaplPair)),
+            armedAt + ADL_TERMINATION_GRACE,
+            "runway armed off the stored price"
+        );
         assertEq(aaplPair.settlementPriceFixedTs(), 0, "arming must not terminate in the same block");
         assertTrue(aaplPair.isAdlPending(), "the auction is still the live path");
 

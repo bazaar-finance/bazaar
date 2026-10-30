@@ -765,7 +765,8 @@ library InsuranceVaultLib {
         pure
         returns (uint256 opensTs)
     {
-        opensTs = (lockTs > lastJumpTs ? lockTs : lastJumpTs) + INSURANCE_WITHDRAWAL_CLAIM_DELAY;
+        opensTs =
+            (lockTs > lastJumpTs ? lockTs : lastJumpTs) + INSURANCE_WITHDRAWAL_CLAIM_DELAY;
         uint256 afterGap = lastGapTs + INSURANCE_WITHDRAWAL_REOPEN_CLAIM_DELAY;
         if (afterGap > opensTs) opensTs = afterGap;
     }

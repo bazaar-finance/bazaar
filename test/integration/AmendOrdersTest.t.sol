@@ -117,7 +117,10 @@ contract AmendOrdersTest is IntegrationBase {
     }
 
     function _crossErr(uint256 orderId, uint256 price, uint256 best) internal pure returns (bytes memory) {
-        return abi.encodeWithSelector(OrderManagementLib.OrderManagementLib__AmendWouldCross.selector, orderId, price, best);
+        return
+            abi.encodeWithSelector(
+                OrderManagementLib.OrderManagementLib__AmendWouldCross.selector, orderId, price, best
+            );
     }
 
     /// @dev The refusal of a move with less than the minimum lifetime left, judged at this block.
@@ -342,7 +345,9 @@ contract AmendOrdersTest is IntegrationBase {
         for (uint256 i = 1; i < bids.length; ++i) {
             uint256 prevPrice = OrderView.order(pair, bids[i - 1]).limitPrice;
             uint256 price = OrderView.order(pair, bids[i]).limitPrice;
-            assertTrue(price < prevPrice || (price == prevPrice && _seq(bids[i]) > _seq(bids[i - 1])), "bids out of order");
+            assertTrue(
+                price < prevPrice || (price == prevPrice && _seq(bids[i]) > _seq(bids[i - 1])), "bids out of order"
+            );
         }
     }
 
@@ -452,9 +457,19 @@ contract AmendOrdersTest is IntegrationBase {
         _roll(1);
         uint256 ask = _placeLimit(bob, false, SIZE, 51_000 * BAZAAR_SCALE);
 
-        _amendExpect(alice, _single(bid, 51_000 * BAZAAR_SCALE, SIZE), _crossErr(bid, 51_000 * BAZAAR_SCALE, 51_000 * BAZAAR_SCALE));
-        _amendExpect(alice, _single(bid, 52_000 * BAZAAR_SCALE, SIZE), _crossErr(bid, 52_000 * BAZAAR_SCALE, 51_000 * BAZAAR_SCALE));
-        _amendExpect(bob, _single(ask, 49_000 * BAZAAR_SCALE, SIZE), _crossErr(ask, 49_000 * BAZAAR_SCALE, 49_000 * BAZAAR_SCALE));
+        _amendExpect(
+            alice,
+            _single(bid, 51_000 * BAZAAR_SCALE, SIZE),
+            _crossErr(bid, 51_000 * BAZAAR_SCALE, 51_000 * BAZAAR_SCALE)
+        );
+        _amendExpect(
+            alice,
+            _single(bid, 52_000 * BAZAAR_SCALE, SIZE),
+            _crossErr(bid, 52_000 * BAZAAR_SCALE, 51_000 * BAZAAR_SCALE)
+        );
+        _amendExpect(
+            bob, _single(ask, 49_000 * BAZAAR_SCALE, SIZE), _crossErr(ask, 49_000 * BAZAAR_SCALE, 49_000 * BAZAAR_SCALE)
+        );
 
         // One tick inside the spread is fine on both sides.
         _amendAs(alice, _single(bid, 50_999 * BAZAAR_SCALE, SIZE));
@@ -470,7 +485,11 @@ contract AmendOrdersTest is IntegrationBase {
         uint256 bid = _placeLimit(alice, true, SIZE, 49_000 * BAZAAR_SCALE);
         _roll(1);
         _placeLimit(alice, false, SIZE, 51_000 * BAZAAR_SCALE);
-        _amendExpect(alice, _single(bid, 51_000 * BAZAAR_SCALE, SIZE), _crossErr(bid, 51_000 * BAZAAR_SCALE, 51_000 * BAZAAR_SCALE));
+        _amendExpect(
+            alice,
+            _single(bid, 51_000 * BAZAAR_SCALE, SIZE),
+            _crossErr(bid, 51_000 * BAZAAR_SCALE, 51_000 * BAZAAR_SCALE)
+        );
     }
 
     /// @notice The placement band holds for an amended price as it does for a new order.
@@ -482,11 +501,16 @@ contract AmendOrdersTest is IntegrationBase {
             alice,
             _single(a, 20_000 * BAZAAR_SCALE, SIZE),
             abi.encodeWithSelector(
-                OrderManagementLib.OrderManagementLib__LimitPriceOutsidePlacementBand.selector, 20_000 * BAZAAR_SCALE, lo, hi
+                OrderManagementLib.OrderManagementLib__LimitPriceOutsidePlacementBand.selector,
+                20_000 * BAZAAR_SCALE,
+                lo,
+                hi
             )
         );
         _amendExpect(
-            alice, _single(a, 0, SIZE), abi.encodeWithSelector(OrderManagementLib.OrderManagementLib__ZeroLimitPrice.selector)
+            alice,
+            _single(a, 0, SIZE),
+            abi.encodeWithSelector(OrderManagementLib.OrderManagementLib__ZeroLimitPrice.selector)
         );
     }
 
@@ -497,7 +521,8 @@ contract AmendOrdersTest is IntegrationBase {
         _sell(SIZE / 2, 49_000); // half of alice's bid fills
         assertEq(OrderView.order(pair, a).filledSize, SIZE / 2);
 
-        bytes memory err = abi.encodeWithSelector(OrderManagementLib.OrderManagementLib__AmendSizeNotAboveFilled.selector, a);
+        bytes memory err =
+            abi.encodeWithSelector(OrderManagementLib.OrderManagementLib__AmendSizeNotAboveFilled.selector, a);
         _amendExpect(alice, _single(a, 49_000 * BAZAAR_SCALE, SIZE / 2), err);
         _amendExpect(alice, _single(a, 49_000 * BAZAAR_SCALE, 0), err);
         // Shrinking the remainder is fine; the filled size stays.
@@ -718,8 +743,8 @@ contract AmendOrdersTest is IntegrationBase {
                 OrderManagementLib.OrderManagementLib__InsufficientMarginAfterOrder.selector,
                 2_001 * BAZAAR_SCALE,
                 // IMR on the size at the mark, the larger leg, plus the maker fee on the limit notional
-                3 * SIZE * 50_000 * 2_000 / 10_000
-                    + 3 * SIZE * 49_000 * BazaarTypes.MAKER_INSURANCE_FEE_EBP / BazaarTypes.EBP_SCALE
+                3 * SIZE * 50_000 * 2_000 / 10_000 + 3 * SIZE * 49_000 * BazaarTypes.MAKER_INSURANCE_FEE_EBP
+                    / BazaarTypes.EBP_SCALE
             )
         );
         _amendAs(alice, _single(a, 49_000 * BAZAAR_SCALE, 2 * SIZE));
@@ -760,7 +785,8 @@ contract AmendOrdersTest is IntegrationBase {
         uint256 nonce = pair.metaTxNonces(signer);
         uint256 deadline = vm.getBlockTimestamp() + MetaTxLib.MAX_DEADLINE_WINDOW;
         uint256 fee = BAZAAR_SCALE / 2;
-        bytes32 digest = MessageHashUtils.toTypedDataHash(pair.DOMAIN_SEPARATOR(), _structHash(batch, nonce, deadline, fee));
+        bytes32 digest =
+            MessageHashUtils.toTypedDataHash(pair.DOMAIN_SEPARATOR(), _structHash(batch, nonce, deadline, fee));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
         bytes memory sig = abi.encodePacked(r, s, v);
 
@@ -795,7 +821,8 @@ contract AmendOrdersTest is IntegrationBase {
         Batch memory batch = _single(a, 48_000 * BAZAAR_SCALE, SIZE);
         uint256 nonce = pair.metaTxNonces(signer);
         uint256 deadline = vm.getBlockTimestamp() + MetaTxLib.MAX_DEADLINE_WINDOW;
-        bytes32 digest = MessageHashUtils.toTypedDataHash(pair.DOMAIN_SEPARATOR(), _structHash(batch, nonce, deadline, 0));
+        bytes32 digest =
+            MessageHashUtils.toTypedDataHash(pair.DOMAIN_SEPARATOR(), _structHash(batch, nonce, deadline, 0));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
         bytes memory sig = abi.encodePacked(r, s, v);
 
@@ -820,7 +847,8 @@ contract AmendOrdersTest is IntegrationBase {
         Batch memory batch = _singleHinted(a, uint64(b), 0, 47_500 * BAZAAR_SCALE, SIZE);
         uint256 nonce = pair.metaTxNonces(signer);
         uint256 deadline = vm.getBlockTimestamp() + MetaTxLib.MAX_DEADLINE_WINDOW;
-        bytes32 digest = MessageHashUtils.toTypedDataHash(pair.DOMAIN_SEPARATOR(), _structHash(batch, nonce, deadline, 0));
+        bytes32 digest =
+            MessageHashUtils.toTypedDataHash(pair.DOMAIN_SEPARATOR(), _structHash(batch, nonce, deadline, 0));
         (uint8 v, bytes32 r, bytes32 s_) = vm.sign(pk, digest);
         bytes memory sig = abi.encodePacked(r, s_, v);
 

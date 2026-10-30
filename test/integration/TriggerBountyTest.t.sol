@@ -50,10 +50,13 @@ contract TriggerBountyTest is IntegrationBase {
     /// @dev Fire `orderId` as `keeper` at `priceUsd`, asserting the bounty release it emits. The
     ///      price update is built before the expectation is set, since the mock oracle call
     ///      would otherwise be the call the expectation binds to.
-    function _fireExpectingRelease(address keeper, uint256 orderId, uint256 priceUsd, address recipient, uint256 amount)
-        internal
-        returns (uint256 executedCount)
-    {
+    function _fireExpectingRelease(
+        address keeper,
+        uint256 orderId,
+        uint256 priceUsd,
+        address recipient,
+        uint256 amount
+    ) internal returns (uint256 executedCount) {
         vm.warp(vm.getBlockTimestamp() + 4);
         bytes[] memory pu = _priceUpdate(priceUsd, uint64(vm.getBlockTimestamp()));
         BazaarTypes.TriggerExec[] memory execs = new BazaarTypes.TriggerExec[](1);
@@ -76,7 +79,8 @@ contract TriggerBountyTest is IntegrationBase {
         uint256 escrowBefore = _escrowTotal();
 
         _approveWallet(alice, B);
-        BazaarTypes.OrderSpec memory s = _spec(BazaarTypes.OrderType.StopLimit, true, BTC / 10, 51_500 * BAZAAR_SCALE, B);
+        BazaarTypes.OrderSpec memory s =
+            _spec(BazaarTypes.OrderType.StopLimit, true, BTC / 10, 51_500 * BAZAAR_SCALE, B);
         s.limitPrice = 52_000 * BAZAAR_SCALE;
         bytes[] memory pu = _freshPrice();
         vm.expectEmit(true, true, false, true, address(pair));
@@ -133,7 +137,8 @@ contract TriggerBountyTest is IntegrationBase {
         _deposit(alice, 20_000 * BAZAAR_SCALE);
         _approveWallet(alice, B);
         bytes[] memory pu = _freshPrice();
-        BazaarTypes.OrderSpec memory s = _spec(BazaarTypes.OrderType.StopLimit, true, BTC / 10, 51_500 * BAZAAR_SCALE, B + 1);
+        BazaarTypes.OrderSpec memory s =
+            _spec(BazaarTypes.OrderType.StopLimit, true, BTC / 10, 51_500 * BAZAAR_SCALE, B + 1);
         s.limitPrice = 52_000 * BAZAAR_SCALE;
         vm.prank(alice);
         vm.expectRevert(
@@ -145,7 +150,8 @@ contract TriggerBountyTest is IntegrationBase {
     function test_bounty_needsWalletAllowance() public {
         _deposit(alice, 20_000 * BAZAAR_SCALE); // the deposit consumed its own approval
         bytes[] memory pu = _freshPrice();
-        BazaarTypes.OrderSpec memory s = _spec(BazaarTypes.OrderType.StopLimit, true, BTC / 10, 51_500 * BAZAAR_SCALE, B);
+        BazaarTypes.OrderSpec memory s =
+            _spec(BazaarTypes.OrderType.StopLimit, true, BTC / 10, 51_500 * BAZAAR_SCALE, B);
         s.limitPrice = 52_000 * BAZAAR_SCALE;
         vm.prank(alice);
         vm.expectRevert();
@@ -320,7 +326,8 @@ contract TriggerBountyTest is IntegrationBase {
     function _stopLimitExpiringIn(uint64 life) internal returns (uint256) {
         _deposit(alice, 20_000 * BAZAAR_SCALE);
         _approveWallet(alice, B);
-        BazaarTypes.OrderSpec memory s = _spec(BazaarTypes.OrderType.StopLimit, true, BTC / 10, 51_500 * BAZAAR_SCALE, B);
+        BazaarTypes.OrderSpec memory s =
+            _spec(BazaarTypes.OrderType.StopLimit, true, BTC / 10, 51_500 * BAZAAR_SCALE, B);
         s.limitPrice = 52_000 * BAZAAR_SCALE;
         s.expirationBlock = uint64(vm.getBlockNumber()) + life;
         bytes[] memory pu = _freshPrice();
@@ -468,7 +475,8 @@ contract TriggerBountyTest is IntegrationBase {
     function test_expiredStopLimit_sweepCancelsAndRefunds() public {
         _deposit(alice, 20_000 * BAZAAR_SCALE);
         _approveWallet(alice, B);
-        BazaarTypes.OrderSpec memory s = _spec(BazaarTypes.OrderType.StopLimit, true, BTC / 10, 51_500 * BAZAAR_SCALE, B);
+        BazaarTypes.OrderSpec memory s =
+            _spec(BazaarTypes.OrderType.StopLimit, true, BTC / 10, 51_500 * BAZAAR_SCALE, B);
         s.limitPrice = 52_000 * BAZAAR_SCALE;
         s.expirationBlock = uint64(vm.getBlockNumber()) + BazaarTypes.MIN_ORDER_LIFETIME_BLOCKS;
         bytes[] memory pu = _freshPrice();
@@ -566,7 +574,8 @@ contract TriggerBountyTest is IntegrationBase {
         uint256 fee = 0.5e18;
         _approveWallet(signer, B + fee);
 
-        BazaarTypes.OrderSpec memory spec = _spec(BazaarTypes.OrderType.StopLimit, true, BTC / 10, 51_500 * BAZAAR_SCALE, B);
+        BazaarTypes.OrderSpec memory spec =
+            _spec(BazaarTypes.OrderType.StopLimit, true, BTC / 10, 51_500 * BAZAAR_SCALE, B);
         spec.limitPrice = 52_000 * BAZAAR_SCALE;
         uint256 deadline = vm.getBlockTimestamp() + 5;
         bytes memory sig = _sign(pk, _createOrderHash(spec, deadline, fee));
@@ -600,7 +609,8 @@ contract TriggerBountyTest is IntegrationBase {
         _approveWallet(signer, 10 * B);
         uint256 walletBefore = usdc.balanceOf(signer);
 
-        BazaarTypes.OrderSpec memory spec = _spec(BazaarTypes.OrderType.StopLimit, true, BTC / 10, 51_500 * BAZAAR_SCALE, B);
+        BazaarTypes.OrderSpec memory spec =
+            _spec(BazaarTypes.OrderType.StopLimit, true, BTC / 10, 51_500 * BAZAAR_SCALE, B);
         spec.limitPrice = 52_000 * BAZAAR_SCALE;
         uint256 deadline = vm.getBlockTimestamp() + 5;
         bytes memory sig = _sign(pk, _createOrderHash(spec, deadline, 0));

@@ -69,10 +69,7 @@ contract AdlRoundingHarness {
     }
 
     function _marginReqs() internal pure returns (BazaarTypes.MarginRequirements memory) {
-        return
-            BazaarTypes.MarginRequirements({
-                imrBp: 2_000, mmrBp: 1_000, lastUpdateTs: 0, laggedMmrBp: 0
-            });
+        return BazaarTypes.MarginRequirements({imrBp: 2_000, mmrBp: 1_000, lastUpdateTs: 0, laggedMmrBp: 0});
     }
 
     function liquidate(address[] calldata users, uint256 price, int256 fundingIndex)

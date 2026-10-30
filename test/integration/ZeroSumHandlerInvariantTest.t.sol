@@ -647,10 +647,7 @@ contract ZeroSumHandler is Test {
             (uint256 score, bool eligible) = lens.getAdlScore(address(pair), traders[i]);
             if (!eligible) continue;
             uint256 j = count;
-            while (
-                j > 0
-                    && (scores[j - 1] < score || (scores[j - 1] == score && sorted[j - 1] > traders[i]))
-            ) {
+            while (j > 0 && (scores[j - 1] < score || (scores[j - 1] == score && sorted[j - 1] > traders[i]))) {
                 sorted[j] = sorted[j - 1];
                 scores[j] = scores[j - 1];
                 j--;
