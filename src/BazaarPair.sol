@@ -1562,11 +1562,14 @@ contract BazaarPair is Initializable, ReentrancyGuardTransient {
     ///      already occupies, and the fixed cost of a call — the price, the margin curve and the
     ///      signature — is paid once for the whole batch. No fill can happen here, so the vault's
     ///      exposure does not move and no health check runs. Queue positions are drawn from the
-    ///      same counter as order ids, which therefore have gaps. A relinked order is placed from
-    ///      the hints packed into its id word, falling back to its old neighbours, so a requote by
-    ///      a few ticks needs no hint and a jump across the book takes one; a slot further than
-    ///      MAX_WALK_STEPS nodes from the first live candidate (its hints, then its old
-    ///      neighbours) is refused, and is a cancel and a new order.
+    ///      same counter as order ids, which therefore have gaps. A move that leaves the order
+    ///      between the same two neighbours is written where it stands, the book's links
+    ///      untouched, since relinking it would rebuild them as they are; only a move that changes
+    ///      its neighbours relinks it. A relinked order is placed from the hints packed into its
+    ///      id word, falling back to its old neighbours, so a requote by a few ticks needs no hint
+    ///      and a jump across the book takes one; a slot further than MAX_WALK_STEPS nodes from the
+    ///      first live candidate (its hints, then its old neighbours) is refused, and is a cancel
+    ///      and a new order.
     /// @param amends The batch as triples of words, covered by the EIP-712 payload: for each
     ///        amendment its id word — the order id in the low 64 bits, up to two predecessor
     ///        hints (the order to rest directly behind at the new price, 0 for none) in bits

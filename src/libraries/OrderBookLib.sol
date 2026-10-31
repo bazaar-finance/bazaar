@@ -13,23 +13,29 @@ import {FundingLib} from "./FundingLib.sol";
 ///         it to the back, or a keeper arms a StopLimit — when it takes a fresh value from the
 ///         same counter (BazaarTypes.Order). Every link also stamps the order with the block it
 ///         entered the book in (Order.restedBlock) and how far on the far side of the index it
-///         entered (Order.restedPremiumPpm): how long and where it has stood, which bound what
-///         its fills carry into the mark.
+///         entered (Order.restedPremiumPpm): how long and where it has stood at its current
+///         price and queue position, which bound what its fills carry into the mark. A member
+///         whose price and queue position are rewritten where it stands (staysInPlace, restamp)
+///         is stamped afresh the same way.
 /// @dev Internal library (inlined into callers, no DELEGATECALL hop). Every mutation preserves:
 ///       • strict (limitPrice, prioritySeq) ordering along nextInBook on both sides;
 ///       • link reciprocity — orders[x].nextInBook == y iff orders[y].prevInBook == x, the head's
 ///         prevInBook is 0 and the tail's nextInBook is 0;
 ///       • inBook is true exactly for orders reachable from their side's head, and
 ///         bidCount/askCount equal the traversal lengths;
-///       • a member's restedBlock is the block of the link that made it a member, and its
-///         restedPremiumPpm the far-side premium it stood at against that link's index.
+///       • a member's restedBlock is the block of the link, or of the in-place rewrite, that
+///         gave it its current price and queue position, and its restedPremiumPpm the far-side
+///         premium it stood at against that moment's index.
 ///      insert never links at an unverified position: every candidate placement — hinted or
 ///      found by the repair walk — is checked against the actual neighbors, so a wrong hint can
 ///      only fail placement, never mis-place an order. locate is the read-only half of insert,
 ///      for callers that must learn whether a slot is reachable before committing any state.
 ///      unlink is an unconditional no-op on non-members, so terminal-state writers (cancel,
 ///      fill, expiry sweep, liquidation, ADL) can call it without knowing whether the order
-///      ever rested.
+///      ever rested. staysInPlace tells a caller about to give a member a new price and queue
+///      position whether its slot survives the change; when it does, the caller writes the key
+///      where the order stands and calls restamp, and the book is left exactly as an unlink and
+///      an insert would leave it.
 library OrderBookLib {
     error OrderBookLib__AlreadyInBook(uint256 orderId);
     error OrderBookLib__HintRepairExhausted(uint256 orderId);
@@ -162,6 +168,53 @@ library OrderBookLib {
                 --book.askCount;
             }
         }
+    }
+
+    /// @notice Whether a member keeps its slot under a new price and queue position: its
+    ///         predecessor still sorts ahead of (newPrice, newSeq) and its successor still behind
+    ///         it, a missing neighbour counting as satisfied.
+    /// @dev The slot is unique. A side is strictly sorted by (limitPrice, prioritySeq) and no two
+    ///      orders share a prioritySeq, so exactly one position in the list takes the new key, and
+    ///      when both neighbours still bracket it that position is the one the order occupies.
+    ///      Unlinking the order and inserting it under the new key would therefore resolve to the
+    ///      same predecessor and successor, restore the same two links, the same head and the same
+    ///      count, and stamp the order as restamp stamps it: writing the key in place leaves the
+    ///      book and the order in exactly the state the relink would, and skips only the work of
+    ///      taking the links apart and putting them back. The equivalence rests on `newSeq` being
+    ///      later than every queue position in the book — the value a caller is about to draw
+    ///      from the counter — so a successor at the new price is never kept: under a later
+    ///      position the order belongs behind it, and the caller must relink.
+    /// @param orders The pair's order storage.
+    /// @param o The order, which must be in the book.
+    /// @param newPrice The limit price the order is about to take.
+    /// @param newSeq The queue position it is about to take; later than every one in the book.
+    /// @return True when the order's slot survives the new key.
+    function staysInPlace(
+        mapping(uint256 => BazaarTypes.Order) storage orders,
+        BazaarTypes.Order storage o,
+        uint256 newPrice,
+        uint64 newSeq
+    ) internal view returns (bool) {
+        bool side = o.isLong;
+        uint48 prev = o.prevInBook;
+        uint48 next = o.nextInBook;
+        return (prev == 0 || _nodePrecedes(side, orders[prev], newPrice, newSeq))
+            && (next == 0 || _precedesNode(side, newPrice, newSeq, orders[next]));
+    }
+
+    /// @notice Stamp a member as a link stamps it — the block it rests from and its far-side
+    ///         premium against `indexPrice` — without moving it, for a caller that has rewritten
+    ///         the order's price and queue position where it stands (staysInPlace). The stamps
+    ///         measure how long and where the order has stood at its current price and size, so a
+    ///         new price restarts them exactly as a relink would.
+    /// @dev The stamps share a slot with the queue position and the links, so they land in a slot
+    ///      the caller's prioritySeq write has already dirtied.
+    /// @param o The order, in the book, with its new limitPrice already written.
+    /// @param restedBlock The current L2 block; the low 32 bits are what the stamp holds.
+    /// @param indexPrice The index the premium is measured against; 0 stamps zero.
+    function restamp(BazaarTypes.Order storage o, uint64 restedBlock, uint256 indexPrice) internal {
+        o.restedBlock = uint32(restedBlock);
+        o.restedPremiumPpm = FundingLib.restedPremiumOf(o.isLong, o.limitPrice, indexPrice);
     }
 
     /// @notice Emit OrderUpdated for an order, reporting its stored state.

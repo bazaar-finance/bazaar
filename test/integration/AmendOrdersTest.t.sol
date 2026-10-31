@@ -5,6 +5,7 @@ import {IntegrationBase} from "./IntegrationBase.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {Vm} from "forge-std/Vm.sol";
 import {BazaarTypes} from "../../src/libraries/BazaarTypes.sol";
+import {FundingLib} from "../../src/libraries/FundingLib.sol";
 import {MetaTxLib} from "../../src/libraries/MetaTxLib.sol";
 import {OrderManagementLib} from "../../src/libraries/OrderManagementLib.sol";
 import {OrderBookLib} from "../../src/libraries/OrderBookLib.sol";
@@ -14,7 +15,9 @@ import {OrderView} from "../OrderView.sol";
 /// @notice amendOrders rewrites resting limit orders in place. An order keeps its id, its expiry
 ///         and its place in the owner's set, and takes a new price and size. A new price or a
 ///         larger size sends it to the back of its new level under a fresh queue position; a
-///         smaller size at the same price keeps its place. Up to two predecessor hints ride in
+///         smaller size at the same price keeps its place. A move whose new price and queue
+///         position still sort between the order's neighbours is written where the order stands;
+///         one that changes them relinks it, placed from up to two predecessor hints that ride in
 ///         the id word, with the order's old neighbours as the fallback anchor. The batch never
 ///         crosses the book and is all or nothing, and margin is judged once on the set the batch
 ///         leaves.
@@ -88,6 +91,10 @@ contract AmendOrdersTest is IntegrationBase {
         return OrderView.order(pair, orderId).prioritySeq;
     }
 
+    function _prev(uint256 orderId) internal view returns (uint64) {
+        return OrderView.order(pair, orderId).prevInBook;
+    }
+
     /// @dev Bids from the head down, as the book links them.
     function _bids() internal view returns (uint256[] memory ids) {
         (uint64 cur,, uint64 count,) = pair.book();
@@ -98,6 +105,33 @@ contract AmendOrdersTest is IntegrationBase {
             cur = _next(cur);
         }
         require(cur == 0, "bid list longer than its count");
+    }
+
+    /// @dev Asks from the head up, as the book links them.
+    function _asks() internal view returns (uint256[] memory ids) {
+        (, uint64 cur,, uint64 count) = pair.book();
+        ids = new uint256[](count);
+        for (uint256 i; i < count; ++i) {
+            require(cur != 0, "ask list shorter than its count");
+            ids[i] = cur;
+            cur = _next(cur);
+        }
+        require(cur == 0, "ask list longer than its count");
+    }
+
+    /// @dev Both heads, both counts and every member's prev and next, in one word, so two readings
+    ///      of the book's links compare at once.
+    function _links() internal view returns (bytes32 acc) {
+        (uint64 bidHead, uint64 askHead, uint64 bidCount, uint64 askCount) = pair.book();
+        acc = keccak256(abi.encode(bidHead, askHead, bidCount, askCount));
+        uint256[] memory ids = _bids();
+        for (uint256 i; i < ids.length; ++i) {
+            acc = keccak256(abi.encode(acc, ids[i], _prev(ids[i]), _next(ids[i])));
+        }
+        ids = _asks();
+        for (uint256 i; i < ids.length; ++i) {
+            acc = keccak256(abi.encode(acc, ids[i], _prev(ids[i]), _next(ids[i])));
+        }
     }
 
     /// @dev Two bids from alice (49k) and bob (48k), both funded well past the margin they need.
@@ -301,6 +335,147 @@ contract AmendOrdersTest is IntegrationBase {
             })
         );
         _amendAs(alice, _single(a, 48_500 * BAZAAR_SCALE, 2 * SIZE));
+    }
+
+    // ---------------------------- in place ----------------------------
+
+    /// @notice A reprice that still sorts between the order's neighbours is written where the
+    ///         order stands: every link, both heads and both counts read the same before and
+    ///         after, while the order carries the new price, the queue position the amendment
+    ///         drew and the block it was rewritten in.
+    function test_reprice_betweenItsNeighbours_isWrittenInPlace() public {
+        _deposit(alice, 20_000 * BAZAAR_SCALE);
+        _deposit(bob, 40_000 * BAZAAR_SCALE);
+        uint256 above = _placeLimit(bob, true, SIZE, 49_500 * BAZAAR_SCALE);
+        _roll(1);
+        uint256 a = _placeLimit(alice, true, SIZE, 49_000 * BAZAAR_SCALE);
+        _roll(1);
+        uint256 below = _placeLimit(bob, true, SIZE, 48_000 * BAZAAR_SCALE);
+        _roll(5);
+        bytes32 links = _links();
+        uint256 counter = lens.nextOrderId(address(pair));
+        uint32 restedAt = OrderView.order(pair, a).restedBlock;
+
+        _amendAs(alice, _single(a, 48_500 * BAZAAR_SCALE, SIZE));
+
+        assertEq(_links(), links, "no link, head or count changed");
+        assertEq(_prev(a), uint64(above));
+        assertEq(_next(a), uint64(below));
+        assertEq(_bidHead(), uint64(above));
+        assertEq(_bids().length, 3);
+        BazaarTypes.Order memory o = OrderView.order(pair, a);
+        assertEq(o.limitPrice, 48_500 * BAZAAR_SCALE, "the new price");
+        assertEq(o.prioritySeq, uint48(counter), "a fresh queue position all the same");
+        assertEq(lens.nextOrderId(address(pair)), counter + 1, "drawn from the counter");
+        assertEq(o.restedBlock, uint32(vm.getBlockNumber()), "rests from this block");
+        assertGt(o.restedBlock, restedAt);
+    }
+
+    /// @notice An in-place move restamps the order's exposure as a relink does: the block it was
+    ///         rewritten in, and the far-side premium of its new price against the amendment's
+    ///         index — the same stamp a relinked order lands with at that price.
+    function test_inPlaceMove_restampsExposureLikeARelink() public {
+        _deposit(alice, 40_000 * BAZAAR_SCALE);
+        _deposit(bob, 40_000 * BAZAAR_SCALE);
+        uint256 top = _placeLimit(bob, true, SIZE, 51_000 * BAZAAR_SCALE);
+        _roll(1);
+        uint256 a = _placeLimit(alice, true, SIZE, 50_200 * BAZAAR_SCALE);
+        _roll(1);
+        uint256 mid = _placeLimit(bob, true, SIZE, 49_000 * BAZAAR_SCALE);
+        _roll(1);
+        uint256 low = _placeLimit(alice, true, SIZE, 48_500 * BAZAAR_SCALE);
+        _roll(3);
+        bytes32 links = _links();
+
+        // Between top and mid still: in place.
+        _amendAs(alice, _single(a, 50_500 * BAZAAR_SCALE, SIZE));
+        assertEq(_links(), links, "written in place");
+        uint16 premium = FundingLib.restedPremiumOf(true, 50_500 * BAZAAR_SCALE, 50_000 * BAZAAR_SCALE);
+        assertGt(premium, 0, "fixture: a bid above the index");
+        assertEq(OrderView.order(pair, a).restedPremiumPpm, premium, "the new price's far-side premium");
+        assertEq(OrderView.order(pair, a).restedBlock, uint32(vm.getBlockNumber()));
+
+        // Past mid onto a's level: relinked behind a, with the same stamps.
+        _amendAs(alice, _single(low, 50_500 * BAZAAR_SCALE, SIZE));
+        assertEq(_bidHead(), uint64(top));
+        assertEq(_next(a), uint64(low), "relinked behind the order already at the level");
+        assertEq(_next(low), uint64(mid));
+        assertEq(OrderView.order(pair, low).restedPremiumPpm, premium, "the relink stamps the same premium");
+        assertEq(OrderView.order(pair, low).restedBlock, OrderView.order(pair, a).restedBlock);
+    }
+
+    /// @notice A reprice to the exact price of the order behind it does not keep the slot: at that
+    ///         price the order queues behind the incumbent, so it is relinked there. One tick short
+    ///         of that price it stays where it is.
+    function test_reprice_ontoTheNextLevel_queuesBehindItsIncumbent() public {
+        (uint256 a, uint256 b) = _twoBids();
+        bytes32 links = _links();
+        _amendAs(alice, _single(a, 48_001 * BAZAAR_SCALE, SIZE));
+        assertEq(_links(), links, "a tick above the next level: in place");
+        assertEq(_bidHead(), uint64(a));
+
+        uint256 counter = lens.nextOrderId(address(pair));
+        _amendAs(alice, _single(a, 48_000 * BAZAAR_SCALE, SIZE));
+        assertEq(_bidHead(), uint64(b), "the incumbent leads the level");
+        assertEq(_next(b), uint64(a), "the repriced order queues behind it");
+        assertEq(_prev(a), uint64(b));
+        assertEq(_next(a), 0);
+        assertEq(_seq(a), uint64(counter));
+        assertEq(_bids().length, 2);
+    }
+
+    /// @notice The head repriced to a better price is still the head: nothing around it changes,
+    ///         so it is written in place, under a fresh queue position.
+    function test_reprice_headToABetterPrice_staysHeadInPlace() public {
+        (uint256 a, uint256 b) = _twoBids();
+        bytes32 links = _links();
+        uint256 counter = lens.nextOrderId(address(pair));
+        _amendAs(alice, _single(a, 49_500 * BAZAAR_SCALE, SIZE));
+        assertEq(_links(), links);
+        assertEq(_bidHead(), uint64(a), "still the head");
+        assertEq(_next(a), uint64(b));
+        assertEq(_prev(b), uint64(a));
+        assertEq(_seq(a), uint64(counter), "the queue position advanced");
+        assertEq(OrderView.order(pair, a).limitPrice, 49_500 * BAZAAR_SCALE);
+    }
+
+    /// @notice An order alone on its side keeps its slot under any price inside the band.
+    function test_reprice_soleOrder_staysInPlace() public {
+        _deposit(alice, 20_000 * BAZAAR_SCALE);
+        uint256 a = _placeLimit(alice, true, SIZE, 49_000 * BAZAAR_SCALE);
+        bytes32 links = _links();
+        _amendAs(alice, _single(a, 40_000 * BAZAAR_SCALE, SIZE));
+        _amendAs(alice, _single(a, 60_000 * BAZAAR_SCALE, SIZE));
+        assertEq(_links(), links);
+        assertEq(_bidHead(), uint64(a));
+        assertEq(_prev(a), 0);
+        assertEq(_next(a), 0);
+        assertEq(_bids().length, 1);
+    }
+
+    /// @notice Growing an order that shares its price with no neighbour is written in place; once
+    ///         another order rests at its price behind it, growing again queues behind that order.
+    function test_grow_aloneAtItsPriceStays_sharedPriceQueuesBehind() public {
+        _deposit(alice, 40_000 * BAZAAR_SCALE);
+        _deposit(bob, 40_000 * BAZAAR_SCALE);
+        uint256 a = _placeLimit(alice, true, SIZE, 49_000 * BAZAAR_SCALE);
+        _roll(1);
+        uint256 b = _placeLimit(bob, true, SIZE, 48_000 * BAZAAR_SCALE);
+        bytes32 links = _links();
+        uint256 counter = lens.nextOrderId(address(pair));
+        _amendAs(alice, _single(a, 49_000 * BAZAAR_SCALE, 2 * SIZE));
+        assertEq(_links(), links, "alone at its price: in place");
+        assertEq(_seq(a), uint64(counter));
+        assertEq(OrderView.order(pair, a).size, 2 * SIZE);
+
+        _roll(1);
+        uint256 c = _placeLimit(bob, true, SIZE, 49_000 * BAZAAR_SCALE);
+        assertEq(_next(a), uint64(c), "fixture: an order at the same price behind it");
+        _amendAs(alice, _single(a, 49_000 * BAZAAR_SCALE, 3 * SIZE));
+        assertEq(_bidHead(), uint64(c), "the order already at the level leads it");
+        assertEq(_next(c), uint64(a), "the grown order queues behind");
+        assertEq(_next(a), uint64(b));
+        assertEq(_bids().length, 3);
     }
 
     /// @notice A relinked order finds its slot from its old neighbours, in either direction: down
@@ -904,25 +1079,59 @@ contract AmendOrdersTest is IntegrationBase {
             uint256 price = (40_000 + 500 * ((seed >> 8) % 20)) * BAZAAR_SCALE; // 40k..49.5k, no asks to cross
             uint256 size = SIZE / 4 + (SIZE / 4) * ((seed >> 16) % 8); // 0.025..0.2 BTC
             _amendAs(alice, _single(orderId, price, size));
-            _assertBidsWellFormed();
+            _assertSideWellFormed(true, 6);
         }
     }
 
-    function _assertBidsWellFormed() internal view {
-        uint256[] memory bids = _bids();
-        assertEq(bids.length, 6, "every order still rests");
+    /// @notice Alice's orders interleaved with bob's on both sides, amended at random to prices
+    ///         that land between his, onto them and past them: whether an amendment is written in
+    ///         place or relinks, both sides stay strictly sorted by price and then by queue
+    ///         position with reciprocal links, and each count equals its traversal's length.
+    function testFuzz_randomAmendments_amongOthersOrders_keepBothSidesWellFormed(uint256 seed) public {
+        _deposit(alice, 300_000 * BAZAAR_SCALE);
+        _deposit(bob, 300_000 * BAZAAR_SCALE);
+        uint256[6] memory mine;
+        for (uint256 i; i < 4; ++i) {
+            mine[i] = _placeLimit(alice, true, SIZE, (45_000 + 1_000 * i) * BAZAAR_SCALE);
+            _placeLimit(bob, true, SIZE, (45_500 + 1_000 * i) * BAZAAR_SCALE);
+            _roll(1);
+        }
+        mine[4] = _placeLimit(alice, false, SIZE, 53_000 * BAZAAR_SCALE);
+        mine[5] = _placeLimit(alice, false, SIZE, 54_000 * BAZAAR_SCALE);
+        _placeLimit(bob, false, SIZE, 53_500 * BAZAAR_SCALE);
+        _placeLimit(bob, false, SIZE, 54_500 * BAZAAR_SCALE);
+        for (uint256 step; step < 12; ++step) {
+            seed = uint256(keccak256(abi.encode(seed, step)));
+            uint256 pick = seed % 6;
+            // Bids 40k..49.5k and asks 52k..61.5k, in $500 steps so amendments land onto occupied
+            // levels as often as between them, and neither side ever reaches the other.
+            uint256 price = ((pick < 4 ? 40_000 : 52_000) + 500 * ((seed >> 8) % 20)) * BAZAAR_SCALE;
+            uint256 size = SIZE / 4 + (SIZE / 4) * ((seed >> 16) % 8);
+            _roll(1);
+            _amendAs(alice, _single(mine[pick], price, size));
+            _assertSideWellFormed(true, 8);
+            _assertSideWellFormed(false, 4);
+        }
+    }
+
+    /// @dev One side traverses to its count, every member on that side with reciprocal links, in
+    ///      strict order: better price first, then the earlier queue position.
+    function _assertSideWellFormed(bool isLong, uint256 expectedCount) internal view {
+        uint256[] memory ids = isLong ? _bids() : _asks();
+        assertEq(ids.length, expectedCount, "every order still rests");
         uint64 prev;
-        for (uint256 i; i < bids.length; ++i) {
-            BazaarTypes.Order memory o = OrderView.order(pair, bids[i]);
+        for (uint256 i; i < ids.length; ++i) {
+            BazaarTypes.Order memory o = OrderView.order(pair, ids[i]);
             assertEq(o.prevInBook, prev, "links are reciprocal");
             assertTrue(o.inBook);
+            assertEq(o.isLong, isLong, "on its side");
             if (i > 0) {
-                BazaarTypes.Order memory before = OrderView.order(pair, bids[i - 1]);
-                bool ordered = before.limitPrice > o.limitPrice
+                BazaarTypes.Order memory before = OrderView.order(pair, ids[i - 1]);
+                bool ordered = (isLong ? before.limitPrice > o.limitPrice : before.limitPrice < o.limitPrice)
                     || (before.limitPrice == o.limitPrice && before.prioritySeq < o.prioritySeq);
                 assertTrue(ordered, "sorted by price, then by queue position");
             }
-            prev = uint64(bids[i]);
+            prev = uint64(ids[i]);
         }
     }
 }

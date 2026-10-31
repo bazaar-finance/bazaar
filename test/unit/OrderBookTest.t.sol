@@ -36,6 +36,40 @@ contract OrderBookHarness {
         indexPrice = index;
     }
 
+    /// @dev A fresh queue position: the next counter value, as an amendment draws one.
+    function drawSeq() external returns (uint48) {
+        return uint48(nextOrderId++);
+    }
+
+    function prioritySeq(uint256 orderId) external view returns (uint48) {
+        return orders[orderId].prioritySeq;
+    }
+
+    function staysInPlace(uint256 orderId, uint256 newPrice, uint64 newSeq) external view returns (bool) {
+        return OrderBookLib.staysInPlace(orders, orders[orderId], newPrice, newSeq);
+    }
+
+    /// @dev A member takes a new price and queue position where it stands and is restamped, as an
+    ///      amendment whose slot survives the new key writes it.
+    function rewriteInPlace(uint256 orderId, uint256 newPrice, uint48 newSeq) external {
+        BazaarTypes.Order storage o = orders[orderId];
+        o.limitPrice = uint128(newPrice);
+        o.prioritySeq = newSeq;
+        OrderBookLib.restamp(o, uint64(block.number), indexPrice);
+    }
+
+    /// @dev The same change done as an unlink and an insert anchored on the old neighbours.
+    function relink(uint256 orderId, uint256 newPrice, uint48 newSeq) external {
+        BazaarTypes.Order storage o = orders[orderId];
+        BazaarTypes.MatchHints memory hints;
+        hints.pred3 = o.prevInBook;
+        hints.pred4 = o.nextInBook;
+        OrderBookLib.unlink(orders, book, orderId);
+        o.limitPrice = uint128(newPrice);
+        o.prioritySeq = newSeq;
+        OrderBookLib.insert(orders, book, orderId, hints, uint64(block.number), indexPrice);
+    }
+
     function insert(uint256 orderId, BazaarTypes.MatchHints calldata hints) external {
         OrderBookLib.insert(orders, book, orderId, hints, uint64(block.number), indexPrice);
     }
@@ -147,9 +181,9 @@ contract OrderBookTest is Test {
                 assertEq(next, 0, "tail terminator");
             }
             if (i > 0) {
-                // Strict ordering: better price first; equal price → older (lower) id first.
+                // Strict ordering: better price first; equal price → earlier queue position first.
                 if (price == prevPrice) {
-                    assertLt(uint256(prevId), got[i], "fifo tiebreak");
+                    assertLt(h.prioritySeq(prevId), h.prioritySeq(got[i]), "fifo tiebreak");
                 } else if (side) {
                     assertLt(price, prevPrice, "bid price ordering");
                 } else {
@@ -538,6 +572,206 @@ contract OrderBookTest is Test {
         h.unlink(b1);
         _assertList(true, _arr1(b2));
         _assertList(false, _arr2(a1, a2));
+    }
+
+    // -------------------- in-place rewrite --------------------
+
+    /// @notice A member keeps its slot under a new key exactly when its predecessor still sorts
+    ///         ahead of the key and its successor still behind it. The predecessor's own price
+    ///         keeps the slot — under the later queue position the order belongs behind it, where
+    ///         it already is — while the successor's price does not: there it belongs behind the
+    ///         successor too.
+    function test_staysInPlace_middleOrder() public {
+        uint256 b1 = _mk(true, 100 * P, 0);
+        uint256 b2 = _mk(true, 90 * P, uint64(b1));
+        uint256 b3 = _mk(true, 80 * P, uint64(b2));
+        uint64 seq = uint64(h.drawSeq());
+        assertTrue(h.staysInPlace(b2, 95 * P, seq), "between its neighbours' prices");
+        assertTrue(h.staysInPlace(b2, 85 * P, seq));
+        assertTrue(h.staysInPlace(b2, 100 * P, seq), "at the predecessor's price, behind it");
+        assertFalse(h.staysInPlace(b2, 80 * P, seq), "at the successor's price it belongs behind it");
+        assertFalse(h.staysInPlace(b2, 105 * P, seq), "ahead of the predecessor");
+        assertFalse(h.staysInPlace(b2, 75 * P, seq), "behind the successor");
+        assertFalse(h.staysInPlace(b3, 95 * P, seq), "the tail moved up past its predecessor");
+    }
+
+    /// @notice A missing neighbour never fails the test: the head keeps its slot under any better
+    ///         price, the tail under any worse one, and an order alone on its side under every
+    ///         price.
+    function test_staysInPlace_headTailAndSole() public {
+        uint256 b1 = _mk(true, 100 * P, 0);
+        uint256 b2 = _mk(true, 90 * P, uint64(b1));
+        uint256 a1 = _mk(false, 110 * P, 0);
+        uint64 seq = uint64(h.drawSeq());
+        assertTrue(h.staysInPlace(b1, 1_000 * P, seq), "the head improves in place");
+        assertTrue(h.staysInPlace(b1, 91 * P, seq));
+        assertFalse(h.staysInPlace(b1, 90 * P, seq), "onto the successor's level");
+        assertFalse(h.staysInPlace(b1, 1, seq), "past the successor");
+        assertTrue(h.staysInPlace(b2, 1, seq), "the tail worsens in place");
+        assertTrue(h.staysInPlace(b2, 100 * P, seq), "onto the predecessor's level, behind it");
+        assertFalse(h.staysInPlace(b2, 101 * P, seq), "ahead of the predecessor");
+        assertTrue(h.staysInPlace(a1, 1, seq), "alone on its side");
+        assertTrue(h.staysInPlace(a1, 1_000 * P, seq));
+    }
+
+    /// @notice Asks mirror bids: the lower price leads.
+    function test_staysInPlace_asksMirror() public {
+        uint256 a1 = _mk(false, 100 * P, 0);
+        uint256 a2 = _mk(false, 110 * P, uint64(a1));
+        uint256 a3 = _mk(false, 120 * P, uint64(a2));
+        uint64 seq = uint64(h.drawSeq());
+        assertTrue(h.staysInPlace(a2, 105 * P, seq));
+        assertTrue(h.staysInPlace(a2, 115 * P, seq));
+        assertTrue(h.staysInPlace(a2, 100 * P, seq), "at the predecessor's price, behind it");
+        assertFalse(h.staysInPlace(a2, 120 * P, seq), "at the successor's price");
+        assertFalse(h.staysInPlace(a2, 95 * P, seq));
+        assertFalse(h.staysInPlace(a2, 125 * P, seq));
+        assertFalse(h.staysInPlace(a3, 105 * P, seq));
+    }
+
+    /// @notice An in-place rewrite stamps what a link stamps: the current block, and the far-side
+    ///         premium of the new price against the index — the same values a fresh order linked
+    ///         at that price receives.
+    function test_rewriteInPlace_restampsLikeALink() public {
+        h.setIndex(100 * P);
+        uint256 b1 = _mk(true, 100 * P, 0);
+        assertEq(h.restedPremiumPpm(b1), 0, "at the index: no premium");
+        uint32 linkedAt = h.restedBlock(b1);
+        vm.roll(vm.getBlockNumber() + 7);
+
+        h.rewriteInPlace(b1, 101 * P, h.drawSeq());
+
+        assertEq(h.restedBlock(b1), uint32(vm.getBlockNumber()), "rests from the rewrite's block");
+        assertGt(h.restedBlock(b1), linkedAt);
+        assertEq(h.restedPremiumPpm(b1), FundingLib.restedPremiumOf(true, 101 * P, 100 * P), "the new price's premium");
+        uint256 fresh = _mk(true, 101 * P, 0);
+        assertEq(h.restedPremiumPpm(fresh), h.restedPremiumPpm(b1), "what a link stamps at that price");
+        assertEq(h.restedBlock(fresh), h.restedBlock(b1));
+        _assertList(true, _arr2(b1, fresh));
+    }
+
+    /// @notice Written in place, a member whose slot survives leaves every stored field of every
+    ///         order, both heads and both counts exactly as an unlink and an insert would: the
+    ///         middle, head and tail of the bids and the tail of the asks, and a move onto the
+    ///         predecessor's level.
+    function test_rewriteInPlace_leavesTheBookAsARelinkWould() public {
+        OrderBookHarness a = new OrderBookHarness();
+        OrderBookHarness b = new OrderBookHarness();
+        _ladder(a);
+        _ladder(b);
+        assertTrue(_moveBoth(a, b, 2, 95 * P, 5), "between its neighbours");
+        assertTrue(_moveBoth(a, b, 1, 105 * P, 5), "the head improves");
+        assertTrue(_moveBoth(a, b, 3, 70 * P, 5), "the tail worsens");
+        assertTrue(_moveBoth(a, b, 5, 130 * P, 5), "the ask tail worsens");
+        assertTrue(_moveBoth(a, b, 2, 105 * P, 5), "onto the predecessor's level, behind it");
+        assertFalse(_moveBoth(a, b, 1, 90 * P, 5), "past its successor: relinked");
+        uint256[] memory bids = b.traverse(true);
+        assertEq(bids.length, 3);
+        assertEq(bids[0], 2);
+        assertEq(bids[1], 1);
+        assertEq(bids[2], 3);
+        _assertSorted(b, true);
+        _assertSorted(b, false);
+    }
+
+    /// @notice Under random ladders and random moves, writing in place whenever the slot survives
+    ///         leaves the book identical to relinking every time.
+    function testFuzz_rewriteInPlace_equalsRelink(uint256 seed) public {
+        OrderBookHarness a = new OrderBookHarness();
+        OrderBookHarness b = new OrderBookHarness();
+        a.setIndex(4 * P);
+        b.setIndex(4 * P);
+        uint256 n = 3 + seed % 8;
+        for (uint256 i; i < n; ++i) {
+            seed = uint256(keccak256(abi.encode(seed, i)));
+            bool side = seed % 2 == 0;
+            uint256 price = ((seed / 2) % 6 + 1) * P;
+            uint256 id = a.create(side, price);
+            assertEq(b.create(side, price), id, "the harnesses number in step");
+            a.insert(id, _hints(0));
+            b.insert(id, _hints(0));
+        }
+        for (uint256 m; m < 4; ++m) {
+            seed = uint256(keccak256(abi.encode(seed, "move", m)));
+            _moveBoth(a, b, 1 + seed % n, ((seed / 8) % 8 + 1) * P, n);
+        }
+        _assertSorted(b, true);
+        _assertSorted(b, false);
+    }
+
+    /// @dev Three bids at 100, 90 and 80 (ids 1-3) and two asks at 110 and 120 (ids 4-5), with the
+    ///      index at 95 so the stamps carry premiums.
+    function _ladder(OrderBookHarness hh) internal {
+        hh.setIndex(95 * P);
+        uint256 b1 = hh.create(true, 100 * P);
+        hh.insert(b1, _hints(0));
+        uint256 b2 = hh.create(true, 90 * P);
+        hh.insert(b2, _hints(uint64(b1)));
+        uint256 b3 = hh.create(true, 80 * P);
+        hh.insert(b3, _hints(uint64(b2)));
+        uint256 a1 = hh.create(false, 110 * P);
+        hh.insert(a1, _hints(0));
+        uint256 a2 = hh.create(false, 120 * P);
+        hh.insert(a2, _hints(uint64(a1)));
+    }
+
+    /// @dev Apply one move to both harnesses under the same fresh queue position — `a` always by
+    ///      relink, `b` in place when its slot survives — a block later than the last, and compare
+    ///      their whole state over orders 1..n. Returns whether the move was written in place.
+    function _moveBoth(OrderBookHarness a, OrderBookHarness b, uint256 id, uint256 price, uint256 n)
+        internal
+        returns (bool inPlace)
+    {
+        vm.roll(vm.getBlockNumber() + 1);
+        uint48 seq = a.drawSeq();
+        assertEq(b.drawSeq(), seq, "the harnesses draw in step");
+        inPlace = b.staysInPlace(id, price, seq);
+        a.relink(id, price, seq);
+        if (inPlace) {
+            b.rewriteInPlace(id, price, seq);
+        } else {
+            b.relink(id, price, seq);
+        }
+        assertEq(_bookState(b, n), _bookState(a, n), "the book reads the same either way");
+    }
+
+    /// @dev Every field the book writes on an order, in one word.
+    function _nodeState(OrderBookHarness hh, uint256 id) internal view returns (bytes32) {
+        (bool inBook, uint64 prev, uint64 next, uint256 price, bool isLong) = hh.node(id);
+        return keccak256(
+            abi.encode(
+                inBook, prev, next, price, isLong, hh.prioritySeq(id), hh.restedBlock(id), hh.restedPremiumPpm(id)
+            )
+        );
+    }
+
+    /// @dev Both heads, both counts and every order 1..n, in one word.
+    function _bookState(OrderBookHarness hh, uint256 n) internal view returns (bytes32 acc) {
+        (uint64 bidHead, uint64 askHead, uint64 bidCount, uint64 askCount) = hh.heads();
+        acc = keccak256(abi.encode(bidHead, askHead, bidCount, askCount));
+        for (uint256 id = 1; id <= n; ++id) {
+            acc = keccak256(abi.encode(acc, _nodeState(hh, id)));
+        }
+    }
+
+    /// @dev One side of `hh` traverses to its count with reciprocal links, strictly sorted by price
+    ///      and then by queue position.
+    function _assertSorted(OrderBookHarness hh, bool side) internal view {
+        uint256[] memory got = hh.traverse(side);
+        uint64 prevId;
+        for (uint256 i; i < got.length; ++i) {
+            (bool inBook, uint64 prev,, uint256 price, bool isLong) = hh.node(got[i]);
+            assertTrue(inBook && isLong == side, "a member of this side");
+            assertEq(prev, prevId, "prev reciprocity");
+            if (i > 0) {
+                (,,, uint256 prevPrice,) = hh.node(prevId);
+                bool ordered = price == prevPrice
+                    ? hh.prioritySeq(prevId) < hh.prioritySeq(got[i])
+                    : (side ? price < prevPrice : price > prevPrice);
+                assertTrue(ordered, "strictly sorted");
+            }
+            prevId = uint64(got[i]);
+        }
     }
 
     // -------------------- fuzz: random ops vs a reference model --------------------

@@ -155,7 +155,13 @@ amendment that fails reverts the whole batch.
   keeps its place, since it takes nothing from anyone behind it. The place is carried by `prioritySeq`,
   which equals the order's id until an amendment moves it and then takes the next value from the id
   counter — so ids have gaps where amendments (and keeper-armed StopLimits, see
-  [trigger orders](#order-types)) drew values, and no two resting orders can ever tie.
+  [trigger orders](#order-types)) drew values, and no two resting orders can ever tie. When the new
+  price and queue position still sort between the order's current neighbours — a requote by less
+  than the gap to the next order on its side — the order is rewritten where it stands and the
+  book's links are not touched: a side is strictly sorted with no ties, so the slot is unique and
+  a relink would rebuild exactly the links that are there. Only a move that changes the order's
+  neighbours relinks it, and a move onto a price another order already rests at always does,
+  since the order queues behind it.
 - **Exposure.** The same split applies to the order's two exposure stamps — the block it entered the
   book at its current price and size, and how far on the far side of the index it stood then — which
   decide how much of a fill against it enters the [mark price](funding.md#mark-price) and at what
@@ -195,9 +201,11 @@ amendment that fails reverts the whole batch.
   happen, so no health check runs.
 - **Hints.** Insertion hints are optional and ride inside the id word: bits 64–127 and 128–191 each
   name an order to rest directly behind at the new price (`BazaarPairLens.findPredecessor` finds it,
-  `amendIdWord` packs it), and the top 64 bits must be zero. The caller's hints lead the placement
-  and the order's old neighbours follow as the fallback anchor, so a requote by a few ticks needs no
-  hint while a jump across the book takes one. Every candidate is verified against the real
+  `amendIdWord` packs it), and the top 64 bits must be zero. They are consulted only when the move
+  changes the order's neighbours; a move that keeps them is written in place and ignores them. The
+  caller's hints lead the placement and the order's old neighbours follow as the fallback anchor,
+  so a requote by a few ticks needs no hint while a jump across the book takes one. Every
+  candidate is verified against the real
   neighbours before linking — a hint can fail a placement, never misplace an order — and when none
   brackets the slot, a repair walk of up to `MAX_WALK_STEPS` (32) nodes starts from the first live
   candidate; a slot further than that from it is refused (`OrderBookLib__HintRepairExhausted`),

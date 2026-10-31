@@ -525,6 +525,14 @@ library OrderManagementLib {
     ///      amendments landing on one level queue in the order the caller listed them, and no
     ///      value is ever shared between an order's id and another's position.
     ///
+    ///      A move whose new price and queue position still sort between the order's current
+    ///      neighbours is written where the order stands (OrderBookLib.staysInPlace): a side is
+    ///      strictly sorted and no two orders share a queue position, so an unlink and an insert
+    ///      would resolve to the same slot and rebuild the same links, head and count, and the
+    ///      order's exposure stamps are restarted as a link restarts them. Only a move that
+    ///      changes the order's neighbours relinks it; a move onto a level another order rests at
+    ///      always does, since the fresh queue position puts the order behind every order there.
+    ///
     ///      A relinked order is placed from up to two predecessor hints the caller packs into the
     ///      id word, with its old neighbours as fallback candidates. OrderBookLib.locate verifies
     ///      every candidate against the real neighbours before linking, so a hint can fail a
@@ -600,9 +608,10 @@ library OrderManagementLib {
         );
     }
 
-    /// @dev One amendment: validate, then rewrite the order in place and, when it loses its
-    ///      place, relink it, stamping its far-side premium against `stampIndex` (0: none).
-    ///      Returns the id counter after any queue position drawn.
+    /// @dev One amendment: validate, then rewrite the order in place and, when its slot does not
+    ///      survive the new price and queue position, relink it. A move stamps the order's far-side
+    ///      premium against `stampIndex` (0: none) either way. Returns the id counter after any
+    ///      queue position drawn.
     function _amendOne(
         mapping(uint256 => BazaarTypes.Order) storage orders,
         BazaarTypes.OrderBook storage book,
@@ -674,39 +683,52 @@ library OrderManagementLib {
             // queued behind it. Below the stored size, so inside the field.
             o.size = uint128(newSize);
         } else {
-            // A move links the order into the book anew, and every link must leave the order the
-            // lifetime a new one is created with. Without the floor an order could rest deep in
-            // the book and move to the front in its last live block: one block later it is a
-            // dead node at the head, which the next walk spends a step removing, so a wall of
-            // them could exhaust a taker's or an unload's step budget at the cost of one block of
-            // exposure each.
+            // A move is a new claim on the book, and every move must leave the order the lifetime
+            // a new one is created with. Without the floor an order could rest deep in the book
+            // and move to the front in its last live block: one block later it is a dead node at
+            // the head, which the next walk spends a step removing, so a wall of them could
+            // exhaust a taker's or an unload's step budget at the cost of one block of exposure
+            // each. The floor is judged on the amendment, not on where the order lands, so the
+            // caller faces one rule.
             uint64 minExpiry = params.currentBlock + MIN_ORDER_LIFETIME_BLOCKS;
             if (o.expiryBlock < minExpiry) {
                 revert OrderManagementLib__AmendTooCloseToExpiry(orderId, o.expiryBlock, minExpiry);
             }
             // A new price, or more size at the same one, is a new claim on the level: the order
             // goes to the back behind every order resting there, under a fresh queue position,
-            // and the relink restarts its exposure and re-measures its far-side premium
+            // and the move restarts its exposure and re-measures its far-side premium
             // (Order.restedBlock, Order.restedPremiumPpm) — a quote moved to a new price, or
             // grown, has not stood at that price and size for anyone to take. The reduction
             // above keeps all three: what remains was there all along.
-            // The caller's hints lead, so a jump across the book walks from where the caller says
-            // the slot is; the old neighbours, still resting, follow as the fallback anchor, so a
-            // requote by a few ticks with no hint, or a dead one, still walks from close by.
-            BazaarTypes.MatchHints memory hints;
-            hints.pred = uint64(idWord >> 64);
-            hints.pred2 = uint64(idWord >> 128);
-            hints.pred3 = o.prevInBook;
-            hints.pred4 = o.nextInBook;
-            OrderBookLib.unlink(orders, book, orderId);
-            o.limitPrice = SafeCast.toUint128(newPrice);
-            o.size = SafeCast.toUint128(newSize);
             // Counter values stay far below 2^48 (BazaarTypes.Order).
-            o.prioritySeq = uint48(seqCounter);
+            uint48 seq = uint48(seqCounter);
             unchecked {
                 ++seqCounter;
             }
-            OrderBookLib.insert(orders, book, orderId, hints, params.currentBlock, stampIndex);
+            if (OrderBookLib.staysInPlace(orders, o, newPrice, seq)) {
+                // The new key still sorts between the order's neighbours, so an unlink and an
+                // insert would rebuild the links, head and count exactly as they stand: the key
+                // and the stamps are written where the order is, and the hints go unused.
+                o.limitPrice = SafeCast.toUint128(newPrice);
+                o.size = SafeCast.toUint128(newSize);
+                o.prioritySeq = seq;
+                OrderBookLib.restamp(o, params.currentBlock, stampIndex);
+            } else {
+                // The caller's hints lead, so a jump across the book walks from where the caller
+                // says the slot is; the old neighbours, still resting, follow as the fallback
+                // anchor, so a requote by a few ticks with no hint, or a dead one, still walks
+                // from close by.
+                BazaarTypes.MatchHints memory hints;
+                hints.pred = uint64(idWord >> 64);
+                hints.pred2 = uint64(idWord >> 128);
+                hints.pred3 = o.prevInBook;
+                hints.pred4 = o.nextInBook;
+                OrderBookLib.unlink(orders, book, orderId);
+                o.limitPrice = SafeCast.toUint128(newPrice);
+                o.size = SafeCast.toUint128(newSize);
+                o.prioritySeq = seq;
+                OrderBookLib.insert(orders, book, orderId, hints, params.currentBlock, stampIndex);
+            }
         }
         OrderBookLib.emitOrderUpdated(
             params.pairId, orderId, o, BazaarTypes.OrderAction.Amended, BazaarTypes.CancelReason.None

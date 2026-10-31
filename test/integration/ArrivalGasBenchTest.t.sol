@@ -296,6 +296,29 @@ contract ArrivalGasBenchTest is IntegrationBase {
         emit log_named_uint("amendOrders: reprice 10 resting orders", used);
         emit log_named_uint("amendOrders: per order of the ten", used / 10);
     }
+
+    /// @notice Ten resting bids twenty dollars apart, each moved down ten dollars in one call:
+    ///         every order still sorts between its neighbours, so each is written where it stands.
+    function test_gas_amendOrders_repriceTen_inPlace() public {
+        _deposit(alice, 600_000 * BAZAAR_SCALE);
+        uint256[] memory ids = new uint256[](10);
+        for (uint256 i; i < 10; ++i) {
+            ids[i] = _placeLimit(alice, true, BTC / 100, (49_000 - 20 * i) * BAZAAR_SCALE);
+        }
+        uint256[] memory words = new uint256[](30);
+        for (uint256 i; i < 10; ++i) {
+            words[3 * i] = ids[i];
+            words[3 * i + 1] = (48_990 - 20 * i) * BAZAAR_SCALE;
+            words[3 * i + 2] = BTC / 100;
+        }
+        bytes[] memory pu = _freshPrice();
+        vm.prank(alice);
+        uint256 g0 = gasleft();
+        pair.amendOrders(words, pu, 0, 0, 0, "", "");
+        uint256 used = g0 - gasleft();
+        emit log_named_uint("amendOrders: reprice 10 resting orders in place", used);
+        emit log_named_uint("amendOrders: per order of the ten in place", used / 10);
+    }
 }
 
 /// @title UserOrderCountColdBench
