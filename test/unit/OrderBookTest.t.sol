@@ -674,29 +674,42 @@ contract OrderBookTest is Test {
         _assertSorted(b, false);
     }
 
-    /// @notice Under random ladders and random moves, writing in place whenever the slot survives
-    ///         leaves the book identical to relinking every time.
+    /// @notice Under full sides and random moves, writing in place whenever the slot survives
+    ///         leaves the book identical to relinking every time. Each side holds 32 orders on 16
+    ///         levels of two; a move picks any order and any price from below the bids' worst
+    ///         level to above the asks' worst, so it lands between levels, onto a level — ahead
+    ///         of, behind or between its two orders — or past either end of its side.
     function testFuzz_rewriteInPlace_equalsRelink(uint256 seed) public {
         OrderBookHarness a = new OrderBookHarness();
         OrderBookHarness b = new OrderBookHarness();
-        a.setIndex(4 * P);
-        b.setIndex(4 * P);
-        uint256 n = 3 + seed % 8;
-        for (uint256 i; i < n; ++i) {
-            seed = uint256(keccak256(abi.encode(seed, i)));
-            bool side = seed % 2 == 0;
-            uint256 price = ((seed / 2) % 6 + 1) * P;
-            uint256 id = a.create(side, price);
-            assertEq(b.create(side, price), id, "the harnesses number in step");
-            a.insert(id, _hints(0));
-            b.insert(id, _hints(0));
-        }
-        for (uint256 m; m < 4; ++m) {
-            seed = uint256(keccak256(abi.encode(seed, "move", m)));
-            _moveBoth(a, b, 1 + seed % n, ((seed / 8) % 8 + 1) * P, n);
+        a.setIndex(50 * P);
+        b.setIndex(50 * P);
+        _fullSides(a);
+        _fullSides(b);
+        for (uint256 m; m < 12; ++m) {
+            seed = uint256(keccak256(abi.encode(seed, m)));
+            _moveBoth(a, b, 1 + seed % 64, (30 + (seed / 64) % 90) * P, 64);
         }
         _assertSorted(b, true);
         _assertSorted(b, false);
+    }
+
+    /// @dev 32 bids on the 16 levels 66, 64, …, 36 and 32 asks on the 16 levels 80, 82, …, 110,
+    ///      two orders per level, ids 1-64, each linked behind the one placed before it. With the
+    ///      index at 50 the bids above it carry a far-side premium and the rest stamp zero.
+    function _fullSides(OrderBookHarness hh) internal {
+        uint64 pred;
+        for (uint256 i; i < 32; ++i) {
+            uint256 id = hh.create(true, (66 - 2 * (i / 2)) * P);
+            hh.insert(id, _hints(pred));
+            pred = uint64(id);
+        }
+        pred = 0;
+        for (uint256 i; i < 32; ++i) {
+            uint256 id = hh.create(false, (80 + 2 * (i / 2)) * P);
+            hh.insert(id, _hints(pred));
+            pred = uint64(id);
+        }
     }
 
     /// @dev Three bids at 100, 90 and 80 (ids 1-3) and two asks at 110 and 120 (ids 4-5), with the
