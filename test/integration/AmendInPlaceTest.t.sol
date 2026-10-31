@@ -159,6 +159,10 @@ contract AmendInPlaceTest is AmendTestBase {
     ///         levels, onto them — her own included — and past either end. Whether an amendment is
     ///         written in place or relinks, both sides stay strictly sorted by price and then by
     ///         queue position with reciprocal links, and each count equals its traversal's length.
+    ///         Each run builds 64 orders and checks both sides after every amendment, so it runs
+    ///         fewer times than the suite default; the order book's differential fuzz carries the
+    ///         equivalence at full depth.
+    /// forge-config: default.fuzz.runs = 64
     function testFuzz_randomAmendments_amongOthersOrders_keepBothSidesWellFormed(uint256 seed) public {
         _deposit(alice, 500_000 * BAZAAR_SCALE);
         _deposit(bob, 500_000 * BAZAAR_SCALE);
