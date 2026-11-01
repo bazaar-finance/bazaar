@@ -39,7 +39,7 @@ the disagreement as a finding.
 |---|---|
 | Repository | https://github.com/bazaar-finance/bazaar |
 | Tag | `v1.0.0-rc1` |
-| Commit | `<hash of the commit that carries the Pyth Core switch>` |
+| Commit | `182d354c01458bbcda8db5ce67a177520048d787` |
 | Target chain | Arbitrum One (chain id 42161) |
 | Compiler | solc 0.8.34 |
 | Optimizer | on, `optimizer_runs = 150` for every contract |
