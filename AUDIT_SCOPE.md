@@ -39,7 +39,7 @@ the disagreement as a finding.
 |---|---|
 | Repository | https://github.com/bazaar-finance/bazaar |
 | Tag | `v1.0.0-rc1` |
-| Commit | `<hash of the commit that carries the current changes>` |
+| Commit | `<hash of the commit that carries the Pyth Core switch>` |
 | Target chain | Arbitrum One (chain id 42161) |
 | Compiler | solc 0.8.34 |
 | Optimizer | on, `optimizer_runs = 150` for every contract |
@@ -59,8 +59,7 @@ taken at this commit.
 - `BazaarOracle` (Pyth adapter and composite-feed registry), `BazaarPairTerminator` and
   `BazaarPairLens` are protocol-wide singletons.
 - Arbitrum One dependency addresses, as configured in `script/HelperConfig.s.sol`: Pyth
-  `0xe15357fB7ab31E091583b9c4b4135BB2f176f38e`, native USDC
-  `0xaf88d065e77c8cC2239327C5EDb3A432268e5831`, UMA OptimisticOracleV3
+  Core `0xff1a0f4744e8582DF1aE09D5611b887B6a12925C`, native USDC `0xaf88d065e77c8cC2239327C5EDb3A432268e5831`, UMA OptimisticOracleV3
   `0xa6147867264374F324524E30C02C331cF28aa879`.
 
 ### Externally linked libraries
@@ -343,8 +342,9 @@ How it is used:
   on the stale path, the pair settles at its last stored price, never at Pyth's permissionlessly
   writable cache.
 
-Trusted: Pyth's publishers and attestation for the price and confidence values; the Pyth contract
-at the immutable `BazaarOracle.pyth` address (Pyth's own governance can upgrade it); availability of
+Trusted: Pyth's publishers and attestation for the price and confidence values; the Pyth Core
+contract at the immutable `BazaarOracle.pyth` address (Pyth's own governance can upgrade it; see
+section 9, item 28); availability of
 signed updates off-chain for keepers and frontends, which is a liveness rather than a safety
 assumption. Defended against: stale and future-dated prices, wide confidence, tick-picking from
 the cache or from a batch of updates at termination, composite re-registration, and a feed that
@@ -795,38 +795,48 @@ without a new consequence (a larger impact, a cheaper path, or a broken bound) a
     yes-voters even if the DVM upheld the claim (unless the vote met a cutoff UMA had already
     verified). Accepted: it needs a USDC-blacklisted bond recipient, and its cost falls on that
     claim and its voters, not on the pair.
-28. **Deployment-environment checks the repository cannot make.** The build targets `cancun`
-    (`MCOPY` and transient storage), which Arbitrum One supports since ArbOS 20; the Arbitrum Sepolia
-    rehearsal is the planned confirmation. `DeployBazaar` probes the USDC, Pyth and OOv3 addresses
-    for code, distinctness, decimals and live calls before broadcasting, but a wrong-but-live address
-    of the right shape (for example bridged USDC.e, which also has 6 decimals) is detectable only by
-    reading the literals against the issuers' published lists.
+28. **The Pyth contract address is immutable.** `BazaarOracle.pyth` is set at deployment to Pyth Core
+    (`0xff1a0f4744e8582DF1aE09D5611b887B6a12925C`), the original Arbitrum One contract, which Pyth upgraded in
+    place in August 2026. Pyth's list also names a second contract with the same interface and separate
+    storage, Pyth Core Compatible (`0xe15357fB7ab31E091583b9c4b4135BB2f176f38e`), which Bazaar does not use,
+    and it does not say how long it will maintain either. If Pyth Core stopped accepting updates, pairs
+    could store no new price: 24/7 pairs would halt, session pairs would stay on their stale fallback,
+    and markets would wind down through the UMA claim category for a Pyth contract migration or, after
+    `ORACLE_DEAD_THRESHOLD`, `terminateStalePair`; new listings would need a new deployment. Accepted:
+    there is no upgrade path by design, and the termination paths are the way out.
+29. **Deployment-environment checks still to run.** The build targets `cancun` (`MCOPY` and transient
+    storage), which Arbitrum One supports since ArbOS 20; the Arbitrum Sepolia rehearsal is the
+    planned confirmation. `DeployBazaar` probes the USDC, Pyth and OOv3 addresses for code,
+    distinctness, decimals and live calls before broadcasting, but a wrong-but-live address of the
+    right shape (for example bridged USDC.e, which also has 6 decimals) is detectable only by reading
+    the literals against the issuers' published lists. All three matched those lists on 2026-11-01;
+    they have to be read again before a mainnet deployment.
 
 ### Accepted residuals of fixed issues
 
-29. **In-band vault unloads fill at once.** Fills inside the unload band (the lower of the maintenance
+30. **In-band vault unloads fill at once.** Fills inside the unload band (the lower of the maintenance
     rate and `LIQ_MAX_SLIPPAGE_BP`, 5%) are immediate, so whoever wins the liquidation race can also
     buy the seized inventory at the band edge; beyond the edge the floor opens toward the
     fund-neutral price only over `UNLOAD_FLOOR_DECAY` (3 minutes), and fills that cost the fund stay
     within its headroom. The extraction is bounded by the band.
-30. **The ADL reserve is sized on live open interest during a pair's first day.**
+31. **The ADL reserve is sized on live open interest during a pair's first day.**
     `RiskParamsLib.reserveOiSizeOf` takes the lower of live open interest and its trailing minimum
     over `MMR_GRACE_PERIOD`, and live open interest alone until a sampled interval is that old, so a
     new pair's reserve can be inflated with wash open interest, and open interest held for a day
     counts in full.
-31. **The margin rate can be lifted for a minute by a wash opened just before a recompute.** Open
+32. **The margin rate can be lifted for a minute by a wash opened just before a recompute.** Open
     interest opened before the next post-cooldown recompute enters the stored IMR for up to
     `IMR_UPDATE_COOLDOWN`; inside a cooldown `liquidate` can be more lenient than ADL or withdrawals,
     never stricter, and past it `liquidate` judges at the live rate, which can sit above the stored
     rate withdrawals read until the next refresh. Positions opened during a genuine rise are
     maintained at the lagged rate for up to a day.
-32. **A netting's reward can bring an ADL window forward.** The 2 bp netting reward is paid from free
+33. **A netting's reward can bring an ADL window forward.** The 2 bp netting reward is paid from free
     capital and is not counted by `nettingAffordable`, so it can open a window earlier by what it
     pays.
 
 ### Test-suite limits
 
-33. **The stateful suite is not shown to reach realized bad debt.** The handler exercises funding
+34. **The stateful suite is not shown to reach realized bad debt.** The handler exercises funding
     carry under held inventory (`accrueFunding`) and records the deepest deficit a sequence books
     (`ghostMaxDeficit`), but no assertion reads it, so whether a fuzzed sequence reaches the bad-debt
     regime is unmeasured; that regime is pinned by deterministic tests.

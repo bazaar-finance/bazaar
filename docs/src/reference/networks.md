@@ -22,7 +22,7 @@ External dependencies on Arbitrum One:
 
 | Contract | Address |
 |---|---|
-| Pyth | `0xe15357fB7ab31E091583b9c4b4135BB2f176f38e` |
+| Pyth Core | `0xff1a0f4744e8582DF1aE09D5611b887B6a12925C` |
 | USDC (native) | `0xaf88d065e77c8cC2239327C5EDb3A432268e5831` |
 | UMA Optimistic Oracle V3 | `0xa6147867264374F324524E30C02C331cF28aa879` |
 
@@ -44,7 +44,7 @@ External dependencies on Arbitrum Sepolia:
 
 | Contract | Address |
 |---|---|
-| Pyth | `0x0B73614636C855Bf23F342F307FB981A3e47f42B` |
+| Pyth Core | `0x4374e5a8b9C22271E9EB878A2AA31DE97DF15DAF` |
 | USDC (testnet) | `0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d` |
 | UMA OOv3 | **mock** (`OwnedMockOptimisticOracleV3`), deployed by the script and owned by the deploying account, which alone can force-settle assertions, resolve disputes, and set the identifier whitelist and minimum bond (Bazaar's assertions set their own liveness periods). UMA's own Arbitrum Sepolia OOv3 is not used: it does not accept Circle's test USDC as bond collateral, and its stand-in DVM lets anyone resolve a dispute |
 

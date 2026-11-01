@@ -48,15 +48,17 @@ contract HelperConfig is Script {
     ///        protocol did not intend and could never migrate off. Both happen to carry 6 decimals,
     ///        so the deploy-time decimals probe does not separate them — this is the one entry that
     ///        has to be read character by character.
-    ///      - `pythFeed` must be the Pyth Core contract for Arbitrum One from Pyth's own EVM
-    ///        contract-address list. Pyth has cut over to a new deployment before; an address that
-    ///        was right for a prior release is not evidence about the current one.
+    ///      - `pythFeed` must be the contract Pyth's own EVM contract-address list names Pyth Core
+    ///        for Arbitrum One, not the Pyth Core Compatible contract beside it. The two share an
+    ///        interface but not storage, so a price posted to one cannot be read from the other.
+    ///        Pyth has cut over to a new deployment before; an address that was right for a prior
+    ///        release is not evidence about the current one.
     ///      - `optimisticOracleV3` must be UMA's OptimisticOracleV3 for Arbitrum One. UMA's Finder
     ///        is reached through it at runtime rather than configured here, so this address alone
     ///        determines which UMA deployment adjudicates every listing and termination.
     function getArbitrumMainnetConfig() public pure returns (NetworkConfig memory) {
         return NetworkConfig({
-            pythFeed: 0xe15357fB7ab31E091583b9c4b4135BB2f176f38e,
+            pythFeed: 0xff1a0f4744e8582DF1aE09D5611b887B6a12925C,
             usdcContract: 0xaf88d065e77c8cC2239327C5EDb3A432268e5831,
             optimisticOracleV3: 0xa6147867264374F324524E30C02C331cF28aa879,
             name: "Arbitrum-Mainnet"
@@ -90,7 +92,7 @@ contract HelperConfig is Script {
             vm.stopBroadcast();
 
             return NetworkConfig({
-                pythFeed: 0x0B73614636C855Bf23F342F307FB981A3e47f42B,
+                pythFeed: 0x4374e5a8b9C22271E9EB878A2AA31DE97DF15DAF,
                 usdcContract: 0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d,
                 optimisticOracleV3: address(mockOO),
                 name: "Arbitrum-Sepolia"
