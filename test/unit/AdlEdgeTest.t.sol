@@ -198,6 +198,13 @@ contract AdlEdgeHarness {
         return feeEscrow.claimable[who];
     }
 
+    /// @dev A deficit already on the books. BazaarPair.executeAdl's entry health check sends a pair
+    ///      that carries one to termination before any batch runs, so only a direct call reaches
+    ///      the batch with it.
+    function setDeficit(uint256 x) external {
+        vault.deficit = x;
+    }
+
     function deficit() external view returns (uint256) {
         return vault.deficit;
     }
@@ -346,6 +353,12 @@ contract AdlEdgeTest is Test {
         out[0] = a;
     }
 
+    /// @dev The keeper rate, 2 bp, on `size` valued at `price`: what the inventory leg pays its
+    ///      executor for a close that averts no more than a fifth of its notional.
+    function _rate(uint256 size, uint256 price) internal pure returns (uint256) {
+        return Math.mulDiv(Math.mulDiv(size, price, SCALE), 2, 10_000);
+    }
+
     // ---------------- partial close of an oversized winner ----------------
 
     /// @notice A winner larger than the vault's pending exposure is PARTIALLY closed: pro-rata
@@ -397,17 +410,18 @@ contract AdlEdgeTest is Test {
     /// @notice A winner large enough to cover the whole aggregate is closed only for the size the
     ///         exposure requires. Finishing the 1000 units at the band edge ($76, the $80 mark
     ///         less the 5% band) would cost $14,000 against $12,000 of free capital, so the batch
-    ///         must close $2,000 of that; each unit closed removes $14 of it and hands the executor
-    ///         $0.01 of it back, leaving 143 units to close and 857 with the winner. Bounding by
-    ///         winner count instead would settle all 1000 at the estates' bankruptcy price and pay
-    ///         the executor a cut of every one.
+    ///         must close $2,000 of that; each unit closed removes $14 of it and pays the executor
+    ///         $0.016 of it back — 2 bp of the $80 mark, more than 0.1% of the $10 the close
+    ///         averts — leaving 143 units to close and 857 with the winner. Bounding by winner
+    ///         count instead would settle all 1000 at the estates' bankruptcy price and pay the
+    ///         executor for every one.
     function test_batchCap_flatFunding_closesOnlyWhatTheExposureRequires() public {
         _oversizedWinnerOnDeepInventory();
         h.setVaultInsurance(22_000e18); // free capital = 22,000 − 10,000 seized
 
         BazaarTypes.AdlResult memory r = h.execAdl(_one(winner), _paramsAtMark(90 * SCALE, 80 * SCALE, 15));
 
-        assertApproxEqRel(r.totalLiqSize, 142.9593e18, 0.0001e18, "2,000 excess / 13.99 per unit");
+        assertApproxEqRel(r.totalLiqSize, 143.0206e18, 0.0001e18, "2,000 excess / 13.984 per unit");
         assertEq(h.bucketSize(winner), 1000 * SCALE - r.totalLiqSize, "the rest stays with the winner");
         assertEq(h.pendingSize(), 1000 * SCALE - r.totalLiqSize, "and the matching inventory stays open");
     }
@@ -416,7 +430,7 @@ contract AdlEdgeTest is Test {
     ///         base as the batch runs and the batch needs fewer units than the finish cost alone
     ///         implies. With a 5% target the reserve is $0.40 per unit of open interest here:
     ///         $400 on the 1000-unit book, so the base is $11,600 rather than $12,000, and each
-    ///         unit closed repairs $14.39 rather than $13.99 — 167 units instead of 172.
+    ///         unit closed repairs $14.384 rather than $13.984 — 167 units instead of 172.
     function test_batchCap_reserveReleasedByTheCloseShortensTheBatch() public {
         _oversizedWinnerOnDeepInventory();
         h.setVaultInsurance(22_000e18); // free capital = 12,000
@@ -424,7 +438,7 @@ contract AdlEdgeTest is Test {
 
         BazaarTypes.AdlResult memory r = h.execAdl(_one(winner), _paramsAtMark(90 * SCALE, 80 * SCALE, 15));
 
-        assertApproxEqRel(r.totalLiqSize, 166.7825e18, 0.0001e18, "2,400 excess / 14.39 per unit");
+        assertApproxEqRel(r.totalLiqSize, 166.8521e18, 0.0001e18, "2,400 excess / 14.384 per unit");
         assertLt(r.totalLiqSize, 172 * SCALE, "sizing without the released reserve would close 172");
     }
 
@@ -438,7 +452,7 @@ contract AdlEdgeTest is Test {
 
         BazaarTypes.AdlResult memory r = h.execAdl(_one(winner), _paramsAtMark(90 * SCALE, 80 * SCALE, 15));
 
-        assertApproxEqRel(r.totalLiqSize, 0.07148e18, 0.01e18, "$1 excess / 13.99 per unit");
+        assertApproxEqRel(r.totalLiqSize, 0.07151e18, 0.01e18, "$1 excess / 13.984 per unit");
         assertLt(r.totalLiqSize, 10 * SCALE, "a boundary breach does not deleverage the book");
     }
 
@@ -457,15 +471,15 @@ contract AdlEdgeTest is Test {
 
         BazaarTypes.AdlResult memory r = h.execAdl(_one(winner), params);
 
-        assertApproxEqRel(r.totalLiqSize, 214.4389e18, 0.0001e18, "3,000 excess / 13.99 per unit");
+        assertApproxEqRel(r.totalLiqSize, 214.5309e18, 0.0001e18, "3,000 excess / 13.984 per unit");
         assertGt(r.totalLiqSize, 200 * SCALE, "sizing against the finish cost alone would stop at 200");
     }
 
     /// @notice When the figure exceeds the inventory the cap does not bind: the batch runs to its
     ///         eligible size. Vault long 100 units marked $10 ABOVE the bankruptcy price but owing
     ///         $20/unit of funding, with $100 in the fund against a $1,550 band-edge finish cost:
-    ///         each unit closed at the $110 mark frees $5.50 ($15.50 of finish cost less the $10
-    ///         it costs past the earmark), so 264 would be needed.
+    ///         each unit closed at the $110 mark frees $5.478 ($15.50 of finish cost less the $10
+    ///         it costs past the earmark and the executor's 2 bp of $110), so 265 would be needed.
     function test_batchCap_figureBeyondTheInventory_closesTheEligibleSize() public {
         h.setPendingLiq(100 * SCALE, 10_000 * SCALE, true); // settlement price = $100, nothing seized
         h.setVaultInsurance(100e18);
@@ -503,23 +517,26 @@ contract AdlEdgeTest is Test {
     }
 
     /// @notice The funding the estates paid before liquidation is inside the bankruptcy price, so
-    ///         a close there costs the fund nothing past the earmark: the batch closes the 5.56
+    ///         a close there costs the fund nothing past the earmark: the batch closes the 5.57
     ///         units that put the fund on the release line — the $90 band-edge finish cost less
-    ///         its $40, plus the rounding allowance, over the $8.995 a unit a close at $85 frees
-    ///         ($9 of finish cost less the cut on the $5 averted) — and no more.
+    ///         its $40, plus the rounding allowance, over the $8.984 a unit a close at $85 frees
+    ///         ($9 of finish cost less the executor's 2 bp of the $80 mark, more than 0.1% of the
+    ///         $5 averted) — and no more.
     function test_batchCap_paidPreLiquidationFunding_landsOnTheLine() public {
         _paidFundingSetup();
         int256 idx = int256(5 * SCALE);
-        uint256 expected = Math.mulDiv(50.000001e18, 10 * SCALE, 89.95e18, Math.Rounding.Ceil);
+        uint256 expected = Math.mulDiv(50.000001e18, 10 * SCALE, 89.84e18, Math.Rounding.Ceil);
 
         BazaarTypes.AdlResult memory r = h.execAdl(_one(winner), _paramsAtIndex(80 * SCALE, idx));
 
         assertEq(r.settlementPrice, 85 * SCALE, "the bankruptcy price");
-        assertEq(r.totalLiqSize, expected, "5.56 units");
+        assertEq(r.totalLiqSize, expected, "5.57 units");
         (, uint256 base, uint256 worstFinish,) = h.exposure(80 * SCALE, idx, 1_000);
         assertLe(worstFinish, base, "on the release line");
         assertEq(h.deficit(), 0, "nothing went unpaid");
-        // $20 a unit paid at $85, all of it earmark: free capital moves only by the executor's cut.
+        // $20 a unit paid at $85, all of it earmark: free capital moves only by the executor's
+        // reward.
+        assertEq(h.claimable(address(this)), _rate(expected, 80 * SCALE), "2 bp of the close at the mark");
         assertApproxEqAbs(
             h.insurance(),
             240e18 - Math.mulDiv(expected, 20e18, SCALE) - h.claimable(address(this)),
@@ -531,14 +548,15 @@ contract AdlEdgeTest is Test {
     /// @notice The mirror with the funding received: $5 a unit the estates took before liquidation
     ///         lowers the bankruptcy price to $75 and is no gain on the close. At the $70 mark the
     ///         batch closes the 5.30 units that put the fund on the release line — the $85 finish
-    ///         cost less its $40, plus the allowance, over $8.495 a unit — in one batch.
+    ///         cost less its $40, plus the allowance, over $8.486 a unit, the executor taking 2 bp
+    ///         of the $70 mark — in one batch.
     function test_batchCap_receivedPreLiquidationFunding_landsOnTheLine() public {
         _paidFundingSetup();
         h.setPendingLiq(10 * SCALE, 750 * SCALE, true);
         h.setPendingLiqEntryNotional(1000 * SCALE);
         h.setPendingLiqSeized(200 * SCALE);
         int256 idx = -int256(5 * SCALE);
-        uint256 expected = Math.mulDiv(45.000001e18, 10 * SCALE, 84.95e18, Math.Rounding.Ceil);
+        uint256 expected = Math.mulDiv(45.000001e18, 10 * SCALE, 84.86e18, Math.Rounding.Ceil);
 
         BazaarTypes.AdlResult memory r = h.execAdl(_one(winner), _paramsAtIndex(70 * SCALE, idx));
 
@@ -553,7 +571,7 @@ contract AdlEdgeTest is Test {
     ///         once its own earmark is spent, not backing that shrinks with the inventory. Long 10
     ///         @ $100 against $150 seized, bankrupt at $85, with $20 of such arrears: at the $80
     ///         mark the batch closes the 3.34 units that put the fund on the release line — the
-    ///         $90 finish cost less the fund's $40 and the $20, plus the allowance, over $8.995 a
+    ///         $90 finish cost less the fund's $40 and the $20, plus the allowance, over $8.984 a
     ///         unit — and the arrears stay, since each unit's $15 loss at $85 is exactly its
     ///         earmark.
     function test_batchCap_leftoverArrears_landsOnTheLine() public {
@@ -563,7 +581,7 @@ contract AdlEdgeTest is Test {
         h.setVaultInsurance(190e18);
         h.setBucket(winner, false, 10 * SCALE, 1100 * SCALE, 100 * SCALE);
         h.setOI(0, 10 * SCALE, 0, 1100 * SCALE);
-        uint256 expected = Math.mulDiv(30.000001e18, 10 * SCALE, 89.95e18, Math.Rounding.Ceil);
+        uint256 expected = Math.mulDiv(30.000001e18, 10 * SCALE, 89.84e18, Math.Rounding.Ceil);
 
         BazaarTypes.AdlResult memory r = h.execAdl(_one(winner), _paramsAtMark(100 * SCALE, 80 * SCALE, 15));
 
@@ -618,9 +636,10 @@ contract AdlEdgeTest is Test {
 
         // Winner credit: price PnL (150−100) + own funding receivable (+2) = $52, in full. The
         // vault's leg on the slice is the $2 the long inventory owed (entry and bankruptcy
-        // notional coincide, so the price leg is zero): that is the only insurance entry.
+        // notional coincide, so the price leg is zero): that is the only settlement entry, and
+        // the executor's 2 bp of the unit at the $100 mark the only other.
         assertEq(h.bucketCollateral(winner), 62 * SCALE, "winner paid totalPnl incl. funding");
-        assertEq(h.insurance(), 4e18 - 2e18, "insurance settles the vault's funding leg once");
+        assertEq(h.insurance(), 4e18 - 2e18 - 0.02e18, "insurance settles the vault's funding leg once");
         assertEq(h.vaultCollateral(), 1_000e18 + 2e18, "deposits ledger mirrors the single I->D transfer");
         assertEq(h.pendingSize(), 1 * SCALE, "the unit the winner could not cover stays open");
     }
@@ -667,8 +686,9 @@ contract AdlEdgeTest is Test {
 
         // Credit = (100 − 88) − 3 = $9 on top of $5 collateral.
         assertEq(h.bucketCollateral(winner), 14 * SCALE, "winner credited price leg less own tab");
-        // Less the executor's 0.1% of the $8 the close averted against the $80 mark.
-        assertEq(h.insurance(), 24e18 - 9e18 - 0.008e18, "vault leg from entry: -12 price + 3 funding, booked once");
+        // Less the executor's 2 bp of the unit at the $80 mark, $0.016, which is more than 0.1%
+        // of the $8 the close averted.
+        assertEq(h.insurance(), 24e18 - 9e18 - 0.016e18, "vault leg from entry: -12 price + 3 funding, booked once");
         assertEq(h.vaultCollateral(), 1_000e18 + 9e18, "deposits ledger mirrors the single transfer");
         assertEq(h.pendingSize(), 1 * SCALE, "the estate the winner could not cover stays open");
     }
@@ -699,9 +719,9 @@ contract AdlEdgeTest is Test {
 
         assertEq(h.bucketSize(winner), 0, "dodger closed despite the top-up");
         assertEq(h.bucketCollateral(winner), (60 + 50) * SCALE, "payout uses REAL collateral + pnl");
-        // Closed at its own basis, the inventory moves the fund only by the executor's 0.1% of
-        // the $10 the close averted against the $90 mark.
-        assertEq(h.insurance(), 10e18 - 0.01e18, "inventory closed at its own basis: only the reward leaves");
+        // Closed at its own basis, the inventory moves the fund only by the executor's 2 bp of
+        // the unit at the $90 mark, $0.018, more than 0.1% of the $10 the close averted.
+        assertEq(h.insurance(), 10e18 - 0.018e18, "inventory closed at its own basis: only the reward leaves");
         assertEq(h.vaultCollateral(), 1_000e18, "no vault realization: deposits ledger untouched");
         assertEq(h.pendingSize(), 1 * SCALE, "the unit the winner could not cover stays open");
     }
@@ -722,9 +742,9 @@ contract AdlEdgeTest is Test {
 
         assertEq(h.bucketSize(winner), 0, "pure-profit winner closed first");
         assertEq(h.bucketCollateral(winner), 50 * SCALE, "credit = pnl on zero real collateral");
-        // Closed at its own basis, the inventory moves the fund only by the executor's 0.1% of
-        // the $10 the close averted against the $90 mark.
-        assertEq(h.insurance(), 10e18 - 0.01e18, "inventory closed at its own basis: only the reward leaves");
+        // Closed at its own basis, the inventory moves the fund only by the executor's 2 bp of
+        // the unit at the $90 mark, $0.018, more than 0.1% of the $10 the close averted.
+        assertEq(h.insurance(), 10e18 - 0.018e18, "inventory closed at its own basis: only the reward leaves");
         assertEq(h.pendingSize(), 1 * SCALE, "the unit the winner could not cover stays open");
     }
 
@@ -877,28 +897,34 @@ contract AdlEdgeTest is Test {
     ///         vault's gain on the slice moves from the deposits ledger into the fund. Vault long
     ///         1 unit at bankruptcy $100, marked $104; an empty fund cannot finish the unit
     ///         inside the 5% band, which is what keeps the window open above the neutral price.
-    ///         Every part of the unit closed at $104 hands the fund $4 and takes $1.20 of finish
-    ///         cost off, so 3/13 of it puts the fund on the release line, and that is all the
-    ///         batch closes.
+    ///         Every part of the unit closed at $104 hands the fund $4, takes $1.20 of finish cost
+    ///         off and pays the executor 2 bp of its notional at the mark, so about 0.23 of it puts
+    ///         the fund on the release line, and that is all the batch closes.
     function test_settlement_markAboveBankruptcy_longInventorySettlesAtMark() public {
         h.setPendingLiq(1 * SCALE, 100 * SCALE, true);
         // Short winner, 1 unit entered at $150/u, $10 collateral.
         h.setBucket(winner, false, 1 * SCALE, 150 * SCALE, 10 * SCALE);
         h.setOI(0, 1 * SCALE, 0, 150 * SCALE);
         h.setVaultInsurance(0);
-        // The $1.20 finish cost plus the rounding allowance, over the $5.20 a unit a close at $104
-        // frees: the $4 gain and the $1.20 of finish cost it takes off.
-        uint256 closed = Math.mulDiv(1.200001e18, SCALE, 5.2e18, Math.Rounding.Ceil);
+        // The $1.20 finish cost plus the rounding allowance, over the $5.1792 a unit a close at
+        // $104 frees: the $4 gain and the $1.20 of finish cost it takes off, less the $0.0208 the
+        // executor is paid.
+        uint256 closed = Math.mulDiv(1.200001e18, SCALE, 5.1792e18, Math.Rounding.Ceil);
 
         BazaarTypes.AdlResult memory r = h.execAdl(_one(winner), _paramsAtMark(100 * SCALE, 104 * SCALE, 15));
 
         assertEq(r.settlementPrice, 104 * SCALE, "settlement = the mark, not the bankruptcy price");
-        assertEq(r.totalLiqSize, closed, "3/13 of the unit");
+        assertEq(r.totalLiqSize, closed, "about 0.23 of the unit");
         // Winner: (150 - 104) on the part closed, the market close and no better.
         assertEq(h.bucketCollateral(winner), 10 * SCALE + closed * 46, "winner credited PnL at the mark");
         assertEq(h.bucketSize(winner), 1 * SCALE - closed, "the rest of the winner stays open");
-        // Vault: the slice sold $4 above its entry basis, a D -> I transfer.
-        assertEq(h.insurance(), closed * 4, "the fund keeps the recovery above the bankruptcy price");
+        // Vault: the slice sold $4 above its entry basis, a D -> I transfer, less the reward.
+        assertEq(h.claimable(address(this)), _rate(closed, 104 * SCALE), "2 bp of the close at the mark");
+        assertEq(
+            h.insurance(),
+            closed * 4 - _rate(closed, 104 * SCALE),
+            "the fund keeps the recovery above the bankruptcy price"
+        );
         assertEq(h.vaultCollateral(), 1_000e18 - closed * 4, "deposits ledger paid the vault's gain");
         assertEq(h.pendingSize(), 1 * SCALE - closed, "the rest of the inventory is carried");
         (, uint256 base, uint256 worstFinish,) = h.exposure(104 * SCALE, 0, 1_000);
@@ -908,28 +934,269 @@ contract AdlEdgeTest is Test {
     /// @notice Mirror for short inventory: a mark BELOW the bankruptcy price is the fund's
     ///         favorable side, so the batch settles there. Vault short 1 unit at bankruptcy
     ///         $100, marked $96, against a long winner: the $4 a unit gained and the $0.80 of
-    ///         finish cost at the $100.80 band edge put 1/6 of the unit on the release line.
+    ///         finish cost at the $100.80 band edge, less the executor's $0.0192, put about 0.17 of
+    ///         the unit on the release line.
     function test_settlement_markBelowBankruptcy_shortInventorySettlesAtMark() public {
         h.setPendingLiq(1 * SCALE, 100 * SCALE, false);
         // Long winner, 1 unit entered at $50/u, $10 collateral.
         h.setBucket(winner, true, 1 * SCALE, 50 * SCALE, 10 * SCALE);
         h.setOI(1 * SCALE, 0, 50 * SCALE, 0);
         h.setVaultInsurance(0);
-        uint256 closed = Math.mulDiv(0.800001e18, SCALE, 4.8e18, Math.Rounding.Ceil);
+        uint256 closed = Math.mulDiv(0.800001e18, SCALE, 4.7808e18, Math.Rounding.Ceil);
 
         BazaarTypes.AdlParams memory p = _paramsAtMark(100 * SCALE, 96 * SCALE, 15);
         p.adlLongs = true;
         BazaarTypes.AdlResult memory r = h.execAdl(_one(winner), p);
 
         assertEq(r.settlementPrice, 96 * SCALE, "settlement = the mark, not the bankruptcy price");
-        assertEq(r.totalLiqSize, closed, "1/6 of the unit");
+        assertEq(r.totalLiqSize, closed, "about 0.17 of the unit");
         // Winner: (96 - 50) on the part closed.
         assertEq(h.bucketCollateral(winner), 10 * SCALE + closed * 46, "winner credited PnL at the mark");
-        assertEq(h.insurance(), closed * 4, "the fund keeps the recovery below the bankruptcy price");
+        assertEq(
+            h.insurance(),
+            closed * 4 - _rate(closed, 96 * SCALE),
+            "the fund keeps the recovery below the bankruptcy price"
+        );
         assertEq(h.vaultCollateral(), 1_000e18 - closed * 4, "deposits ledger paid the vault's gain");
         assertEq(h.pendingSize(), 1 * SCALE - closed, "the rest of the inventory is carried");
         (, uint256 base, uint256 worstFinish,) = h.exposure(96 * SCALE, 0, 1_000);
         assertLe(worstFinish, base, "the fund can finish the rest inside the band");
+    }
+
+    // ---------------- the executor's reward for the inventory leg ----------------
+
+    /// @notice Far enough past the bankruptcy price, the executor is paid its share of the bad
+    ///         debt the close averts rather than the rate. Vault long 1 unit at bankruptcy $100,
+    ///         marked $70, against a $10 fund: finishing it at the $66.50 band edge would cost
+    ///         $33.50. Each unit closed at $100 averts $30, whose 0.1% is $0.03, against 2 bp of
+    ///         the $70 mark, $0.014; so it repairs $33.47, and the batch closes $23.500001 of it.
+    function test_adlReward_markFarPastTheBankruptcyPrice_paysTheAvertedShare() public {
+        h.setPendingLiq(1 * SCALE, 100 * SCALE, true);
+        h.setVaultInsurance(10e18);
+        h.setBucket(winner, false, 1 * SCALE, 150 * SCALE, 10 * SCALE);
+        h.setOI(0, 1 * SCALE, 0, 150 * SCALE);
+        uint256 closed = Math.mulDiv(23.500001e18, SCALE, 33.47e18, Math.Rounding.Ceil);
+
+        BazaarTypes.AdlResult memory r = h.execAdl(_one(winner), _paramsAtMark(100 * SCALE, 70 * SCALE, 15));
+
+        assertEq(r.settlementPrice, 100 * SCALE, "the bankruptcy price");
+        assertEq(r.totalLiqSize, closed, "sized with the averted share as the executor's reward");
+        uint256 share = Math.mulDiv(Math.mulDiv(closed, 30 * SCALE, SCALE), 10, 10_000);
+        assertGt(share, _rate(closed, 70 * SCALE), "premise: the share is the larger");
+        assertEq(h.claimable(address(this)), share, "0.1% of the $30 a unit averted");
+        assertEq(h.insurance(), 10e18 - share, "the close itself costs the fund nothing");
+        (, uint256 base, uint256 worstFinish,) = h.exposure(70 * SCALE, 0, 1_000);
+        assertLe(worstFinish, base, "the fund can finish the rest inside the band");
+    }
+
+    /// @notice Submitting the cohort that covers a deferred account pays the executor more than
+    ///         leaving it out. On the held-window book the cohort closes the account at its
+    ///         $73.50 bankruptcy price, its loss landing on its counterparty, for the $0.05 seizure
+    ///         floor and 0.1% of the $47 it averts. Without the cohort the leg closes inventory at
+    ///         the mark so the fund can net the account and pay its loss, and those closes earn
+    ///         nothing past the netting's $0.05.
+    function test_adlReward_coveringCohortPaysMoreThanTheNettingRoute() public {
+        _heldWindowSetup();
+        h.setBucket(ally, true, 2 * SCALE, 120 * SCALE, 20 * SCALE);
+        h.setOI(2 * SCALE, 12 * SCALE, 120 * SCALE, 1240 * SCALE);
+        BazaarTypes.AdlParams memory p = _paramsAtMark(100 * SCALE, 97 * SCALE, 15);
+        uint256 snap = vm.snapshotState();
+
+        h.execAdlBoth(_one(winner), _one(ally), p);
+        uint256 withCohort = h.claimable(address(this));
+        uint256 fundWithCohort = h.insurance();
+        vm.revertToState(snap);
+
+        h.execAdlBoth(_one(winner), new address[](0), p);
+        uint256 withoutCohort = h.claimable(address(this));
+
+        assertEq(withCohort, 0.097e18, "the seizure floor and 0.1% of the $47 averted");
+        assertEq(withoutCohort, 0.05e18, "the netting's seizure floor alone");
+        assertGt(withCohort, withoutCohort, "the cohort is the better-paid route");
+        assertGt(fundWithCohort, h.insurance(), "and the cheaper one for the fund");
+    }
+
+    /// @notice The same holds where the batch's own deferred pass can net an account and so make
+    ///         the inventory need a close it did not need before. Two listed shorts of one unit each
+    ///         from $70 against $3.50, and a fund exactly on its release line with $28.50 free:
+    ///         without a cohort the first pass nets one account, which costs the fund $21.50 and
+    ///         leaves the 9 units it keeps needing a close, and the leg then closes enough to net
+    ///         the other. That close is not the inventory's own need as the batch began, so it
+    ///         earns nothing: the two nettings' $0.05 each. The cohort that covers both pays their
+    ///         seizure floors and 0.1% of the $47 they avert.
+    function test_adlReward_coveringCohortPaysMoreEvenWhereTheFirstPassCouldNet() public {
+        _heldWindowSetup();
+        h.setBucket(loser, false, 1 * SCALE, 70 * SCALE, 3.5e18);
+        h.setBucket(loser2, false, 1 * SCALE, 70 * SCALE, 3.5e18);
+        h.pushDeferred(loser2);
+        h.setVaultInsurance(78.5e18);
+        h.setBucket(ally, true, 2 * SCALE, 120 * SCALE, 20 * SCALE);
+        h.setOI(2 * SCALE, 12 * SCALE, 120 * SCALE, 1240 * SCALE);
+        BazaarTypes.AdlParams memory p = _paramsAtMark(100 * SCALE, 97 * SCALE, 15);
+        uint256 snap = vm.snapshotState();
+
+        h.execAdlBoth(_one(winner), _one(ally), p);
+        uint256 withCohort = h.claimable(address(this));
+        vm.revertToState(snap);
+
+        h.execAdlBoth(_one(winner), new address[](0), p);
+        uint256 withoutCohort = h.claimable(address(this));
+
+        assertEq(h.deferredCount(), 0, "premise: without the cohort both accounts are netted");
+        assertGt(h.pendingSize(), 0, "and inventory remains");
+        assertEq(withCohort, 0.147e18, "two seizure floors and 0.1% of the $47 averted");
+        assertEq(withoutCohort, 0.1e18, "the two nettings' floors alone");
+        assertGt(withCohort, withoutCohort, "the cohort is the better-paid route");
+    }
+
+    /// @dev Vault long 10 @ $100 against $90 seized, the estates having taken $4 a unit of funding
+    ///      before liquidation: bankrupt at $87 and marked $83, the fund holding `fund` under a 20%
+    ///      target. Two listed shorts: `loser`, 2 @ $76 against $13, which no cohort covers, and
+    ///      `loser2`, `size` from `entry` against `collateral`. `ally`, a long of `loser2`'s size
+    ///      from $50, is the cohort that covers `loser2` wherever it closes above $50.
+    function _twoListedBook(uint256 entry, uint256 collateral, uint256 size, uint256 fund) internal {
+        h.setPendingLiq(10 * SCALE, 870 * SCALE, true);
+        h.setPendingLiqEntryNotional(1000 * SCALE);
+        h.setPendingLiqSeized(90 * SCALE);
+        h.setPendingLiqFundingIndex(int256(4 * SCALE));
+        h.setTargetRatio(2_000);
+        h.setVaultInsurance(fund);
+        h.setBucket(loser, false, 2 * SCALE, 152 * SCALE, 13 * SCALE);
+        h.setBucket(loser2, false, size, Math.mulDiv(size, entry, SCALE), collateral);
+        h.setBucket(ally, true, size, Math.mulDiv(size, 50 * SCALE, SCALE), 10 * SCALE);
+        h.setBucket(winner, false, 10 * SCALE, 1100 * SCALE, 100 * SCALE);
+        h.setOI(
+            2 * SCALE + size,
+            12 * SCALE + size,
+            200 * SCALE + Math.mulDiv(size, 50 * SCALE, SCALE),
+            1252 * SCALE + Math.mulDiv(size, entry, SCALE)
+        );
+        h.pushDeferred(loser);
+        h.pushDeferred(loser2);
+    }
+
+    /// @dev The batch with `ally` as the deferred cohort, then from the same state without it,
+    ///      which is the state left behind.
+    function _bothRoutes(BazaarTypes.AdlParams memory p) internal returns (uint256 withCohort, uint256 withoutCohort) {
+        uint256 snap = vm.snapshotState();
+        h.execAdlBoth(_one(winner), _one(ally), p);
+        withCohort = h.claimable(address(this));
+        vm.revertToState(snap);
+        h.execAdlBoth(_one(winner), new address[](0), p);
+        withoutCohort = h.claimable(address(this));
+    }
+
+    /// @notice The same holds where the batch also absorbs an account no cohort covers, and
+    ///         absorbing the other one too would raise the leg's close. `loser2`, half a unit from
+    ///         $60 against $1, is $10.50 past its collateral. With `ally` it closes at its $62
+    ///         bankruptcy price and the leg is sized to net `loser`. Without it, no close short of
+    ///         the whole inventory leaves room to net both, so the whole inventory goes and the two
+    ///         accounts become the inventory. Absorbing `loser2` takes its half unit off the
+    ///         fund's exposure, so the leg is paid on half a unit less: the cohort route earns 0.1%
+    ///         of the $10.50 averted and 2 bp of that half unit at the mark more.
+    function test_adlReward_coveringCohortPaysMoreWhereAnotherAccountIsAbsorbed() public {
+        _twoListedBook(60 * SCALE, 1e18, 0.5e18, 106e18);
+        (uint256 withCohort, uint256 withoutCohort) = _bothRoutes(_paramsAtMark(100 * SCALE, 83 * SCALE, 15));
+
+        assertEq(h.pendingSize(), 2.5e18, "premise: without the cohort the two accounts are the inventory");
+        assertFalse(h.pendingIsLong(), "on their own side");
+        assertEq(
+            withCohort - withoutCohort, 0.0105e18 + _rate(0.5e18, 83 * SCALE), "the share and the half unit's rate"
+        );
+    }
+
+    /// @dev One two-account book for the incentive fuzz: the second account, `loser`'s
+    ///      collateral, the fund, the mark, the unload band (through the lagged maintenance rate),
+    ///      the target and the trailing open interest the reserve is sized on.
+    struct CohortCase {
+        uint256 entry;
+        uint256 collateral;
+        uint256 size;
+        uint256 loserCollateral;
+        uint256 fund;
+        uint256 mark;
+        uint256 bandBp;
+        uint256 target;
+        uint256 trailing;
+    }
+
+    /// @notice Across the second account's entry, collateral and size, the fund's balance, the
+    ///         mark from $7 past the bankruptcy price to $5 on the fund's side of it, bands from
+    ///         2% to 5%, targets up to 20% and live open interest above its trailing reading or
+    ///         not, the route with the covering cohort never pays the executor less than the one
+    ///         without. `loser` stays past its collateral. One within it is not an account the
+    ///         leg is sized for: a route that empties the inventory seizes it into the new one at
+    ///         the flat reward while the other leaves it listed, which is the seizure rule's
+    ///         doing rather than the leg's.
+    function testFuzz_adlReward_coveringCohortNeverPaysLess(CohortCase memory c) public {
+        uint256 mark = bound(c.mark, 80, 92);
+        _twoListedBook(
+            bound(c.entry, 30, 80) * SCALE,
+            bound(c.collateral, 0.1e18, 5e18),
+            bound(c.size, 0.1e18, 1.5e18),
+            bound(c.fund, 90, 130) * SCALE
+        );
+        // Its loss at the mark is 2 x (mark - $76); the collateral stays at least $0.10 under it.
+        h.setBucket(
+            loser, false, 2 * SCALE, 152 * SCALE, bound(c.loserCollateral, 0.1e18, (2 * mark - 152) * SCALE - 0.1e18)
+        );
+        h.setTargetRatio(bound(c.target, 0, 2_000));
+        h.setTrailingOi(uint128(bound(c.trailing, 0, 12 * SCALE)));
+        BazaarTypes.AdlParams memory p = _paramsAtMark(100 * SCALE, mark * SCALE, 15);
+        p.marginRequirements.laggedMmrBp = bound(c.bandBp, 200, 1_000);
+        (uint256 withCohort, uint256 withoutCohort) = _bothRoutes(p);
+        assertGe(withCohort, withoutCohort, "the cohort route pays at least as much");
+    }
+
+    /// @dev One inventory-only book for the reward fuzz: the side, the mark's place against the
+    ///      $100 bankruptcy price, the fund and its reserve.
+    struct RewardCase {
+        bool vaultShort;
+        uint256 mark;
+        uint256 free;
+        uint256 target;
+    }
+
+    /// @notice Across both sides, marks from $40 past the bankruptcy price to $10 on the fund's
+    ///         side of it, funds and reserves: every close the inventory leg makes pays the
+    ///         executor the larger of 2 bp of its notional at the mark and 0.1% of the bad debt it
+    ///         averts, nothing else is paid, and a batch that leaves inventory open leaves it on
+    ///         the release line. The vault holds 10 units at a $100 entry with nothing seized,
+    ///         against a winner twice that size in profit at the $100 snapshot.
+    function testFuzz_adlReward_eachCloseEarnsTheLargerOfTheRateAndTheAvertedShare(RewardCase memory c) public {
+        // On the long side a mark below $100 is past the bankruptcy price; on the short side, above.
+        uint256 m = bound(c.mark, 60, 110);
+        uint256 mark = (c.vaultShort ? 200 - m : m) * SCALE;
+        h.setPendingLiq(10 * SCALE, 1_000 * SCALE, !c.vaultShort);
+        h.setVaultInsurance(bound(c.free, 1, 60) * SCALE);
+        h.setTargetRatio(bound(c.target, 0, 2_000));
+        if (c.vaultShort) {
+            h.setBucket(winner, true, 20 * SCALE, 400 * SCALE, 100 * SCALE);
+            h.setOI(20 * SCALE, 0, 400 * SCALE, 0);
+        } else {
+            h.setBucket(winner, false, 20 * SCALE, 4_000 * SCALE, 100 * SCALE);
+            h.setOI(0, 20 * SCALE, 0, 4_000 * SCALE);
+        }
+        BazaarTypes.AdlParams memory p = _paramsAtMark(100 * SCALE, mark, 15);
+        p.adlLongs = c.vaultShort;
+
+        vm.recordLogs();
+        BazaarTypes.AdlResult memory r = h.execAdl(_one(winner), p);
+        LoggedClose[] memory closes = _loggedCloses(vm.getRecordedLogs());
+
+        uint256 expected;
+        for (uint256 i = 0; i < closes.length; i++) {
+            uint256 rate = _rate(closes[i].size, mark);
+            uint256 gap = closes[i].price > mark ? closes[i].price - mark : mark - closes[i].price;
+            uint256 share = Math.mulDiv(Math.mulDiv(closes[i].size, gap, SCALE), 10, 10_000);
+            expected += rate > share ? rate : share;
+        }
+        assertEq(h.claimable(address(this)), expected, "each close pays the larger of the two");
+        assertEq(h.deficit(), 0, "no deficit");
+        if (r.totalLiqSize != 0 && r.totalLiqSize < 10 * SCALE) {
+            (, uint256 base, uint256 worstFinish,) = h.exposure(mark, 0, 1_000);
+            assertLe(worstFinish, base, "the batch leaves the fund on the release line");
+        }
     }
 
     // ---------------- negative settlement skip ----------------
@@ -1026,6 +1293,75 @@ contract AdlEdgeTest is Test {
         assertEq(r.deferredClosedSize, 10 * SCALE, "the whole account closed against its cohort");
         assertEq(h.bucketCollateral(ally), 200 * SCALE, "credited (90 - 80) x 10 at the bankruptcy price");
         assertEq(h.claimable(address(this)), 0.2e18 + 0.1e18, "2 bp of the $1,000 closed plus 0.1% of $100 averted");
+    }
+
+    /// @notice A cohort close against an account whose collateral the deposits ledger could not
+    ///         hand over in full still takes the whole account. The ledger holds $4 of `loser`'s
+    ///         $10: the seizure collects the $4 and carries the other $6 as arrears, and the close
+    ///         at the $90 bankruptcy price pays its $10 loss from the $4 and then nets the $6.
+    ///         Nothing is left unpaid, so no deficit stops the close.
+    function test_deferred_cohortClose_collateralTheLedgerCannotPay_completesWithNoDeficit() public {
+        _deferredShortAgainstLongInventory();
+        h.setVaultCollateral(4e18);
+
+        BazaarTypes.AdlResult memory r = h.execAdlBoth(new address[](0), _one(ally), _params(100 * SCALE, 15));
+
+        assertEq(r.deferredClosedSize, 1 * SCALE, "the whole account closed against its cohort");
+        assertEq(h.deficit(), 0, "no deficit");
+        assertEq(h.arrears(), 0, "the close nets the $6 the ledger owed");
+        assertEq(h.bucketCollateral(ally), 20 * SCALE, "credited at the bankruptcy price");
+        assertEq(h.claimable(address(this)), 0.06e18, "seizure floor + averted-loss share");
+        assertEq(h.insurance(), 1_000e18 - 0.06e18, "the $4 seized in and paid back out, the reward out");
+        assertEq(h.vaultCollateral(), 4e18, "the ledger gets back the $4 it handed over");
+        assertEq(h.pendingSize(), 1 * SCALE, "the vault's inventory is untouched");
+    }
+
+    /// @dev A cohort close stops before its first slice once the pair carries a deficit, which
+    ///      the close cannot book itself (above), so the deficit is staged. Vault long `inventory`
+    ///      units at $100 with nothing seized. `loser` is a short of 10 from $80 on $100, bankrupt
+    ///      at $90; `ally` is the long of 10 from $80 that would cover it.
+    function _deficitBooked(uint256 inventory) internal {
+        h.setPendingLiq(inventory, inventory * 100, true);
+        h.setBucket(loser, false, 10 * SCALE, 800 * SCALE, 100 * SCALE);
+        h.setBucket(ally, true, 10 * SCALE, 800 * SCALE, 100 * SCALE);
+        h.setOI(10 * SCALE, 10 * SCALE, 800 * SCALE, 800 * SCALE);
+        h.pushDeferred(loser);
+        h.setDeficit(1e18);
+    }
+
+    /// @notice With a deficit on the books, the cohort closes nothing and the seized account nets
+    ///         against the inventory instead. The netting retires all 10 units, so the seizure is
+    ///         paid the rate on them, 2 bp at the $100 mark, and no averted share. The fund pays the
+    ///         $200 entry gap from the account's $100 and $100 of its own.
+    function test_deferred_cohortClose_afterADeficit_netsTheAccountAndPaysTheRateOnTheOverlap() public {
+        _deficitBooked(10 * SCALE);
+
+        BazaarTypes.AdlResult memory r = h.execAdlBoth(new address[](0), _one(ally), _params(100 * SCALE, 15));
+
+        assertEq(r.deferredClosedSize, 0, "the cohort closes nothing");
+        assertEq(h.bucketSize(ally), 10 * SCALE, "and keeps its position");
+        assertEq(h.bucketSize(loser), 0, "the account is seized");
+        assertEq(h.deferredCount(), 0, "and delisted");
+        assertEq(h.pendingSize(), 0, "the netting retires the whole inventory");
+        assertEq(h.claimable(address(this)), _rate(10 * SCALE, 100 * SCALE), "2 bp on the 10 units netted");
+        assertEq(h.deficit(), 1e18, "no further deficit");
+        assertEq(h.insurance(), 1_000e18 + 100e18 - 200e18 - 0.2e18, "seized in, entry gap out, reward out");
+    }
+
+    /// @notice Where the account is larger than the inventory, the netting retires the 4 units
+    ///         they share and the other 6 become the inventory on the account's side. Only the
+    ///         overlap is paid the rate.
+    function test_deferred_cohortClose_afterADeficit_accountLargerThanTheInventory_restBecomesTheInventory() public {
+        _deficitBooked(4 * SCALE);
+
+        BazaarTypes.AdlResult memory r = h.execAdlBoth(new address[](0), _one(ally), _params(100 * SCALE, 15));
+
+        assertEq(r.deferredClosedSize, 0, "the cohort closes nothing");
+        assertEq(h.pendingSize(), 6 * SCALE, "the 6 units past the overlap are the inventory now");
+        assertFalse(h.pendingIsLong(), "on the account's side");
+        assertEq(h.deferredCount(), 0, "the account is delisted");
+        assertEq(h.claimable(address(this)), _rate(4 * SCALE, 100 * SCALE), "2 bp on the 4 units netted");
+        assertEq(h.insurance(), 1_000e18 + 100e18 - 80e18 - 0.08e18, "seized in, the overlap's gap out, reward out");
     }
 
     /// @notice The deferred cohort ranks at the price the call attests, not at the window's
@@ -1313,6 +1649,64 @@ contract AdlEdgeTest is Test {
         assertEq(h.claimable(address(this)), 2e18 + 0.05e18, "the overlap's 2 bp and the merged account's floor");
     }
 
+    /// @notice The merge after a flip is not put to the netting gate, which prices it as a
+    ///         netting. `loser2` is short 1 from $10,500 on $10: $500 in profit at the $10,000
+    ///         mark but under maintenance there, so the gate, setting its entry against the
+    ///         inventory's $10,000, reads a $500 loss, while a merge realizes nothing. With nothing free in the fund before the
+    ///         batch the gate refuses it; the batch merges it all the same. The fund ends with
+    ///         both accounts' $10 seizures less the $2.05 of rewards.
+    function test_deferred_accountAfterAFlip_mergesWhereTheNettingGateWouldRefuse() public {
+        // The gate's reading of the merge, against a short inventory of the flip's shape.
+        h.setPendingLiq(2 * SCALE, 20_000 * SCALE, false);
+        h.setVaultInsurance(5e18);
+        h.setBucket(loser2, false, 1 * SCALE, 10_500 * SCALE, 10 * SCALE);
+        assertFalse(h.nettingAffordable(loser2, 10_000 * SCALE, 0, 1 * SCALE), "premise: the gate refuses it");
+
+        _deferredLargerThanTheInventory();
+        h.setVaultInsurance(0);
+        h.setOI(0, 4 * SCALE, 0, 40_500 * SCALE);
+        h.pushDeferred(loser2);
+
+        h.execAdlBoth(_one(winner), new address[](0), _params(10_000 * SCALE, 15));
+
+        assertEq(h.bucketSize(loser2), 0, "the second account is seized");
+        assertEq(h.deferredCount(), 0, "the list is empty");
+        assertEq(h.pendingSize(), 3 * SCALE, "and it merged into the short inventory");
+        assertFalse(h.pendingIsLong(), "which stays short");
+        assertEq(h.deficit(), 0, "nothing went unpaid");
+        assertEq(h.claimable(address(this)), 2e18 + 0.05e18, "the overlap's 2 bp and the merged account's floor");
+        assertEq(h.insurance(), 20e18 - 2.05e18, "the two seizures, less the rewards");
+    }
+
+    /// @notice Whatever the entry and collateral of an account the pass reaches after a flip,
+    ///         as long as it is insolvent at the mark, it merges into the inventory in the same
+    ///         batch: seized, delisted, its size added to the inventory, nothing realized, and
+    ///         the floor paid for it. Its entry runs from $2,000 below the $10,000 mark to $999
+    ///         above it, against less collateral than keeps it above maintenance there.
+    function testFuzz_deferred_accountAfterAFlip_alwaysMerges(uint256 size, uint256 gap, uint256 collateral) public {
+        _deferredLargerThanTheInventory();
+        h.setVaultInsurance(0);
+        h.setVaultCollateral(1_000_000e18);
+        uint256 b = bound(size, 0.01e18, 5e18);
+        uint256 entry = 8_000 + bound(gap, 0, 2_999);
+        // Maintenance at the mark is 10% of $10,000 a unit; equity is the collateral plus the
+        // short's PnL, (entry - 10,000) a unit.
+        uint256 c = bound(collateral, 0, (11_000 - entry) * b - 1);
+        h.setBucket(loser2, false, b, entry * b, c);
+        h.setOI(0, 3 * SCALE + b, 0, 30_000 * SCALE + entry * b);
+        h.pushDeferred(loser2);
+
+        h.execAdlBoth(_one(winner), new address[](0), _params(10_000 * SCALE, 15));
+
+        assertEq(h.bucketSize(loser2), 0, "the account is seized");
+        assertEq(h.deferredCount(), 0, "the list is empty");
+        assertEq(h.pendingSize(), 2 * SCALE + b, "its size joined the inventory");
+        assertFalse(h.pendingIsLong(), "which stays short");
+        assertEq(h.deficit(), 0, "nothing went unpaid");
+        assertEq(h.claimable(address(this)), 2e18 + 0.05e18, "the overlap's 2 bp and the merged account's floor");
+        assertEq(h.insurance(), 10e18 + c - 2.05e18, "both seizures in, nothing realized, the rewards out");
+    }
+
     // ---------------- a window held by a deferred account no cohort covers ----------------
 
     /// @dev The vault is long 10 @ $100 against $50 seized (bankrupt at $95), the fund holds $37
@@ -1336,10 +1730,11 @@ contract AdlEdgeTest is Test {
     /// @dev The size the inventory leg is sized to on that setup. Each unit closed at the $97
     ///      mark hands the fund $2 ($5 of earmark less the $3 lost from $100) and takes $2.85
     ///      off the band-edge finish cost ($100 - $92.15 less the $5 of earmark): $48.50 of
-    ///      progress over the 10 units. The fund has to cover the netting's $43 beyond the
-    ///      netted slices' own backing, the $0.05 seizure reward it pays, and the finish cost of
-    ///      the 8 units the netting leaves, 8 x $2.85 = $22.80, less the $37 it holds: $28.85,
-    ///      plus the rounding allowance of one unit of USDC precision.
+    ///      progress over the 10 units. None of them is the inventory's own exposure, so none
+    ///      pays the executor. The fund has to cover the netting's $43 beyond the netted slices'
+    ///      own backing, the $0.05 seizure reward it pays, and the finish cost of the 8 units the
+    ///      netting leaves, 8 x $2.85 = $22.80, less the $37 it holds: $28.85, plus the rounding
+    ///      allowance of one unit of USDC precision.
     function _heldWindowClose(uint256 rewards) internal pure returns (uint256) {
         return Math.mulDiv(28.8e18 + rewards + 1e12, 10 * SCALE, 48.5e18, Math.Rounding.Ceil);
     }
@@ -1365,7 +1760,8 @@ contract AdlEdgeTest is Test {
         assertTrue(h.pendingIsLong(), "which kept its side");
         assertEq(h.deficit(), 0, "the fund could afford the netting");
         // $3 lost per unit closed at the mark; the account's $7 in and the netting's $60 out;
-        // the seizure reward out. A close at the mark averts nothing and earns nothing itself.
+        // the seizure reward out. The closes are only for the netting, so they earn nothing past
+        // its seizure reward: a cohort covering the account would have spared the fund the loss.
         assertEq(h.insurance(), 87e18 - closed * 3 + 7e18 - 60e18 - 0.05e18, "the fund paid what it could afford");
         assertEq(h.claimable(address(this)), 0.05e18, "the seizure reward only");
         (, uint256 base, uint256 worstFinish,) = h.exposure(97 * SCALE, 0, 1_000);
@@ -1468,7 +1864,8 @@ contract AdlEdgeTest is Test {
         assertEq(h.deferredCount(), 0, "list emptied");
         // $30 lost closing at the mark, the $14 seized in; the fund paid no netting. The account
         // became the inventory rather than being retired, so it earns the $0.05 floor, not 2 bp
-        // of its $388: that is paid to whoever retires it.
+        // of its $388: that is paid to whoever retires it. The 10 units closed at the mark were
+        // closed for the account alone, so they earn nothing.
         assertEq(h.insurance(), 87e18 - 30e18 + 14e18 - 0.05e18, "the surplus banked against the new inventory");
         assertEq(h.claimable(address(this)), 0.05e18, "the flat seizure reward");
     }
@@ -1504,8 +1901,9 @@ contract AdlEdgeTest is Test {
     ///         own exposure requires and leaves the account listed and open. Long 10 @ $100
     ///         against $20 seized, marked $90 with $10 above the earmark: $80 of loss beyond the
     ///         earmark at the mark and $125 at the $85.50 band edge, so the ordinary sizing closes
-    ///         $115 plus the rounding allowance of the $124.92 each unit repairs at the $98
-    ///         bankruptcy settlement. The listed
+    ///         $115 plus the rounding allowance over the $12.482 each unit repairs at the $98
+    ///         bankruptcy settlement: $12.50 of finish cost less the executor's 2 bp of the $90
+    ///         mark, more than 0.1% of the $8 averted. The listed
     ///         short, 2 @ $70 against $41, is $1 inside its collateral and below maintenance;
     ///         netting it costs $60 against $10 + $4 + $41, so the first pass leaves it, and
     ///         after the close its overlap of 0.79 would fit, but the held-only pass does not
@@ -1522,7 +1920,7 @@ contract AdlEdgeTest is Test {
         BazaarTypes.AdlResult memory r =
             h.execAdlBoth(_one(winner), new address[](0), _paramsAtMark(100 * SCALE, 90 * SCALE, 15));
 
-        uint256 ordinary = Math.mulDiv(115.000001e18, 10 * SCALE, 12_492e16, Math.Rounding.Ceil);
+        uint256 ordinary = Math.mulDiv(115.000001e18, 10 * SCALE, 124.82e18, Math.Rounding.Ceil);
         assertEq(r.totalLiqSize, ordinary, "the ordinary sizing, not the whole inventory");
         assertEq(h.pendingSize(), 10 * SCALE - ordinary, "inventory remains");
         assertEq(h.bucketSize(loser), 2 * SCALE, "the listed account is open");
@@ -1594,8 +1992,9 @@ contract AdlEdgeTest is Test {
     ///         nettings' $50 beyond their own backing, the two $0.05 rewards, the 6 survivors'
     ///         $24 and the rounding allowance, less the $51 of free capital and arrears, is
     ///         $23.100001, and each unit closed at the $110 mark covers $19 of it — $5 of earmark,
-    ///         $10 realized and its $4 share of the survivors' cushion. The leg closes that at the
-    ///         mark, the pass after it nets both accounts, and the window releases in one batch.
+    ///         $10 realized and its $4 share of the survivors' cushion; closed only for the
+    ///         nettings, it pays the executor nothing. The leg closes that at the mark, the pass
+    ///         after it nets both accounts, and the window releases in one batch.
     function test_deferred_heldWindowAboveWater_closesWhatTheNettingGateNeeds() public {
         _aboveWaterHeldSetup();
 
@@ -2094,8 +2493,8 @@ contract AdlEdgeTest is Test {
         assertEq(h.deferredCount(), 0, "list emptied");
         // $100 lost from the $100 entry at the mark, $50 of it the earmark and $50 the fund's
         // own; the deferred account's $10 seized in; its seizure reward out, the $0.05 floor:
-        // it became the inventory, so 2 bp of its $1,080 is left to whoever retires it. A close
-        // at the mark averts nothing and earns nothing itself.
+        // it became the inventory, so 2 bp of its $1,080 is left to whoever retires it. The
+        // fund carried the inventory, so the closes are for the account alone and earn nothing.
         assertEq(h.insurance(), 170e18 - 100e18 + 10e18 - 0.05e18, "the fund paid the gap to the mark");
         assertEq(h.claimable(address(this)), 0.05e18, "the flat seizure reward only");
 
@@ -2130,7 +2529,7 @@ contract AdlEdgeTest is Test {
         assertEq(h.pendingSize(), 12 * SCALE, "the deferred long is the inventory now");
         assertTrue(h.pendingIsLong(), "on its own side");
         // $100 lost at the mark, the $10 seized in, the $0.05 floor out: the account became the
-        // inventory, so it earns no rate on its $1,320.
+        // inventory, so it earns no rate on its $1,320, and the closes for it earn nothing.
         assertEq(h.insurance(), 170e18 - 100e18 + 10e18 - 0.05e18, "the fund paid the gap to the mark");
     }
 
@@ -2154,18 +2553,23 @@ contract AdlEdgeTest is Test {
         h.pushDeferred(loser);
     }
 
-    /// @dev The two parts of the close on that setup. The fund carries the rest once it has
-    ///      closed enough at $91 to cover the $55 finish cost less its $6: each unit there takes
-    ///      $5.50 of finish cost off, frees $1.80 of reserve and costs the $0.001 executor cut of
-    ///      the $1 it averts, $7.299 in all, for $49 plus the rounding allowance. The netting then
-    ///      needs $12 beyond its own backing, its $0.05 seizure reward and the finish cost of the
-    ///      8 units it leaves, $44, less the fund's $6, plus the allowance: $50.050001. The units
-    ///      at $91 cover $7.299 each of that, and each unit past them closes at the $90 mark,
-    ///      where the fund pays $1 past the earmark and nothing is averted: $6.30.
-    function _partialSplit() internal pure returns (uint256 atBankruptcy, uint256 atMark) {
-        atBankruptcy = Math.mulDiv(49.000001e18, 10 * SCALE, 72.99e18, Math.Rounding.Ceil);
-        uint256 covered = Math.mulDiv(54.99e18, atBankruptcy, 10 * SCALE) + Math.mulDiv(18e18, atBankruptcy, 10 * SCALE);
-        atMark = Math.mulDiv(50.050001e18 - covered, 10 * SCALE, 63e18, Math.Rounding.Ceil);
+    /// @dev The two parts of the close on that setup, and the units the executor is paid for. As
+    ///      the batch begins the fund carries the rest once it has closed enough at $91 to cover
+    ///      the $55 finish cost less its $6: each unit there takes $5.50 of finish cost off, frees
+    ///      $1.80 of reserve and pays the executor $0.018, 2 bp of the $90 mark, more than 0.1% of
+    ///      the $1 it averts: $7.282 in all, for $49 plus the rounding allowance. Absorbing the
+    ///      deferred account takes its 2 units off the fund's exposure as well, so the executor is
+    ///      paid on that figure less 2 units, and the units at $91 cover $7.30 each of the $49
+    ///      plus that payment. The netting then needs $12 beyond its own backing, its $0.05
+    ///      seizure reward and the finish cost of the 8 units it leaves, $44, less the fund's $6,
+    ///      plus the allowance: $50.050001, and the payment. Each unit past the ones at $91 closes
+    ///      at the $90 mark, where the fund pays $1 past the earmark and, closed only for the
+    ///      deferred account, nothing to the executor: $6.30.
+    function _partialSplit() internal pure returns (uint256 atBankruptcy, uint256 atMark, uint256 paid) {
+        paid = Math.mulDiv(49.000001e18, 10 * SCALE, 72.82e18, Math.Rounding.Ceil) - 2 * SCALE;
+        atBankruptcy = Math.mulDiv(49.000001e18 + _rate(paid, 90 * SCALE), 10 * SCALE, 73e18, Math.Rounding.Ceil);
+        uint256 covered = Math.mulDiv(55e18, atBankruptcy, 10 * SCALE) + Math.mulDiv(18e18, atBankruptcy, 10 * SCALE);
+        atMark = Math.mulDiv(50.050001e18 + _rate(paid, 90 * SCALE) - covered, 10 * SCALE, 63e18, Math.Rounding.Ceil);
     }
 
     /// @notice Part of the inventory is the fund's to shed and part of the close is only for the
@@ -2175,7 +2579,7 @@ contract AdlEdgeTest is Test {
     ///         twice, at each price.
     function test_deferred_heldWindowUnderWater_settlesThePartTheFundCannotCarryAtBankruptcy() public {
         _partialSetup();
-        (uint256 atBankruptcy, uint256 atMark) = _partialSplit();
+        (uint256 atBankruptcy, uint256 atMark, uint256 paid) = _partialSplit();
         uint256 total = atBankruptcy + atMark;
 
         vm.recordLogs();
@@ -2185,7 +2589,7 @@ contract AdlEdgeTest is Test {
 
         assertEq(r.settlementPrice, 91 * SCALE, "the inventory's settlement price is its bankruptcy price");
         assertEq(r.totalLiqSize, total, "both parts");
-        assertLt(total, 7 * SCALE, "about 6.88 of the 10 units");
+        assertLt(total, 7 * SCALE, "about 6.89 of the 10 units");
 
         LoggedClose[] memory closes = _loggedCloses(logs);
         assertEq(closes.length, 2, "the winner is closed in two parts");
@@ -2210,9 +2614,11 @@ contract AdlEdgeTest is Test {
         assertEq(h.pendingSize(), 10 * SCALE - total - 2 * SCALE, "the netting took its 2 units off the remainder");
         assertTrue(h.pendingIsLong(), "which kept its side");
         assertEq(h.deficit(), 0, "nothing went unpaid");
-        // The executor earns the netting's seizure reward and 0.1% of the $1 a unit the
-        // bankruptcy-priced part averted; the part at the mark averts nothing.
-        assertEq(h.claimable(address(this)), 0.05e18 + Math.mulDiv(atBankruptcy, 10, 10_000), "rewards");
+        // The executor earns the netting's seizure reward and 2 bp at the $90 mark of the units
+        // it is paid for, which avert only $1 each: the restoring figure as the batch began less
+        // the account's 2 units, which absorbing it takes off the fund's exposure. The rest of
+        // the close earns nothing.
+        assertEq(h.claimable(address(this)), 0.05e18 + _rate(paid, 90 * SCALE), "rewards");
         // $9 a unit paid at $91, all of it earmark; $10 a unit at $90, $1 of it the fund's own;
         // the account's $10 seized in and the netting's $40 out; the rewards out.
         assertApproxEqAbs(
@@ -2248,22 +2654,27 @@ contract AdlEdgeTest is Test {
     }
 
     /// @notice The $2 a unit the estates took before liquidation is folded into the $89
-    ///         bankruptcy price, and the restoring figure reads it so: 6.70 units at $89 put the
+    ///         bankruptcy price, and the restoring figure reads it so: 6.72 units at $89 put the
     ///         fund on the release line on their own. The units past them are sized on their own
     ///         settlement figures and close at the $88 mark, which the fund can pay for, so the
     ///         batch nets the deferred account and ends the window in one go.
     function test_deferred_heldWindowUnderWater_receivedFunding_restoringFigureOnTheLine_endsTheWindow() public {
         _receivedFundingSetup();
-        // The restoring figure: the $54 band-edge finish cost less the fund's $6, plus the
-        // rounding allowance, over the $7.159 a unit a close at $89 frees — $5.40 of finish cost
-        // and $1.76 of reserve, less the executor's cut on the $1 averted. The netting close then
-        // needs $16.50, the $0.05 reward and the 8 remaining units' $43.20 of finish cost, less
-        // the fund's $6, plus the allowance; each unit at $88 takes $5.40 of finish cost off,
-        // costs $1 past its earmark and frees $1.76 of reserve.
-        uint256 atBankruptcy = Math.mulDiv(48.000001e18, 10 * SCALE, 71.59e18, Math.Rounding.Ceil);
-        uint256 covered =
-            Math.mulDiv(53.99e18, atBankruptcy, 10 * SCALE) + Math.mulDiv(17.6e18, atBankruptcy, 10 * SCALE);
-        uint256 atMark = Math.mulDiv(53.750001e18 - covered, 10 * SCALE, 61.6e18, Math.Rounding.Ceil);
+        // As the batch begins, the $54 band-edge finish cost less the fund's $6, plus the
+        // rounding allowance, over the $7.1424 a unit a close at $89 frees — $5.40 of finish
+        // cost and $1.76 of reserve, less the executor's 2 bp of the $88 mark. The executor is
+        // paid on that figure less the deferred account's 2 units, which absorbing it takes off
+        // the fund's exposure, so the restoring figure covers the $48 plus that payment at
+        // $7.16 a unit. The netting close then needs $16.50, the $0.05 reward and the 8 remaining
+        // units' $43.20 of finish cost, less the fund's $6, plus the allowance and the payment;
+        // each unit at $88 takes $5.40 of finish cost off, costs $1 past its earmark and frees
+        // $1.76 of reserve, paying the executor nothing.
+        uint256 paid = Math.mulDiv(48.000001e18, 10 * SCALE, 71.424e18, Math.Rounding.Ceil) - 2 * SCALE;
+        uint256 atBankruptcy =
+            Math.mulDiv(48.000001e18 + _rate(paid, 88 * SCALE), 10 * SCALE, 71.6e18, Math.Rounding.Ceil);
+        uint256 covered = Math.mulDiv(54e18, atBankruptcy, 10 * SCALE) + Math.mulDiv(17.6e18, atBankruptcy, 10 * SCALE);
+        uint256 atMark =
+            Math.mulDiv(53.750001e18 + _rate(paid, 88 * SCALE) - covered, 10 * SCALE, 61.6e18, Math.Rounding.Ceil);
 
         vm.recordLogs();
         BazaarTypes.AdlResult memory r =
@@ -2287,12 +2698,13 @@ contract AdlEdgeTest is Test {
     ///         seized, the estates having taken $3 a unit of funding before liquidation, is
     ///         bankrupt at $88; at the $87 mark the fund holds $3 above the earmark and no reserve.
     ///         The deferred short, 12 @ $80 against $10, outnumbers the inventory, so the batch is
-    ///         sized to the whole of it. The restoring figure calls for 9.44 units at $88: the
-    ///         $53.50 band-edge finish cost less the fund's $3, over the $5.349 a unit a close
-    ///         there frees ($5.35 of finish cost less the cut on the $1 averted). The other 0.56
-    ///         cost the fund $1 a unit past their earmark at the mark, which its $3 pays, so they
-    ///         close at $87. The inventory is gone, and the deferred short becomes the inventory
-    ///         in the same batch.
+    ///         sized to the whole of it, and none of the close pays the executor: the short, counted
+    ///         at its full size, is more than the inventory the fund could not carry. The restoring
+    ///         figure calls for 9.44 units at $88: the $53.50 band-edge finish cost less the
+    ///         fund's $3, over the $5.35 of finish cost a unit closed there takes off. The other
+    ///         0.56 cost the fund $1 a unit past their earmark at the mark, which its $3 pays, so
+    ///         they close at $87. The inventory is gone, and the deferred short becomes the
+    ///         inventory in the same batch.
     function test_deferred_heldWindowUnderWater_receivedFunding_restPaysAtTheMark() public {
         h.setPendingLiq(10 * SCALE, 880 * SCALE, true);
         h.setPendingLiqEntryNotional(1000 * SCALE);
@@ -2303,7 +2715,7 @@ contract AdlEdgeTest is Test {
         h.setBucket(winner, false, 10 * SCALE, 1100 * SCALE, 100 * SCALE);
         h.setOI(12 * SCALE, 22 * SCALE, 1200 * SCALE, 2060 * SCALE);
         h.pushDeferred(loser);
-        uint256 restoring = Math.mulDiv(50.500001e18, 10 * SCALE, 53.49e18, Math.Rounding.Ceil);
+        uint256 restoring = Math.mulDiv(50.500001e18, 10 * SCALE, 53.5e18, Math.Rounding.Ceil);
 
         vm.recordLogs();
         BazaarTypes.AdlResult memory r =
@@ -2325,11 +2737,10 @@ contract AdlEdgeTest is Test {
         assertEq(h.deferredCount(), 0, "list emptied");
         assertEq(h.deficit(), 0, "nothing went unpaid");
         // $9 a unit paid at $88, all of it earmark; $10 a unit at $87, $1 of it the fund's own;
-        // the account's $10 seized in; its seizure reward, the $0.05 floor since it became the
-        // inventory rather than 2 bp of its $1,044, and the 0.1% cut of the $1 a unit the $88
-        // part averted out.
-        uint256 rewards = 0.05e18 + Math.mulDiv(restoring, 10, 10_000);
-        assertEq(h.claimable(address(this)), rewards, "the seizure reward and the averted cut");
+        // the account's $10 seized in; its seizure reward out, the $0.05 floor since it became
+        // the inventory rather than 2 bp of its $1,044.
+        uint256 rewards = 0.05e18;
+        assertEq(h.claimable(address(this)), rewards, "the seizure reward alone");
         assertApproxEqAbs(
             h.insurance(),
             93e18 - 90e18 - (10 * SCALE - restoring) + 10e18 - rewards,
@@ -2344,9 +2755,9 @@ contract AdlEdgeTest is Test {
     ///         seized, the estates having taken $4 a unit of funding before liquidation, is
     ///         bankrupt at $87; at the $83 mark the fund holds $16 above the earmark against a
     ///         $19.92 reserve. The deferred short, 2 @ $76 against $13, is $1 past its collateral,
-    ///         and netting it costs $9 beyond its own backing. On its own the inventory needs 8.71
-    ///         units closed; with the account netted, 7.97. The batch closes 7.97 at $87 in one
-    ///         part, nets the account and releases the window: closing 8.71 would haircut 0.74
+    ///         and netting it costs $9 beyond its own backing. On its own the inventory needs 8.72
+    ///         units closed; with the account netted, 7.98. The batch closes 7.98 at $87 in one
+    ///         part, nets the account and releases the window: closing 8.72 would haircut 0.74
     ///         more units for inventory the netting retires.
     function test_deferred_heldWindowUnderWater_nettingFigureBelowTheRestoring_closesTheNettingFigure() public {
         h.setPendingLiq(10 * SCALE, 870 * SCALE, true);
@@ -2359,13 +2770,17 @@ contract AdlEdgeTest is Test {
         h.setBucket(winner, false, 10 * SCALE, 1100 * SCALE, 100 * SCALE);
         h.setOI(2 * SCALE, 12 * SCALE, 200 * SCALE, 1252 * SCALE);
         h.pushDeferred(loser);
-        // The restoring figure: the $81.50 band-edge finish cost plus the $3.92 the fund sits
-        // under its reserve, plus the rounding allowance, over $9.806 a unit ($8.15 of finish
-        // cost and $1.66 of reserve, less the cut on $4 averted). The netting close at $87: $9 +
-        // $0.05 + the 8 remaining units' $65.20 of finish cost + the $3.92 + the allowance, over
-        // the same $9.806.
-        uint256 restoring = Math.mulDiv(85.420001e18, 10 * SCALE, 98.06e18, Math.Rounding.Ceil);
-        uint256 netting = Math.mulDiv(78.170001e18, 10 * SCALE, 98.06e18, Math.Rounding.Ceil);
+        // As the batch begins, the restoring figure is the $81.50 band-edge finish cost plus the
+        // $3.92 the fund sits under its reserve, plus the rounding allowance, over $9.7934 a
+        // unit ($8.15 of finish cost and $1.66 of reserve, less the executor's 2 bp of the $83
+        // mark, more than 0.1% of the $4 averted). The executor is paid on that figure less the
+        // account's 2 units, which absorbing it takes off the fund's exposure, so with that
+        // payment added the leg's figures are solved at $9.81 a unit: the restoring figure on the
+        // same $85.420001, and the netting close at $87 on $9 + $0.05 + the 8 remaining units'
+        // $65.20 of finish cost + the $3.92 + the allowance.
+        uint256 paid = Math.mulDiv(85.420001e18, 10 * SCALE, 97.934e18, Math.Rounding.Ceil) - 2 * SCALE;
+        uint256 restoring = Math.mulDiv(85.420001e18 + _rate(paid, 83 * SCALE), 10 * SCALE, 98.1e18, Math.Rounding.Ceil);
+        uint256 netting = Math.mulDiv(78.170001e18 + _rate(paid, 83 * SCALE), 10 * SCALE, 98.1e18, Math.Rounding.Ceil);
         assertLt(netting, restoring, "the netting figure is the smaller");
 
         vm.recordLogs();
@@ -2377,7 +2792,7 @@ contract AdlEdgeTest is Test {
         assertEq(closes[0].size, netting, "the netting figure");
         assertEq(closes[0].price, 87 * SCALE, "at the bankruptcy price");
         uint256 settled = netting;
-        assertEq(r.totalLiqSize, settled, "7.97 units, not the 8.71 the inventory alone would need");
+        assertEq(r.totalLiqSize, settled, "7.98 units, not the 8.72 the inventory alone would need");
         assertEq(h.bucketCollateral(winner), 100e18 + Math.mulDiv(settled, 23e18, SCALE), "$23 a unit at $87");
         assertEq(h.bucketSize(loser), 0, "the deferred account is netted");
         assertEq(h.deferredCount(), 0, "and delisted");
@@ -2420,7 +2835,8 @@ contract AdlEdgeTest is Test {
         assertEq(h.pendingSize(), 12 * SCALE, "the deferred short is the inventory now");
         assertEq(h.deficit(), 0, "nothing went unpaid");
         // The close spent only the $50 earmark; the account's $10 seized in, its $0.05 seizure
-        // reward out: it became the inventory, so it earns no rate.
+        // reward out: it became the inventory, so it earns no rate, and the closes made for it
+        // earn nothing either.
         assertEq(h.insurance(), 1e18 + 10e18 - 0.05e18, "free capital untouched by the close");
     }
 
@@ -2587,10 +3003,11 @@ contract AdlEdgeTest is Test {
     /// @dev The size the inventory leg closes on the shared setup below, and the score it ranks its
     ///      winner at. One long unit at $100 against a $10 fund, marked $90: finishing the unit at
     ///      the $85.50 band edge would cost $14.50 against $10 of capital, plus the rounding
-    ///      allowance, and each unit closed repairs $14.49 of that. The score is the winner's $50
-    ///      of profit AT THE SNAPSHOT over its $10 of collateral; at the live mark the same winner
-    ///      would score 6.
-    uint256 internal constant INVENTORY_LEG_CLOSE = 310_559_075_224_292_616;
+    ///      allowance, and each unit closed repairs $14.482 of that: the $14.50 less the
+    ///      executor's 2 bp of the $90 mark, more than 0.1% of the $10 averted. The score is the
+    ///      winner's $50 of profit AT THE SNAPSHOT over its $10 of collateral; at the live mark the
+    ///      same winner would score 6.
+    uint256 internal constant INVENTORY_LEG_CLOSE = 310_730_631_128_297_197;
     uint256 internal constant INVENTORY_LEG_SCORE = 5e18;
 
     function _bothLegsSetup() internal {
@@ -2857,6 +3274,8 @@ contract AdlEdgeTest is Test {
     ///         The close then needs $18 beyond the two slices' own backing, two $0.05 seizure
     ///         rewards and the 8 remaining units' $44 of finish cost, less the $6, plus the
     ///         rounding allowance: $56.100001, where _partialSplit's one account needs $50.050001.
+    ///         Both add the executor's payment, on the same units: the two accounts take as much
+    ///         off the fund's exposure as the one.
     function test_deferred_twoHeldAccounts_bothNettedAfterTheLeg() public {
         h.setPendingLiq(10 * SCALE, 910 * SCALE, true);
         h.setPendingLiqEntryNotional(1000 * SCALE);
@@ -2868,9 +3287,10 @@ contract AdlEdgeTest is Test {
         h.setOI(2 * SCALE, 12 * SCALE, 200 * SCALE, 1260 * SCALE);
         h.pushDeferred(loser);
         h.pushDeferred(loser2);
-        uint256 atBankruptcy = Math.mulDiv(49.000001e18, 10 * SCALE, 72.99e18, Math.Rounding.Ceil);
-        uint256 covered = Math.mulDiv(54.99e18, atBankruptcy, 10 * SCALE) + Math.mulDiv(18e18, atBankruptcy, 10 * SCALE);
-        uint256 atMark = Math.mulDiv(56.100001e18 - covered, 10 * SCALE, 63e18, Math.Rounding.Ceil);
+        (uint256 atBankruptcy,, uint256 paid) = _partialSplit();
+        uint256 covered = Math.mulDiv(55e18, atBankruptcy, 10 * SCALE) + Math.mulDiv(18e18, atBankruptcy, 10 * SCALE);
+        uint256 atMark =
+            Math.mulDiv(56.100001e18 + _rate(paid, 90 * SCALE) - covered, 10 * SCALE, 63e18, Math.Rounding.Ceil);
         uint256 total = atBankruptcy + atMark;
 
         BazaarTypes.AdlResult memory r =
@@ -2882,7 +3302,11 @@ contract AdlEdgeTest is Test {
         assertEq(h.deferredCount(), 0, "list emptied");
         assertEq(h.pendingSize(), 10 * SCALE - total - 2 * SCALE, "the nettings took their 2 units off the remainder");
         assertEq(h.deficit(), 0, "nothing went unpaid");
-        assertEq(h.claimable(address(this)), 0.1e18 + Math.mulDiv(atBankruptcy, 10, 10_000), "two seizure rewards");
+        assertEq(
+            h.claimable(address(this)),
+            0.1e18 + _rate(paid, 90 * SCALE),
+            "two seizure rewards and the rate on the units the accounts leave the leg"
+        );
         (, uint256 base, uint256 worstFinish,) = h.exposure(90 * SCALE, 0, 1_000);
         assertLe(worstFinish, base, "the window releases");
     }

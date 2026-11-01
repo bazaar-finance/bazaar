@@ -513,7 +513,8 @@ contract BazaarPairLensTest is Test {
     function test_getInsuranceWithdrawalConstants() public view {
         (
             uint256 cd,
-            uint256 win,
+            uint256 continuousWin,
+            uint256 sessionWin,
             uint256 rlp,
             uint256 rlbp,
             uint256 aboveTargetBp,
@@ -521,7 +522,8 @@ contract BazaarPairLensTest is Test {
             uint256 belowTargetFundCapBp
         ) = lens.getInsuranceWithdrawalConstants();
         assertEq(cd, InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN);
-        assertEq(win, InsuranceVaultLib.INSURANCE_WITHDRAWAL_WINDOW);
+        assertEq(continuousWin, InsuranceVaultLib.INSURANCE_WITHDRAWAL_WINDOW_CONTINUOUS);
+        assertEq(sessionWin, InsuranceVaultLib.INSURANCE_WITHDRAWAL_WINDOW_SESSION);
         assertEq(rlp, InsuranceVaultLib.INSURANCE_WITHDRAWAL_RATE_LIMIT_PERIOD);
         assertEq(rlbp, InsuranceVaultLib.INSURANCE_WITHDRAWAL_RATE_LIMIT_BP);
         assertEq(aboveTargetBp, InsuranceVaultLib.INSURANCE_WITHDRAWAL_ABOVE_TARGET_RATE_LIMIT_BP);

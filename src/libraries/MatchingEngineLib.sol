@@ -614,12 +614,12 @@ library MatchingEngineLib {
             if (ctx.isOracleStale) {
                 // Fresh-oracle fills are unbanded: the margin gates price fresh exposure at the
                 // live oracle and charge the fill-vs-mark gap up front, and FundingLib clamps
-                // every print to ±MAX_MARK_DEVIATION_BP of index before it enters the mark EMA —
-                // an off-mark fill is economically real for its two parties and cannot drag the
-                // funding mark everyone else pays against. Under the stale fallback those gates
-                // judge against an aged reference, so fills are confined to
-                // ±MAX_STALE_DEVIATION_BP of it. The two violation directions get opposite
-                // dispositions:
+                // every print to ±MAX_MARK_DEVIATION_BP of index before its premium enters the
+                // mark's tallies — an off-mark fill is economically real for its two parties and
+                // moves the funding mark everyone else pays against no further than a print at
+                // the band edge. Under the stale fallback those gates judge against an aged
+                // reference, so fills are confined to ±MAX_STALE_DEVIATION_BP of it. The two
+                // violation directions get opposite dispositions:
                 //  • FAR side — maker priced beyond the band away from the taker. The taker is
                 //    the one demanding out-of-band execution; the list is price-sorted so nothing
                 //    deeper could fill either, and the remainder cannot rest against a maker it

@@ -51,7 +51,22 @@ library InsuranceVaultLib {
     ///         fund stays through the notice period an approved identifier upgrade gives traders to
     ///         unwind: a request filed at approval ripens only after activation.
     uint256 internal constant INSURANCE_WITHDRAWAL_COOLDOWN = 13 days;
-    uint256 internal constant INSURANCE_WITHDRAWAL_WINDOW = 3 days;
+    /// @notice How long a request stays executable once its cooldown has run, on a continuously
+    ///         traded pair (withdrawalWindowOf). Both execute calls need a fresh price, and a 24/7
+    ///         venue prints one at any hour. Two days outlast an ADL window that resolves at the
+    ///         last moment its timeout and runway allow (VaultHealthLib.ADL_TIMEOUT_DURATION plus
+    ///         BazaarTypes.ADL_TERMINATION_GRACE), throughout which the vault reads unhealthy and
+    ///         redemptions are refused, and still leave most of a day for the lock, its claim delay
+    ///         and several turns of the shared rate-limit period. Every hour past that is time in
+    ///         which the LP picks the moment it locks.
+    uint256 internal constant INSURANCE_WITHDRAWAL_WINDOW_CONTINUOUS = 2 days;
+    /// @notice The same window on a non-continuously traded pair. Its execute calls refuse the
+    ///         frozen closing mark, so only the hours its venue trades are usable. Four days hold a
+    ///         single holiday next to a weekend, the reopen and the reopen claim delay after it,
+    ///         inside a window that opened as the venue shut. A longer closure can leave a request
+    ///         without a trading hour, and the LP files again: Easter on a venue that shuts both
+    ///         Good Friday and Easter Monday, or a week-long holiday such as Lunar New Year.
+    uint256 internal constant INSURANCE_WITHDRAWAL_WINDOW_SESSION = 4 days;
     /// @notice How long after a live-pair redemption's lock its paying call opens. The share price
     ///         learns of a position that a move carried past bankruptcy only when a keeper seizes
     ///         it, so a redemption priced at a single moment the LP picks can land in between and
@@ -549,7 +564,10 @@ library InsuranceVaultLib {
             if (block.timestamp < requestTs + INSURANCE_WITHDRAWAL_COOLDOWN) {
                 revert InsuranceVaultLib__CooldownNotElapsed();
             }
-            if (block.timestamp > requestTs + INSURANCE_WITHDRAWAL_COOLDOWN + INSURANCE_WITHDRAWAL_WINDOW) {
+            if (
+                block.timestamp
+                    > requestTs + INSURANCE_WITHDRAWAL_COOLDOWN + withdrawalWindowOf(params.isContinuouslyTraded)
+            ) {
                 revert InsuranceVaultLib__WithdrawalWindowExpired();
             }
         } else if (vault.totalLongOI != 0 || vault.totalShortOI != 0) {
@@ -627,9 +645,8 @@ library InsuranceVaultLib {
             // second pays the lower of it and the amount then (INSURANCE_WITHDRAWAL_CLAIM_DELAY).
             // A terminated pair's residual is final, so its redemption needs no second moment.
             bool isLock;
-            (isLock, withdrawAmount) = _lockOrClaim(
-                withdrawalLock, caller, requestTs, reopenGapEma, shareAmount, withdrawAmount, params.pairId
-            );
+            (isLock, withdrawAmount) =
+                _lockOrClaim(withdrawalLock, caller, requestTs, reopenGapEma, shareAmount, withdrawAmount, params);
             if (isLock) return (0, totalInsuranceShares);
 
             // The verdict the caller judged saw the fund before this payout, so while the vault
@@ -706,7 +723,8 @@ library InsuranceVaultLib {
     /// @param reopenGapEma The pair's discontinuity record: the last storage gap and price jump
     /// @param shareAmount The requested shares, reported by the lock event
     /// @param amountNow What the requested shares are worth in this call
-    /// @param pairId The pair id carried by the lock event
+    /// @param params Withdrawal parameters: the trading-calendar flag sizes the window
+    ///        (withdrawalWindowOf), and the pair id is carried by the lock event
     /// @return isLock Whether this call recorded the lock, in which case it pays nothing
     /// @return amount What this call pays when it is the claim
     function _lockOrClaim(
@@ -716,21 +734,22 @@ library InsuranceVaultLib {
         BazaarTypes.ReopenGapEma storage reopenGapEma,
         uint256 shareAmount,
         uint256 amountNow,
-        bytes32 pairId
+        BazaarTypes.InsuranceWithdrawParams memory params
     ) private returns (bool isLock, uint256 amount) {
-        uint256 windowOpensTs = requestTs + INSURANCE_WITHDRAWAL_COOLDOWN;
+        uint256 windowOpensTs =
+            requestTs + INSURANCE_WITHDRAWAL_COOLDOWN;
         uint256 lock = withdrawalLock[caller];
         uint256 lockTs = uint256(uint64(lock));
         uint256 lastGapTs = reopenGapEma.lastObsTs;
         uint256 lastJumpTs = reopenGapEma.lastJumpTs;
         if (lockTs < windowOpensTs) {
             uint256 opensTs = claimOpensAt(block.timestamp, lastGapTs, lastJumpTs);
-            uint256 windowEndTs = windowOpensTs + INSURANCE_WITHDRAWAL_WINDOW;
+            uint256 windowEndTs = windowOpensTs + withdrawalWindowOf(params.isContinuouslyTraded);
             // A lock whose claim could only open after the window closes would just lapse with
             // it, so it is refused with the reason instead of being recorded.
             if (opensTs > windowEndTs) revert InsuranceVaultLib__LockTooLate(opensTs, windowEndTs);
             withdrawalLock[caller] = (uint256(SafeCast.toUint192(amountNow)) << 64) | block.timestamp;
-            emit BazaarTypes.InsuranceWithdrawalLocked(pairId, caller, shareAmount, amountNow, opensTs);
+            emit BazaarTypes.InsuranceWithdrawalLocked(params.pairId, caller, shareAmount, amountNow, opensTs);
             return (true, 0);
         }
         uint256 claimTs = claimOpensAt(lockTs, lastGapTs, lastJumpTs);
@@ -742,6 +761,15 @@ library InsuranceVaultLib {
     // ================================================================
     //                        Redemption Timing
     // ================================================================
+
+    /// @notice How long a request stays executable once its cooldown has run, on a pair with the
+    ///         given trading calendar. Shared by executeInsuranceWithdrawal and BazaarPairLens, so
+    ///         the window end a frontend is shown is the one execution enforces.
+    /// @param isContinuouslyTraded Whether the pair's venue trades around the clock
+    /// @return The window length in seconds
+    function withdrawalWindowOf(bool isContinuouslyTraded) internal pure returns (uint256) {
+        return isContinuouslyTraded ? INSURANCE_WITHDRAWAL_WINDOW_CONTINUOUS : INSURANCE_WITHDRAWAL_WINDOW_SESSION;
+    }
 
     /// @notice When the paying call of a redemption locked at `lockTs` opens: a claim delay after
     ///         the lock and after the last price jump, and a reopen delay after the last stored

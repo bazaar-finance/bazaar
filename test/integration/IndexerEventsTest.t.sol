@@ -11,7 +11,8 @@ import {PythSeed} from "../PythSeed.sol";
 
 /// @title IndexerEventsTest
 /// @notice The events an indexer rebuilds a pair from: one Trade per fill carrying both sides, an
-///         OrderUpdated at every order lifecycle step with the reason for each cancellation, the
+///         OrderUpdated at every order lifecycle step with the reason for each cancellation (an
+///         amendment is the one step reported by its own event, OrderAmended), the
 ///         stored oracle prices with the funding index they advanced, the pair fixing its own
 ///         settlement price on insolvency, and the listing metadata at deployment.
 contract IndexerEventsTest is IntegrationBase {
@@ -234,6 +235,36 @@ contract IndexerEventsTest is IntegrationBase {
         assertEq(uint8(ups[0].action), uint8(BazaarTypes.OrderAction.Created), "created first");
         assertEq(uint8(ups[1].action), uint8(BazaarTypes.OrderAction.Triggered), "then triggered");
         assertTrue(_inBook(id), "armed at creation");
+    }
+
+    // ---------------------------- OrderAmended ----------------------------
+
+    /// @notice An amendment is the one lifecycle step OrderUpdated does not report: it emits exactly
+    ///         one OrderAmended, naming the owner and carrying the new price, the new total size and
+    ///         the queue position the order now holds.
+    function test_orderAmended_reportsTheMoveAndNothingElse() public {
+        _deposit(alice, 20_000 * BAZAAR_SCALE);
+        uint256 id = _placeLimit(alice, true, BTC / 10, 49_000 * BAZAAR_SCALE);
+        uint256 seq = lens.nextOrderId(address(pair));
+
+        uint256[] memory words = new uint256[](3);
+        (words[0], words[1], words[2]) = (id, 48_500 * BAZAAR_SCALE, BTC / 5);
+        bytes[] memory pu = _freshPrice();
+        vm.recordLogs();
+        vm.prank(alice);
+        pair.amendOrders(words, pu, 0, 0, 0, "", "");
+        Vm.Log[] memory all = vm.getRecordedLogs();
+
+        assertEq(_orderUpdates(all, id).length, 0, "no OrderUpdated for an amendment");
+        Vm.Log[] memory am = _logs(all, BazaarTypes.OrderAmended.selector);
+        assertEq(am.length, 1, "one OrderAmended");
+        assertEq(am[0].topics[1], pair.pairId(), "pair");
+        assertEq(uint256(am[0].topics[2]), id, "order");
+        assertEq(_topicAddress(am[0].topics[3]), alice, "owner");
+        (uint256 price, uint256 size, uint256 prioritySeq) = abi.decode(am[0].data, (uint256, uint256, uint256));
+        assertEq(price, 48_500 * BAZAAR_SCALE, "new price");
+        assertEq(size, BTC / 5, "new total size");
+        assertEq(prioritySeq, seq, "the queue position the move drew");
     }
 
     // ---------------------------- OrderUpdated: cancel reasons ----------------------------

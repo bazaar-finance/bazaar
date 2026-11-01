@@ -1,0 +1,125 @@
+/* Page actions (page-actions.js): buttons beside each chapter's title that copy
+   the page as Markdown or open it in an AI assistant picked from a menu. Colors
+   come from mdBook's theme variables, so every theme in the picker styles them
+   without a rule of its own. */
+
+/* The title and the actions share a wrapping row. Flex items keep their own
+   margins inside the row, so the title's margin moves onto the row, where it
+   collapses with the neighbouring blocks as the bare title's did. */
+.page-title {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.8rem 1.6rem;
+    margin: 2.1rem 0;
+}
+
+.page-title > h1 {
+    margin: 0;
+}
+
+.page-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    font-size: 1.3rem;
+    line-height: 1.4;
+}
+
+.page-action {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.6rem;
+    height: 3rem;
+    padding: 0 1rem;
+    border: 1px solid var(--theme-popup-border);
+    border-radius: 0.6rem;
+    background: var(--bg);
+    color: var(--fg);
+    font: inherit;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.page-action:hover,
+.page-action-toggle[aria-expanded="true"] {
+    background: var(--theme-hover);
+}
+
+.page-action-ai {
+    position: relative;
+}
+
+/* Anchored to the toggle's right edge and so opening leftward: beside a short
+   title the toggle ends at the content's right edge, where a menu opening
+   rightward would run off the page. */
+.page-action-menu {
+    position: absolute;
+    top: calc(100% + 0.4rem);
+    right: 0;
+    z-index: 10;
+    min-width: 24rem;
+    margin: 0;
+    padding: 0.4rem;
+    list-style: none;
+    background: var(--theme-popup-bg);
+    border: 1px solid var(--theme-popup-border);
+    border-radius: 0.8rem;
+    box-shadow: 0 0.4rem 1.6rem rgba(0, 0, 0, 0.25);
+}
+
+.page-action-menu[hidden] {
+    display: none;
+}
+
+/* The `.content a` prefix outranks mdBook's link color and hover underline, and
+   the hover rule below outranks the Liberty theme's yellow link hover, so the
+   items keep the menu's text color. */
+.content a.page-action-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 1rem;
+    padding: 0.8rem 1rem;
+    border-radius: 0.5rem;
+    color: var(--fg);
+    text-decoration: none;
+}
+
+.content a.page-action-item:hover,
+.content a.page-action-item:focus-visible {
+    background: var(--theme-hover);
+    color: var(--fg);
+    text-decoration: none;
+}
+
+.page-action-item svg {
+    margin-top: 0.2rem;
+}
+
+.page-action-item-title,
+.page-action-item-description {
+    display: block;
+}
+
+.page-action-item-description {
+    font-size: 0.9em;
+    opacity: 0.6;
+}
+
+.page-actions svg {
+    flex: none;
+    width: 1.4rem;
+    height: 1.4rem;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.4;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+@media print {
+    .page-actions {
+        display: none;
+    }
+}

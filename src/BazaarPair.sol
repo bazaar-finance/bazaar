@@ -643,6 +643,7 @@ contract BazaarPair is Initializable, ReentrancyGuardTransient {
             terminalState,
             userActiveLimitOrders[user],
             orders,
+            restingTally,
             BazaarTypes.CollateralWithdrawParams({
                 amount: amount,
                 currentPrice: currentPrice,
@@ -1291,13 +1292,13 @@ contract BazaarPair is Initializable, ReentrancyGuardTransient {
         // executable), the batch sizing (the size that restores health is measured against
         // it), the settlement price (the mark replaces the estates' bankruptcy price whenever
         // it sits on the fund's favorable side, so a stale one would close winners at a price
-        // the market has left), and the executor reward (averted loss is the gap between it and
-        // the settlement price). The ranking of `winners` is immune, being frozen at the
-        // snapshot; the deferred cohort ranks at this price (see AdlLib._closeDeferred). Neither
-        // is enough to let the rest run on a mark nobody just confirmed. A caller who cannot
-        // resolve a fresh price supplies priceUpdate; while the feed is genuinely down, the
-        // auction waits, and the timeout cannot claim the pair out from under it either — see
-        // adlTerminationTs.
+        // the market has left), and the executor reward (the keeper rate is valued at it, and the
+        // averted loss is the gap between it and the settlement price). The ranking of `winners`
+        // is immune, being frozen at the snapshot; the deferred cohort ranks at this price (see
+        // AdlLib._closeDeferred). Neither is enough to let the rest run on a mark nobody just
+        // confirmed. A caller who cannot resolve a fresh price supplies priceUpdate; while the
+        // feed is genuinely down, the auction waits, and the timeout cannot claim the pair out
+        // from under it either — see adlTerminationTs.
         if (isPriceStale) revert BazaarPair__AdlPriceStale();
         uint256 currentPrice = priceStruct.spotPrice;
         // Refreshed from this price before the gate and the batch sizing read it: the stored
@@ -1320,7 +1321,8 @@ contract BazaarPair is Initializable, ReentrancyGuardTransient {
             // its counterparties are on the inventory's own side.
             //
             // The library accrues every reward — the seizure of each deferred position it
-            // takes and the executor's share of the bad debt the closes averted — to the
+            // takes, the executor's share of the bad debt the closes against those averted, and
+            // for the inventory's own closes the keeper rate or that share where larger — to the
             // caller's claimable balance, capped at the fund's free capital, and emits
             // AdlExecuted from this contract's address, so it needs the adlId.
             AdlLib.executeAdlCore(
@@ -1435,9 +1437,6 @@ contract BazaarPair is Initializable, ReentrancyGuardTransient {
 
         uint64 currentBlock = _l2Block();
 
-        // Clean up expired limit orders; createOrder reserves what survives against the mark.
-        _cleanupExpiredLimitOrders(user, currentBlock);
-
         // Wallet pulls come first, ahead of the order's creation: the permit sets the allowance
         // that both the relayer fee and a trigger order's bounty (pulled inside createOrder)
         // draw on, so it is executed whenever one is supplied, fee or no fee. The relayer fee
@@ -1453,6 +1452,8 @@ contract BazaarPair is Initializable, ReentrancyGuardTransient {
             orders,
             positionBuckets,
             userActiveLimitOrders,
+            restingTally,
+            book,
             feeEscrow,
             BazaarTypes.CreateOrderParams({
                 pairId: pairId,
@@ -1539,7 +1540,15 @@ contract BazaarPair is Initializable, ReentrancyGuardTransient {
                 revert BazaarPair__RequestorIsNotOrderOwner();
             }
             OrderManagementLib.cancelOrder(
-                orders, positionBuckets, userActiveLimitOrders, book, feeEscrow, orderIds[i], pairId, currentBlock
+                orders,
+                positionBuckets,
+                userActiveLimitOrders,
+                restingTally,
+                book,
+                feeEscrow,
+                orderIds[i],
+                pairId,
+                currentBlock
             );
         }
 
@@ -1614,6 +1623,7 @@ contract BazaarPair is Initializable, ReentrancyGuardTransient {
             orders,
             positionBuckets,
             userActiveLimitOrders,
+            restingTally,
             book,
             marginRequirements,
             lastPairPrice,
@@ -1633,7 +1643,7 @@ contract BazaarPair is Initializable, ReentrancyGuardTransient {
 
     /// @notice Iterates through a user's active limit order set, cancels expired orders and
     ///         removes them from the set. The survivors' reservation is read by the library gate
-    ///         that follows (CollateralLib._restingReserve), once a price is resolved.
+    ///         that follows (CollateralLib._sweepRestingReserve), once a price is resolved.
     /// @param user The address whose limit orders to clean up
     /// @param currentBlock The L2 block the sweep expires orders against
     function _cleanupExpiredLimitOrders(address user, uint64 currentBlock) internal {
@@ -1644,9 +1654,10 @@ contract BazaarPair is Initializable, ReentrancyGuardTransient {
     /// @notice Permissionless janitor: cancels + unlinks any of the given orders that expired
     ///         without reaching a terminal state, and returns the keeper bounty of any terminal
     ///         or expired order to its owner's claimable balance; every other id is skipped
-    ///         silently. The walk removes expired makers on contact and owners sweep their own
-    ///         during create/withdraw — this lets anyone clear dead nodes from the book
-    ///         proactively and release bounties stranded by auto-cancels.
+    ///         silently. The walk removes expired makers on contact, and an owner's set is swept
+    ///         by a withdrawal, a creation at the order cap, and any gate that reads the set in
+    ///         full — this lets anyone clear dead nodes from the book proactively and release
+    ///         bounties stranded by auto-cancels. It pays its caller nothing.
     function sweepExpired(uint256[] calldata orderIds) external nonReentrant {
         // Gated like every other book mutation; the guard-free cancelOrders path remains the
         // owner's terminal-state escape hatch, for bounties as well as for orders.
@@ -2827,4 +2838,11 @@ contract BazaarPair is Initializable, ReentrancyGuardTransient {
     ///         BazaarPairLens.getInsuranceWithdrawalLock. Declared last so the storage layout ahead
     ///         of it is unchanged.
     mapping(address => uint256) internal insuranceWithdrawalLock;
+
+    /// @notice Per-user tallies over the active-order set (BazaarTypes.RestingTally), from which
+    ///         the creation, amendment and withdrawal gates bound the set's reservation without
+    ///         reading every order; the set itself is read only when the bound does not clear
+    ///         the caller. Read through BazaarPairLens.restingTally. Declared last so the storage
+    ///         layout ahead of it is unchanged.
+    mapping(address => BazaarTypes.RestingTally) internal restingTally;
 }

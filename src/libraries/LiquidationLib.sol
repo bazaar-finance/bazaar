@@ -325,15 +325,16 @@ library LiquidationLib {
     ///         position the seizure retires when that is larger.
     /// @dev Retired means taken off the books in the same transaction — netted against the
     ///      opposite inventory, or closed against counterparties — so it never sits on the fund.
-    ///      A part that joins the inventory instead —
-    ///      an estate seized onto the inventory's side or into an empty one, or the rest of one
-    ///      larger than the inventory it nets — is exposure moved onto the fund, and whoever later
-    ///      retires it is paid for that: an unload's sale or a later netting at this rate, an ADL
-    ///      batch's inventory close through its share of the bad debt the close averts. Paying the
-    ///      rate at seizure as well would pay twice for those units. The flat part covers gas on
-    ///      small positions; the rate scales with size. An ADL batch that closes a seized account
-    ///      against its counterparties pays this reward and its share of the bad debt that close
-    ///      averts: one for taking the account off the books, the other for the loss it spared.
+    ///      A part that joins the inventory instead — an estate seized onto the inventory's side
+    ///      or into an empty one, or the rest of one larger than the inventory it nets — is
+    ///      exposure moved onto the fund, and whoever later retires it is paid for that: an
+    ///      unload's sale or a later netting at this rate, an ADL batch's close of the inventory's
+    ///      own exposure at this rate or at its share of the bad debt the close averts where that
+    ///      is larger. Paying the rate at seizure as well would pay twice for those units. The
+    ///      flat part covers gas on small positions; the rate scales with size. An ADL batch that
+    ///      closes a seized account against its counterparties pays this reward and its share of
+    ///      the bad debt that close averts: one for taking the account off the books, the other
+    ///      for the loss it spared.
     /// @param state The account's bucket state at the liquidation price and the live index
     /// @param retiredSize The part of the position the seizure retires (BAZAAR_SCALE precision)
     /// @param price The liquidation price (BAZAAR_SCALE precision)

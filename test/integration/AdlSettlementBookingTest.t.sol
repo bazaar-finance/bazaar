@@ -416,10 +416,10 @@ contract AdlSettlementBookingTest is IntegrationBase {
     ///         the band, so the gate holds and the batch settles at the mark rather than the
     ///         bankruptcy price. The winner is credited no better than market, the vault's loss
     ///         on the slice shrinks by the recovery so the fund keeps that much of its earmark,
-    ///         no reward is paid, and the pair leaves the window healthy. Every unit closed at
-    ///         the mark hands the fund the recovery on it and takes its band-edge finish cost
-    ///         off, so the batch closes only the part that puts the fund on the release line and
-    ///         carries the rest.
+    ///         the executor is paid 2 bp of the close at the mark, and the pair leaves the window
+    ///         healthy. Every unit closed at the mark hands the fund the recovery on it and takes
+    ///         its band-edge finish cost off, less that reward, so the batch closes only the part
+    ///         that puts the fund on the release line and carries the rest.
     function test_markAboveBankruptcy_settlesAtMark_fundKeepsTheRecovery() public {
         _openChain(60_000, false);
         _liquidateEstate();
@@ -433,11 +433,13 @@ contract AdlSettlementBookingTest is IntegrationBase {
 
         vm.warp(vm.getBlockTimestamp() + 15 minutes + 1);
         bytes[] memory pu = _priceAt(40_200);
+        (uint256 owedBefore,) = lens.claimableFees(address(pair), seq);
         vm.recordLogs();
         vm.prank(seq);
         pair.executeAdl(_arr1(bob), new address[](0), pu);
         Close memory c = _findClose(vm.getRecordedLogs(), bob);
         int256 idxAfter = pair.currentFundingIndex();
+        (uint256 owedAfter,) = lens.claimableFees(address(pair), seq);
 
         assertTrue(c.found, "bob closed");
         uint256 closed = c.closedSize;
@@ -463,11 +465,15 @@ contract AdlSettlementBookingTest is IntegrationBase {
         );
         assertEq(_posCollateral(bob) - s.bobCollBefore, uint256(c.realizedPnl), "bucket grew by the credit");
 
-        // Vault: the slice's loss at the bankruptcy price less the recovery to the mark, and no
-        // reward.
+        // Vault: the slice's loss at the bankruptcy price less the recovery to the mark, and the
+        // executor's 2 bp of the closed notional at the mark.
         (uint256 lossAtBankruptcy,) = _vaultLoss(s.inv, idxAfter, closed);
         uint256 loss = lossAtBankruptcy - Math.mulDiv(closed, mark - s.settlementPrice, BAZAAR_SCALE);
-        assertApproxEqAbs(s.insBefore - _insuranceBal(), loss, 1e6, "insurance paid only the loss at the mark");
+        uint256 reward = Math.mulDiv(Math.mulDiv(closed, mark, BAZAAR_SCALE), 2, 10_000);
+        assertEq(owedAfter - owedBefore, reward, "the executor is paid 2 bp of the close at the mark");
+        assertApproxEqAbs(
+            s.insBefore - _insuranceBal(), loss + reward, 1e6, "insurance paid the loss at the mark and the reward"
+        );
         assertApproxEqAbs(_totalDeposited() - s.depBefore, loss, 1e6, "deposits ledger gained the vault's loss");
         assertEq(_deficit(), 0, "no bad debt");
         assertEq(pair.settlementPriceFixedTs(), 0, "pair survives");

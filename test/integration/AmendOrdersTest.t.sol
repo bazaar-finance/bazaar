@@ -108,6 +108,9 @@ contract AmendOrdersTest is AmendTestBase {
         uint256 b = _placeLimit(bob, true, SIZE, 49_000 * BAZAAR_SCALE);
         uint256 counter = lens.nextOrderId(address(pair));
 
+        // The event reports the queue position it keeps: the id it was created under.
+        vm.expectEmit(true, true, true, true, address(pair));
+        emit BazaarTypes.OrderAmended(pair.pairId(), a, alice, 49_000 * BAZAAR_SCALE, SIZE / 2, a);
         _amendAs(alice, _single(a, 49_000 * BAZAAR_SCALE, SIZE / 2));
 
         assertEq(_bidHead(), uint64(a), "alice keeps the front");
@@ -131,6 +134,9 @@ contract AmendOrdersTest is AmendTestBase {
         uint256 b = _placeLimit(bob, true, SIZE, 49_000 * BAZAAR_SCALE);
         uint256 counter = lens.nextOrderId(address(pair));
 
+        // The event reports the fresh queue position the growth drew.
+        vm.expectEmit(true, true, true, true, address(pair));
+        emit BazaarTypes.OrderAmended(pair.pairId(), a, alice, 49_000 * BAZAAR_SCALE, 2 * SIZE, counter);
         _amendAs(alice, _single(a, 49_000 * BAZAAR_SCALE, 2 * SIZE));
 
         assertEq(_bidHead(), uint64(b), "bob moves to the front");
@@ -148,11 +154,9 @@ contract AmendOrdersTest is AmendTestBase {
         vm.recordLogs();
         _amendAs(alice, _single(a, 49_000 * BAZAAR_SCALE, SIZE));
         Vm.Log[] memory logs = vm.getRecordedLogs();
-        bytes32 topic = keccak256(
-            "OrderUpdated(bytes32,uint256,address,(uint8,uint8,bool,bool,uint256,uint256,uint256,uint256,uint256,uint64,uint64,uint64,uint64,uint8,address,uint8))"
-        );
         for (uint256 i; i < logs.length; ++i) {
-            assertTrue(logs[i].topics[0] != topic, "no OrderUpdated for an unchanged order");
+            assertTrue(logs[i].topics[0] != BazaarTypes.OrderAmended.selector, "no OrderAmended for an unchanged order");
+            assertTrue(logs[i].topics[0] != BazaarTypes.OrderUpdated.selector, "no OrderUpdated for an unchanged order");
         }
         assertEq(_seq(a), uint64(a));
         assertEq(lens.nextOrderId(address(pair)), counter);
@@ -177,37 +181,32 @@ contract AmendOrdersTest is AmendTestBase {
         assertEq(bids[1], a, "now the lowest bid");
     }
 
-    /// @notice The event reports the order as stored after the amendment, under the Amended action.
-    function test_emitsAmendedWithTheNewState() public {
+    /// @notice An amendment is reported by exactly one OrderAmended — the order's owner, its new
+    ///         price and size and the queue position it now holds — and by no OrderUpdated: the
+    ///         fields an amendment cannot change are not re-reported.
+    function test_emitsOneOrderAmendedAndNoOrderUpdated() public {
         (uint256 a,) = _twoBids();
-        uint64 expiry = OrderView.order(pair, a).expiryBlock;
-        uint64 seq = uint64(lens.nextOrderId(address(pair)));
+        uint256 seq = lens.nextOrderId(address(pair));
 
-        vm.expectEmit(true, true, true, true, address(pair));
-        emit BazaarTypes.OrderUpdated(
-            pair.pairId(),
-            a,
-            alice,
-            BazaarTypes.OrderUpdatePayload({
-                action: BazaarTypes.OrderAction.Amended,
-                orderType: BazaarTypes.OrderType.Limit,
-                isLong: true,
-                isPostOnly: false,
-                size: 2 * SIZE,
-                filledSize: 0,
-                triggerPrice: 0,
-                limitPrice: 48_500 * BAZAAR_SCALE,
-                maxSlippageBp: 0,
-                canceledBlock: 0,
-                filledBlock: 0,
-                expiryBlock: expiry,
-                prioritySeq: seq,
-                tif: BazaarTypes.TimeInForce.GTC,
-                integrator: address(0),
-                cancelReason: BazaarTypes.CancelReason.None
-            })
-        );
+        vm.recordLogs();
         _amendAs(alice, _single(a, 48_500 * BAZAAR_SCALE, 2 * SIZE));
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        uint256 amended;
+        for (uint256 i; i < logs.length; ++i) {
+            assertTrue(logs[i].topics[0] != BazaarTypes.OrderUpdated.selector, "no OrderUpdated for an amendment");
+            if (logs[i].topics[0] != BazaarTypes.OrderAmended.selector) continue;
+            ++amended;
+            assertEq(logs[i].emitter, address(pair));
+            assertEq(logs[i].topics[1], pair.pairId());
+            assertEq(uint256(logs[i].topics[2]), a);
+            assertEq(address(uint160(uint256(logs[i].topics[3]))), alice);
+            (uint256 price, uint256 size, uint256 prioritySeq) = abi.decode(logs[i].data, (uint256, uint256, uint256));
+            assertEq(price, 48_500 * BAZAAR_SCALE);
+            assertEq(size, 2 * SIZE);
+            assertEq(prioritySeq, seq, "the queue position drawn for the move");
+        }
+        assertEq(amended, 1, "one OrderAmended");
     }
 
     /// @notice A relinked order finds its slot from its old neighbours, in either direction: down
@@ -432,7 +431,10 @@ contract AmendOrdersTest is AmendTestBase {
             abi.encodeWithSelector(OrderManagementLib.OrderManagementLib__AmendSizeNotAboveFilled.selector, a);
         _amendExpect(alice, _single(a, 49_000 * BAZAAR_SCALE, SIZE / 2), err);
         _amendExpect(alice, _single(a, 49_000 * BAZAAR_SCALE, 0), err);
-        // Shrinking the remainder is fine; the filled size stays.
+        // Shrinking the remainder is fine; the filled size stays, and the event reports the new
+        // total size, filled part included, at the queue position the shrink keeps.
+        vm.expectEmit(true, true, true, true, address(pair));
+        emit BazaarTypes.OrderAmended(pair.pairId(), a, alice, 49_000 * BAZAAR_SCALE, SIZE / 2 + SIZE / 4, a);
         _amendAs(alice, _single(a, 49_000 * BAZAAR_SCALE, SIZE / 2 + SIZE / 4));
         assertEq(OrderView.order(pair, a).size, SIZE / 2 + SIZE / 4);
         assertEq(OrderView.order(pair, a).filledSize, SIZE / 2);

@@ -1330,10 +1330,10 @@ contract Phase3AdlGuardTest is Test {
         assertEq(r.eligibleCount, 1, "pure-profit winner is eligible, not skipped");
         assertEq(r.totalLiqSize, 1 * SCALE, "closed in full");
         assertEq(harness.bucketCollateral(BAD_USER), 50 * SCALE, "credit = PnL on real (zero) collateral");
-        // Closed at its own basis, the inventory moves the fund only by the executor's 0.1% of
-        // the $10 the close averted against the $90 mark.
+        // Closed at its own basis, the inventory moves the fund only by the executor's 2 bp of
+        // the unit at the $90 mark, $0.018, more than 0.1% of the $10 the close averted.
         assertEq(
-            harness.vaultInsurance(), 10 * SCALE - 0.01e18, "inventory closed at its own basis: only the reward leaves"
+            harness.vaultInsurance(), 10 * SCALE - 0.018e18, "inventory closed at its own basis: only the reward leaves"
         );
     }
 

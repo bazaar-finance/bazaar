@@ -137,6 +137,9 @@ contract BazaarPairLens {
     uint256 internal constant SLOT_REOPEN_GAP_EMA = 105; // lastObsTs bits 0-63, gapEmaBp 64-191, lastJumpTs 192-255
     uint256 internal constant SLOT_TRIGGER_BOUNTY = 108; // FeeEscrow.bounty: mapping(orderId => held bounty)
     uint256 internal constant SLOT_INSURANCE_WITHDRAWAL_LOCK = 112; // mapping(user => lockedAmount << 64 | lockTs)
+    // mapping(user => BazaarTypes.RestingTally): +0 bidSize bits 0-95, askSize 96-191, stopCount
+    // 192-223; +1 bidLimitNotional low half, askLimitNotional high; +2 highestBid low, lowestAsk high
+    uint256 internal constant SLOT_RESTING_TALLY = 113;
 
     error BazaarPairLens__ZeroAddress();
 
@@ -739,13 +742,25 @@ contract BazaarPairLens {
         return CollateralLib.MIN_COLLATERAL_AMOUNT;
     }
 
-    /// @notice Returns insurance withdrawal timing and rate-limit constants
+    /// @notice Returns insurance withdrawal timing and rate-limit constants. The execution window
+    ///         follows the pair's trading calendar (InsuranceVaultLib.withdrawalWindowOf), so both
+    ///         lengths are returned.
+    /// @return cooldown How long a request waits before its execution window opens
+    /// @return continuousWindow The execution window on a pair that trades around the clock
+    /// @return sessionWindow The execution window on a pair with trading hours
+    /// @return rateLimitPeriod The length of one period of the shared withdrawal budget
+    /// @return rateLimitBp The budget's open-interest term below target, in bp of OI notional
+    /// @return aboveTargetRateLimitBp The budget's open-interest term above target, in bp of OI
+    ///         notional
+    /// @return aboveTargetFundCapBp The budget's floor above target, in bp of the live fund
+    /// @return belowTargetFundCapBp The budget's ceiling below target, in bp of the live fund
     function getInsuranceWithdrawalConstants()
         external
         pure
         returns (
             uint256 cooldown,
-            uint256 window,
+            uint256 continuousWindow,
+            uint256 sessionWindow,
             uint256 rateLimitPeriod,
             uint256 rateLimitBp,
             uint256 aboveTargetRateLimitBp,
@@ -755,7 +770,8 @@ contract BazaarPairLens {
     {
         return (
             InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN,
-            InsuranceVaultLib.INSURANCE_WITHDRAWAL_WINDOW,
+            InsuranceVaultLib.INSURANCE_WITHDRAWAL_WINDOW_CONTINUOUS,
+            InsuranceVaultLib.INSURANCE_WITHDRAWAL_WINDOW_SESSION,
             InsuranceVaultLib.INSURANCE_WITHDRAWAL_RATE_LIMIT_PERIOD,
             InsuranceVaultLib.INSURANCE_WITHDRAWAL_RATE_LIMIT_BP,
             InsuranceVaultLib.INSURANCE_WITHDRAWAL_ABOVE_TARGET_RATE_LIMIT_BP,
@@ -836,7 +852,7 @@ contract BazaarPairLens {
     /// @return lockTs When the lock was made
     /// @return claimOpensTs When the paying call opens
     /// @return windowEndTs When the request's window closes, after which neither call is
-    ///         accepted; 0 without a request
+    ///         accepted; its length follows the pair's trading calendar; 0 without a request
     function getInsuranceWithdrawalLock(address pair, address user)
         external
         view
@@ -846,7 +862,7 @@ contract BazaarPairLens {
         uint256 requestTs = uint256(uint64(p.insuranceWithdrawalRequestTs(user)));
         if (requestTs == 0 || p.isPairTerminated()) return (false, 0, 0, 0, 0);
         uint256 windowOpensTs = requestTs + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN;
-        windowEndTs = windowOpensTs + InsuranceVaultLib.INSURANCE_WITHDRAWAL_WINDOW;
+        windowEndTs = windowOpensTs + InsuranceVaultLib.withdrawalWindowOf(p.isContinuouslyTraded());
         uint256 lock = uint256(p.extsload(keccak256(abi.encode(user, SLOT_INSURANCE_WITHDRAWAL_LOCK))));
         lockTs = uint256(uint64(lock));
         if (lockTs < windowOpensTs) return (false, 0, 0, 0, windowEndTs);
@@ -1134,6 +1150,26 @@ contract BazaarPairLens {
         assembly ("memory-safe") {
             mstore(orderIds, count)
         }
+    }
+
+    /// @notice The pair's tally over `user`'s active-order set (BazaarTypes.RestingTally), from
+    ///         which its creation, amendment and withdrawal gates bound the set's reservation.
+    ///         The fields sit at or above the live set and are tightened back onto it whenever a
+    ///         gate reads the set in full; `stopCount` at its maximum marks a tally the gates
+    ///         will not use until then.
+    function restingTally(address pair, address user) external view returns (BazaarTypes.RestingTally memory t) {
+        IBazaarPairLens p = IBazaarPairLens(pair);
+        bytes32 base = keccak256(abi.encode(user, SLOT_RESTING_TALLY));
+        uint256 sizes = uint256(p.extsload(base));
+        uint256 notionals = uint256(p.extsload(bytes32(uint256(base) + 1)));
+        uint256 prices = uint256(p.extsload(bytes32(uint256(base) + 2)));
+        t.bidSize = uint96(sizes);
+        t.askSize = uint96(sizes >> 96);
+        t.stopCount = uint32(sizes >> 192);
+        t.bidLimitNotional = uint128(notionals);
+        t.askLimitNotional = uint128(notionals >> 128);
+        t.highestBid = uint128(prices);
+        t.lowestAsk = uint128(prices >> 128);
     }
 
     /// @notice A user's live limit-order exposure per side on `pair`, as limit-priced notional and

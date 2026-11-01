@@ -30,3 +30,15 @@
 </script>
 <script data-goatcounter="https://bazaardocs.goatcounter.com/count"
         async src="//gc.zgo.at/count.js"></script>
+
+{{!--
+  The page's Markdown path relative to the book root (guide/trading.md), which
+  page-actions.js resolves to the copy the docs workflow publishes beside the
+  HTML. index.html reports index.md, so the workflow publishes the first chapter
+  under that name too. Only chapter pages carry a chapter title; the print page
+  and 404.html have no Markdown source and get no tag, which keeps the page
+  actions off them.
+--}}
+{{#if chapter_title}}
+<meta name="bazaar-page-source" content="{{path}}">
+{{/if}}

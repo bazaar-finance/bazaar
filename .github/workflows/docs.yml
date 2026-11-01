@@ -38,6 +38,18 @@ jobs:
       - name: Build book
         run: mdbook build docs
 
+      # mdBook copies no .md files into the book, so each chapter's source is
+      # published beside its HTML here; the page actions (page-actions.js) copy
+      # it to the clipboard and point ChatGPT and Claude at it. index.html is the
+      # first chapter rendered again under the source name index.md, so the
+      # first chapter SUMMARY.md links is published under that name too.
+      - name: Publish Markdown sources
+        working-directory: docs/src
+        run: |
+          find . -name '*.md' ! -name SUMMARY.md -exec cp --parents {} ../book/ \;
+          first=$(sed -n 's/.*](\([^)]*\.md\)).*/\1/p' SUMMARY.md | head -n 1)
+          cp "$first" ../book/index.md
+
       - name: Setup Pages
         uses: actions/configure-pages@v5
         with:

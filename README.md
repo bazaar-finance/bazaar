@@ -1,8 +1,10 @@
+![Bazaar](docs/src/images/bazaar-banner.png)
+
 # Bazaar
 
 **Permissionless perpetual futures on anything with a price feed — no admin keys, no whitelists, no off-switch.**
 
-Bazaar is a USDC-margined perpetual-futures protocol built for Arbitrum. Any asset with a [Pyth](https://pyth.network) price feed — crypto, equities, FX, indices — can be listed permissionlessly through an [UMA Optimistic Oracle](https://uma.xyz) assertion and traded on an on-chain central limit order book. The book is **fully on-chain and sorted**, and orders match **on arrival**, inside their own creation transaction — price-time priority and fill prices are enforced by the contract itself, with no trusted matcher anywhere in the fill path.
+Bazaar is the first-ever fully permissionless perpetual-derivatives protocol, USDC-margined and built for Arbitrum. Any asset with a [Pyth](https://pyth.network) price feed — crypto, equities, FX, indices — can be listed permissionlessly through an [UMA Optimistic Oracle](https://uma.xyz) assertion and traded on an on-chain central limit order book. The book is **fully on-chain and sorted**, and orders match **on arrival**, inside their own creation transaction — price-time priority and fill prices are enforced by the contract itself, with no trusted matcher anywhere in the fill path.
 
 The protocol is immutable: no owner, no pauser, no upgradeable proxies, no governance token. Every privileged action is either fully permissionless, economically bonded, or adjudicated by UMA's optimistic oracle. The single governed parameter — the UMA identifier those assertions are adjudicated under — moves only through a bonded assertion (at least $5,000), a 2-day public dispute window, and a 12-day activation timelock.
 
@@ -41,13 +43,13 @@ src/
 ├── interfaces/
 └── libraries/                  # twelve DELEGATECALL externals, then inlined helpers
     ├── MatchingEngineLib.sol   # Arrival matching: the walk, insertion, unload
-    ├── OrderManagementLib.sol  # Order creation/cancel/cleanup
-    ├── CollateralLib.sol       # Deposits/withdrawals incl. terminal modes
+    ├── OrderManagementLib.sol  # Order creation/amend/cancel/cleanup
+    ├── CollateralLib.sol       # Deposits/withdrawals incl. terminal modes, resting-order reservation
     ├── LiquidationLib.sol      # Bankruptcy pricing, vault aggregation
     ├── AdlLib.sol              # Dutch-auction auto-deleveraging
     ├── InsuranceVaultLib.sol   # LP shares, cooldowns, rate limits
     ├── RiskParamsLib.sol       # Dynamic IMR/MMR + fee curves
-    ├── FundingLib.sol          # Mark EMA + funding index
+    ├── FundingLib.sol          # Mark price + funding index
     ├── TerminationLib.sol      # Settlement waterfall
     ├── MetaTxLib.sol           # EIP-712 meta-transactions
     ├── VaultHealthLib.sol      # ADL/termination triggers

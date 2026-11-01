@@ -14,20 +14,18 @@ library BazaarTypes {
         StopLoss
     }
 
-    /// @notice The lifecycle step an OrderUpdated event reports. Fills are reported by Trade.
+    /// @notice The lifecycle step an OrderUpdated event reports. Fills are reported by Trade and
+    ///         amendments by OrderAmended.
     ///         Created   — createOrder stored the order; its arrival walk, if any, follows.
     ///         Triggered — a StopLimit, StopLoss or TakeProfit met its trigger and began its
     ///                     walk, either on arrival or when a keeper fired it. The payload shows
     ///                     a TP/SL's size already capped at the position it closes, and a
     ///                     keeper-armed StopLimit's new prioritySeq.
     ///         Canceled  — terminal; cancelReason says why.
-    ///         Amended   — amendOrders gave a resting limit order a new price and/or size; the
-    ///                     payload shows the new values and the prioritySeq it now queues at.
     enum OrderAction {
         Created,
         Triggered,
-        Canceled,
-        Amended
+        Canceled
     }
 
     /// @notice Why an order was canceled. None on every OrderUpdated that is not a cancellation.
@@ -260,6 +258,37 @@ library BazaarTypes {
         int256 entryFundingIndex;
         uint64 takeProfitOrderId;
         uint64 stopLossOrderId;
+    }
+
+    /// @notice Per-account tallies over the orders in its active set, from which the creation,
+    ///         amendment and withdrawal margin gates bound the set's reservation
+    ///         (CollateralLib._restingBound) without reading every order. No field depends on
+    ///         the mark, so the bound is taken at gate time against whatever price the gate
+    ///         judges by, and it is exact whenever every bid rests at or below that price and
+    ///         every ask at or above it.
+    /// @dev Three slots: sizes and the stop count, the limit notionals, the two price bounds.
+    ///      The fields never understate the live set. Every order that joins the set adds its
+    ///      full size and its limit notional at creation; an amendment subtracts no more than
+    ///      the order's remaining leg at its old limit and adds the remaining leg at the new one;
+    ///      a cancel subtracts the remaining leg; nothing else writes them. Fills, expiry, the
+    ///      cancels of a liquidation or a deleverage and the arming of a StopLimit leave them
+    ///      where they are, so the tallies drift above the set they describe until the exact
+    ///      sweep rewrites them from what it read (CollateralLib._sweepRestingReserve). A field
+    ///      that would overflow is pinned at its maximum, which the bound refuses to use, so the
+    ///      gate falls back to the sweep. `highestBid` only ever rises between sweeps and
+    ///      `lowestAsk` only ever falls, so each stays a bound on the live set when the order it
+    ///      came from leaves. `stopCount` counts waiting StopLimits, whose reservation is keyed
+    ///      off the trigger and is not bounded here, so any non-zero count sends the gate down
+    ///      the exact sweep; its maximum is the marker a subtraction that would underflow
+    ///      leaves, which the next sweep clears.
+    struct RestingTally {
+        uint96 bidSize; // Σ remaining size over resting bids
+        uint96 askSize; // Σ remaining size over resting asks
+        uint32 stopCount; // waiting StopLimits; type(uint32).max marks the tally invalid
+        uint128 bidLimitNotional; // Σ remaining × limit over bids, BAZAAR precision
+        uint128 askLimitNotional; // Σ remaining × limit over asks, BAZAAR precision
+        uint128 highestBid; // at or above every resting bid's limit (0 = none recorded)
+        uint128 lowestAsk; // at or below every resting ask's limit (0 = none recorded)
     }
 
     /// @notice One hourly sample of the pair's maintenance-margin rate and of its open interest:
@@ -576,8 +605,10 @@ library BazaarTypes {
     uint256 internal constant TAKER_INTEGRATOR_FEE_EBP = 25;
 
     // Keeper rate in EBP of notional (2 bps): paid on the inventory a liquidation's nettings
-    // retire, on what its inline unload or an unloadVault call sells into the book, and on what an
-    // ADL batch retires with each deferred account it seizes (LiquidationLib.seizureReward).
+    // retire, on what its inline unload or an unloadVault call sells into the book, on what an
+    // ADL batch retires with each deferred account it seizes (LiquidationLib.seizureReward), and
+    // on the inventory an ADL batch closes for the inventory's own exposure, valued at the mark,
+    // where that is more than the share of the bad debt the close averts (AdlLib._closeReward).
     uint256 internal constant LIQUIDATION_FEE_EBP = 200;
 
     // Insurance fees in EBP
@@ -585,11 +616,12 @@ library BazaarTypes {
 
     // Stale-fallback fill band. Fresh-oracle fills are unbanded: the fill-time margin gates
     // price fresh exposure at the live oracle and charge the fill-vs-mark gap up front, and
-    // FundingLib clamps every print to ±MAX_MARK_DEVIATION_BP of index before it enters the mark
-    // EMA — an off-mark fill is economically real for its two parties and cannot drag the
-    // funding mark everyone else pays against. Under the stale fallback those gates judge
-    // against an aged reference, so fills are confined to cachedPrice × (1 ± band). A breach
-    // toward the taker cancels the resting maker; away from the taker, the arrival.
+    // FundingLib clamps every print to ±MAX_MARK_DEVIATION_BP of index before its premium enters
+    // the mark's tallies — an off-mark fill is economically real for its two parties and moves
+    // the funding mark everyone else pays against no further than a print at the band edge.
+    // Under the stale fallback those gates judge against an aged reference, so fills are confined
+    // to cachedPrice × (1 ± band). A breach toward the taker cancels the resting maker; away from
+    // the taker, the arrival.
     uint256 internal constant MAX_STALE_DEVIATION_BP = 1000;
 
     // Cap on the oracle leg of the vault unload bound (5%): the vault takes makers within
@@ -690,6 +722,14 @@ library BazaarTypes {
     // level is its own transaction here, so depth is bought with gas rather than posted freely.
     uint256 internal constant MAX_ACTIVE_LIMIT_ORDERS_PER_USER = 32;
 
+    // Rounding slack the resting-reservation bound adds to the figures it stands in for
+    // (CollateralLib._restingBound). The exact sweep floors each order's notional and each loss
+    // leg on its own, while the bound floors one product over the whole side, and a difference
+    // of two floors can exceed the floor of the difference by one; two legs per order, over at
+    // most MAX_ACTIVE_LIMIT_ORDERS_PER_USER orders, is the most the bound can fall short by
+    // without this.
+    uint256 internal constant RESTING_BOUND_SLACK = 2 * MAX_ACTIVE_LIMIT_ORDERS_PER_USER;
+
     // Amendments per amendOrders call. The per-user cap above bounds how many resting limit
     // orders a caller can have, so a batch this size can requote every one of them; the ceiling
     // keeps the worst case — every item repriced into a slot its hints miss, each paying a full
@@ -769,7 +809,10 @@ library BazaarTypes {
     /// @notice Score ceiling the Dutch-auction threshold decays from (pnl = 25× collateral).
     uint256 internal constant ADL_MAX_SCORE = 25 * BAZAAR_SCALE;
 
-    /// @notice Share of the bad debt a batch averts that the executor is paid, from insurance.
+    /// @notice Share of the bad debt an ADL close averts that the executor is paid, from
+    ///         insurance: on top of the seizure reward for a close against a deferred account, and
+    ///         in place of LIQUIDATION_FEE_EBP of the closed notional at the mark for a close of
+    ///         the inventory's own exposure where it is the larger.
     /// @dev Shared with AdlLib: the payout is a fund debit proportional to the size closed, so
     ///      the size that restores health has to account for it or every batch lands just the
     ///      reward's worth short of the release level.
@@ -860,9 +903,28 @@ library BazaarTypes {
         CancelReason cancelReason;
     }
 
-    /// @notice An order was created, triggered, amended or canceled. Fills are reported by Trade.
+    /// @notice An order was created, triggered or canceled. Fills are reported by Trade and
+    ///         amendments by OrderAmended.
     event OrderUpdated(
         bytes32 indexed pairId, uint256 indexed orderId, address indexed owner, OrderUpdatePayload payload
+    );
+
+    /// @notice amendOrders gave a resting limit order a new price and/or size. `size` is the
+    ///         order's new total size, filled part included, as OrderUpdated reports it. Only what
+    ///         an amendment can change is reported: the order's type, side, expiry and integrator
+    ///         are as its Created event left them, and its filled size is what its Trade events sum
+    ///         to. `prioritySeq` is the queue position the order now holds: a value above the one last
+    ///         reported means the order was queued anew behind its price level and its resting
+    ///         exposure restarted in this block, an unchanged one that it shrank where it stood.
+    /// @dev Three words of data rather than OrderUpdated's full payload: a requote is the book's
+    ///      most frequent write, and an indexer already holds the fields an amendment cannot touch.
+    event OrderAmended(
+        bytes32 indexed pairId,
+        uint256 indexed orderId,
+        address indexed owner,
+        uint256 limitPrice,
+        uint256 size,
+        uint256 prioritySeq
     );
 
     event PositionBucketUpdated(
@@ -1163,7 +1225,7 @@ library BazaarTypes {
         bool isPairTerminated;
         uint256 scheduledTerminationTs;
         uint8 vaultHealthReason; // isVaultHealthy verdict judged in this call: 0 = healthy, 1 = liquidation exposure over insurance (0 on a terminated pair)
-        bool isContinuouslyTraded; // false adds the reopen-gap leg to the fund target
+        bool isContinuouslyTraded; // false adds the reopen-gap leg to the fund target and takes the session execution window
         address umaContract; // BazaarPairTerminator, asked for the caller's vote-locked shares
         int256 currentFundingIndex; // live cumulative funding index, for valuing the vault's inherited inventory
         uint256 settlementPriceFixedTs; // when the settlement price was fixed; anchors the post-finalize sweep grace

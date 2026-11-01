@@ -8,7 +8,7 @@ src = "src"
 # "ayu" is mdBook's internal id for the theme the picker labels Liberty.
 default-theme = "ayu"
 preferred-dark-theme = "ayu"
-additional-css = ["bazaar-theme.css"]
-additional-js = ["bazaar-theme.js"]
+additional-css = ["bazaar-theme.css", "page-actions.css"]
+additional-js = ["bazaar-theme.js", "page-actions.js"]
 no-section-label = true
 fold = { enable = true, level = 1 }

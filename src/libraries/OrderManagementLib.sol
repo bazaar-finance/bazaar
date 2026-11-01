@@ -65,6 +65,21 @@ library OrderManagementLib {
     ///         `minExpiryBlock`, the current block plus that floor.
     error OrderManagementLib__AmendTooCloseToExpiry(uint256 orderId, uint64 expiryBlock, uint64 minExpiryBlock);
 
+    /// @dev What the creation margin gate judges a new order by (_requireCreationAffordable):
+    ///      the order's validated fields and the pair state they are judged against.
+    struct CreationGate {
+        BazaarTypes.OrderType orderType;
+        bool isLong;
+        uint256 size;
+        uint256 limitPrice;
+        uint256 triggerPrice;
+        uint256 maxSlippageBp;
+        address integrator;
+        uint256 currentPrice;
+        uint256 imrBp;
+        uint64 currentBlock;
+    }
+
     // -------------------- External Functions --------------------
 
     /// @notice Creates a new order and stores it in the orders mapping. Matching against the
@@ -81,6 +96,8 @@ library OrderManagementLib {
         mapping(uint256 => BazaarTypes.Order) storage orders,
         mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
         mapping(address => EnumerableSet.UintSet) storage userActiveLimitOrders,
+        mapping(address => BazaarTypes.RestingTally) storage restingTallies,
+        BazaarTypes.OrderBook storage book,
         BazaarTypes.FeeEscrow storage feeEscrow,
         BazaarTypes.CreateOrderParams memory params,
         address caller
@@ -125,9 +142,18 @@ library OrderManagementLib {
         // An order that never rests — Market, and a Limit sent IOC or FOK — is terminal within
         // its own transaction and never joins the set, so gating it on the set's occupancy would
         // deny a user at the cap an order that cannot add to either quantity the cap bounds.
+        // A full set is pruned of expired, canceled and filled entries before the cap is judged,
+        // the one case a dead entry costs its owner anything. Below the cap the set is left as it
+        // is: the margin gate reads it only when the tally's bound does not clear this order, and
+        // skips dead entries itself, so an expired order the owner has not canceled is removed by
+        // the next walk that reaches it, a sweep, or a withdrawal.
         if (_joinsActiveSet(ot, spec.tif)) {
-            if (userActiveLimitOrders[caller].length() >= BazaarTypes.MAX_ACTIVE_LIMIT_ORDERS_PER_USER) {
-                revert OrderManagementLib__TooManyActiveLimitOrders();
+            EnumerableSet.UintSet storage activeSet = userActiveLimitOrders[caller];
+            if (activeSet.length() >= BazaarTypes.MAX_ACTIVE_LIMIT_ORDERS_PER_USER) {
+                _pruneExpired(activeSet, orders, book, params.pairId, params.currentBlock);
+                if (activeSet.length() >= BazaarTypes.MAX_ACTIVE_LIMIT_ORDERS_PER_USER) {
+                    revert OrderManagementLib__TooManyActiveLimitOrders();
+                }
             }
         }
 
@@ -268,90 +294,25 @@ library OrderManagementLib {
         );
 
         if (ot != BazaarTypes.OrderType.TakeProfit && ot != BazaarTypes.OrderType.StopLoss) {
-            BazaarTypes.PositionBucket memory bucket = positionBuckets[caller];
-
-            // Fresh exposure is reserved at no less than the current mark: the fill-time margin
-            // gate values it at the then-current oracle, never at the fill price, so a bid below
-            // the mark margined at its own limit would reserve less than any fill of it will
-            // demand — the order would be creatable but only ever auto-cancelable at the gate.
-            // A bid is valued at the mark outright: above the mark, its excess over the mark is
-            // the loss the fill books, charged in full by the fill debit below, so valuing it at
-            // the limit as well would count that excess twice over. The limit leg of the max
-            // keeps asks above the mark reserved at their full crossing price.
-            uint256 executionPrice;
-            if (ot == BazaarTypes.OrderType.Limit) {
-                executionPrice = !spec.isLong && orderLimitPrice > currentPrice ? orderLimitPrice : currentPrice;
-            } else if (ot == BazaarTypes.OrderType.Market) {
-                // Both sides margin at the upper slippage bound. The fill price is the maker's,
-                // so it isn't known here — maxSlippageBp only states how far from currentPrice
-                // the walk may execute. Margining the worst-case notional on both sides keeps a
-                // wider tolerance strictly more expensive than a tight one.
-                executionPrice = currentPrice * (BazaarTypes.BP_SCALE + orderMaxSlippageBp) / BazaarTypes.BP_SCALE;
-            } else {
-                executionPrice = orderTriggerPrice > orderLimitPrice ? orderTriggerPrice : orderLimitPrice;
-                if (currentPrice > executionPrice) executionPrice = currentPrice;
-            }
-
-            uint256 orderNotional = Math.mulDiv(spec.size, executionPrice, BazaarTypes.BAZAAR_SCALE);
-
-            uint256 newTotalNotional;
-            if (bucket.size == 0) {
-                newTotalNotional = orderNotional;
-            } else if (bucket.isLong == spec.isLong) {
-                newTotalNotional = currentState.currentNotional + orderNotional;
-            } else {
-                if (orderNotional > currentState.currentNotional) {
-                    newTotalNotional = orderNotional - currentState.currentNotional;
-                } else {
-                    newTotalNotional = currentState.currentNotional - orderNotional;
-                }
-            }
-
-            // The resting set, already swept by the pair, reserved against the mark as this order
-            // is (CollateralLib._restingReserve): its exposure per side and the fill gate's debit
-            // across it.
-            uint256 restingDebit;
-            {
-                (uint256 longExposure, uint256 shortExposure, uint256 debit) = CollateralLib._restingReserve(
-                    userActiveLimitOrders[caller], orders, params.currentBlock, currentPrice
-                );
-                restingDebit = debit;
-
-                uint256 posNotional = newTotalNotional;
-                bool posIsLong = bucket.size == 0 ? spec.isLong : bucket.isLong;
-                if (bucket.size > 0 && bucket.isLong != spec.isLong && orderNotional > currentState.currentNotional) {
-                    posIsLong = spec.isLong;
-                }
-
-                uint256 sameDirectionExposure = posIsLong ? longExposure : shortExposure;
-                uint256 oppositeDirectionExposure = posIsLong ? shortExposure : longExposure;
-
-                uint256 worstCaseExposure = posNotional + sameDirectionExposure;
-                uint256 worstCaseFlip =
-                    oppositeDirectionExposure > posNotional ? oppositeDirectionExposure - posNotional : 0;
-                newTotalNotional = worstCaseExposure > worstCaseFlip ? worstCaseExposure : worstCaseFlip;
-            }
-
-            if (newTotalNotional > currentState.currentNotional || bucket.size == 0) {
-                // Initial margin on the worst-case notional, plus everything the fill gate debits
-                // from the same collateral before it tests that margin: for this order and every
-                // resting one, the loss a fill at the limit books against the mark and the maker
-                // fee (CollateralLib._fillDebitOf), and the held position's unrealized loss. An
-                // order that gate would refuse is refused here rather than resting until a fill
-                // auto-cancels it.
-                uint256 requiredMargin = Math.mulDiv(params.marginReqs.imrBp, newTotalNotional, BazaarTypes.BP_SCALE)
-                    + restingDebit
-                    + CollateralLib._fillDebitOf(
-                        ot, spec.isLong, spec.size, orderLimitPrice, orderTriggerPrice, currentPrice, spec.integrator
-                    );
-                if (currentState.totalPnl < 0) requiredMargin += uint256(-currentState.totalPnl);
-
-                if (currentState.effectiveCollateral < requiredMargin) {
-                    revert OrderManagementLib__InsufficientMarginAfterOrder(
-                        currentState.effectiveCollateral, requiredMargin
-                    );
-                }
-            }
+            _requireCreationAffordable(
+                userActiveLimitOrders[caller],
+                orders,
+                restingTallies[caller],
+                positionBuckets[caller],
+                currentState,
+                CreationGate({
+                    orderType: ot,
+                    isLong: spec.isLong,
+                    size: spec.size,
+                    limitPrice: orderLimitPrice,
+                    triggerPrice: orderTriggerPrice,
+                    maxSlippageBp: orderMaxSlippageBp,
+                    integrator: spec.integrator,
+                    currentPrice: currentPrice,
+                    imrBp: params.marginReqs.imrBp,
+                    currentBlock: params.currentBlock
+                })
+            );
         }
 
         // params.currentBlock is read at each use rather than cached in a local: createOrder's
@@ -408,9 +369,14 @@ library OrderManagementLib {
 
         // An order that can rest joins userActiveLimitOrders, which carries the per-user cap and
         // the resting-order reserve that the creation, amendment and withdrawal margin checks
-        // tally.
+        // tally, and is recorded at its whole size in the set's tally: what fills in the walk
+        // that follows leaves the tally above the set, which is the side it must err on
+        // (BazaarTypes.RestingTally).
         if (_joinsActiveSet(ot, spec.tif)) {
             userActiveLimitOrders[caller].add(orderId);
+            CollateralLib._tallyAdd(
+                restingTallies[caller], spec.isLong, ot == BazaarTypes.OrderType.StopLimit, spec.size, orderLimitPrice
+            );
         }
 
         OrderBookLib.emitOrderUpdated(
@@ -432,6 +398,7 @@ library OrderManagementLib {
         mapping(uint256 => BazaarTypes.Order) storage orders,
         mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
         mapping(address => EnumerableSet.UintSet) storage userActiveLimitOrders,
+        mapping(address => BazaarTypes.RestingTally) storage restingTallies,
         BazaarTypes.OrderBook storage book,
         BazaarTypes.FeeEscrow storage feeEscrow,
         uint256 orderId,
@@ -452,21 +419,34 @@ library OrderManagementLib {
             revert OrderManagementLib__OrderIsNotActive(orderId);
         }
 
+        BazaarTypes.OrderType ot = order.orderType;
+        // Read ahead of the unlink, which clears inBook: a StopLimit still outside the book is
+        // one the set's tally counts as waiting.
+        bool waitingStop = ot == BazaarTypes.OrderType.StopLimit && !order.inBook;
+
         order.canceledBlock = currentBlock;
         OrderBookLib.unlink(orders, book, orderId);
         FeeEscrowLib.refundBounty(feeEscrow, pairId, orderId, order.creator);
 
         // Clear position-bucket order-slot pointer for slot-bound types
-        BazaarTypes.OrderType ot = order.orderType;
         if (ot == BazaarTypes.OrderType.TakeProfit) {
             positionBuckets[order.creator].takeProfitOrderId = 0;
         } else if (ot == BazaarTypes.OrderType.StopLoss) {
             positionBuckets[order.creator].stopLossOrderId = 0;
         }
 
-        // Remove from active limit orders set (Limit + StopLimit share this set)
+        // Remove from active limit orders set (Limit + StopLimit share this set), and take the
+        // remaining leg out of the set's tally so an owner who cancels and requotes keeps a
+        // tally the next gate can bound from.
         if (ot == BazaarTypes.OrderType.Limit || ot == BazaarTypes.OrderType.StopLimit) {
             userActiveLimitOrders[order.creator].remove(orderId);
+            CollateralLib._tallySub(
+                restingTallies[order.creator],
+                order.isLong,
+                waitingStop,
+                order.size - order.filledSize,
+                order.limitPrice
+            );
         }
 
         OrderBookLib.emitOrderUpdated(
@@ -476,8 +456,9 @@ library OrderManagementLib {
 
     /// @notice Sweeps a user's active-limit-order set: drops expired/canceled/filled entries,
     ///         cancel-emitting and unlinking expired ones. What survives is reserved by the gate
-    ///         that follows (CollateralLib._restingReserve), never here: the sweep runs before
-    ///         the pair resolves a price, since what it leaves decides whether one is needed.
+    ///         that follows (CollateralLib._sweepRestingReserve), never here: the sweep runs
+    ///         before the pair resolves a price, since what it leaves decides whether one is
+    ///         needed.
     /// @dev Called via BazaarPair's _cleanupExpiredLimitOrders wrapper. Canceled/filled entries
     ///      were already unlinked at their terminal write; only the expired-but-live case still
     ///      holds a book position here.
@@ -508,12 +489,13 @@ library OrderManagementLib {
     ///      and an expired order still linked at the head is removed by the next walk that
     ///      touches it, not here.
     ///
-    ///      Margin is judged once, on the set the batch leaves behind: after the amendments the
-    ///      owner's expired orders are pruned and the surviving orders are reserved exactly as
-    ///      createOrder reserves them (CollateralLib._orderReserve), and the position plus that
-    ///      exposure has to clear initial margin together with the fill gate's debit across the
-    ///      set and the position's unrealized loss (_requireRestingExposureAffordable). Only the
-    ///      final set has to pass: intermediate states inside the batch cannot be observed.
+    ///      Margin is judged once, on the set the batch leaves behind: the orders are reserved
+    ///      exactly as createOrder reserves them (CollateralLib._orderReserve), and the position
+    ///      plus that exposure has to clear initial margin together with the fill gate's debit
+    ///      across the set and the position's unrealized loss (_requireAmendedSetAffordable).
+    ///      The set's tally bounds that reservation first; the owner's expired orders are pruned
+    ///      and every survivor read only when the bound does not clear the owner. Only the final
+    ///      set has to pass: intermediate states inside the batch cannot be observed.
     ///
     ///      An amendment that moves an order needs MIN_ORDER_LIFETIME_BLOCKS of the order's life
     ///      left, the floor createOrder holds a new order to, so the order stands open to fills at
@@ -563,6 +545,7 @@ library OrderManagementLib {
         mapping(uint256 => BazaarTypes.Order) storage orders,
         mapping(address => BazaarTypes.PositionBucket) storage positionBuckets,
         mapping(address => EnumerableSet.UintSet) storage userActiveLimitOrders,
+        mapping(address => BazaarTypes.RestingTally) storage restingTallies,
         BazaarTypes.OrderBook storage book,
         BazaarTypes.MarginRequirements storage marginReqs,
         BazaarTypes.PairPrice storage lastPairPrice,
@@ -587,6 +570,7 @@ library OrderManagementLib {
                 orders,
                 book,
                 positionBuckets[caller],
+                restingTallies[caller],
                 amends[at],
                 amends[at + 1],
                 amends[at + 2],
@@ -597,14 +581,16 @@ library OrderManagementLib {
             );
         }
 
-        // The gate runs on the set as the batch leaves it, expired orders pruned and each order
-        // reserved against the mark as createOrder reserves a new one.
-        _pruneExpired(userActiveLimitOrders[caller], orders, book, params.pairId, params.currentBlock);
-        (uint256 longExposure, uint256 shortExposure, uint256 fillDebit) = CollateralLib._restingReserve(
-            userActiveLimitOrders[caller], orders, params.currentBlock, params.currentPrice
-        );
-        _requireRestingExposureAffordable(
-            positionBuckets[caller], marginReqs, params, longExposure, shortExposure, fillDebit
+        // The gate runs on the set as the batch leaves it, each order reserved against the mark
+        // as createOrder reserves a new one.
+        _requireAmendedSetAffordable(
+            userActiveLimitOrders[caller],
+            orders,
+            book,
+            restingTallies[caller],
+            positionBuckets[caller],
+            marginReqs,
+            params
         );
     }
 
@@ -616,6 +602,7 @@ library OrderManagementLib {
         mapping(uint256 => BazaarTypes.Order) storage orders,
         BazaarTypes.OrderBook storage book,
         BazaarTypes.PositionBucket storage bucket,
+        BazaarTypes.RestingTally storage tally,
         uint256 idWord,
         uint256 newPrice,
         uint256 newSize,
@@ -677,8 +664,11 @@ library OrderManagementLib {
 
         bool repriced = newPrice != o.limitPrice;
         bool grew = newSize > o.size;
+        if (!repriced && newSize == o.size) return seqCounter; // nothing changes, nothing to report
+        // The old leg leaves the set's tally before the order is rewritten and the new one joins
+        // it after, so the tally never drops below the set (BazaarTypes.RestingTally).
+        CollateralLib._tallySub(tally, o.isLong, false, o.size - filled, o.limitPrice);
         if (!repriced && !grew) {
-            if (newSize == o.size) return seqCounter; // nothing changes, nothing to report
             // A smaller size at the same price keeps its place: it takes nothing from anyone
             // queued behind it. Below the stored size, so inside the field.
             o.size = uint128(newSize);
@@ -730,38 +720,189 @@ library OrderManagementLib {
                 OrderBookLib.insert(orders, book, orderId, hints, params.currentBlock, stampIndex);
             }
         }
-        OrderBookLib.emitOrderUpdated(
-            params.pairId, orderId, o, BazaarTypes.OrderAction.Amended, BazaarTypes.CancelReason.None
-        );
+        CollateralLib._tallyAdd(tally, o.isLong, false, newSize - filled, newPrice);
+        _emitAmended(params.pairId, orderId, caller, o);
         return seqCounter;
     }
 
-    /// @dev createOrder's margin gate for the resting set alone: the position plus its resting
+    /// @dev Report an amendment from the order's stored state, which the caller has just written.
+    function _emitAmended(bytes32 pairId, uint256 orderId, address owner, BazaarTypes.Order storage o) private {
+        emit BazaarTypes.OrderAmended(pairId, orderId, owner, o.limitPrice, o.size, o.prioritySeq);
+    }
+
+    /// @dev amendOrders' margin gate, on the set as the batch leaves it. The set's tally bounds
+    ///      its reservation first (CollateralLib._restingBound); only an owner the bound does not
+    ///      clear, or one whose tally cannot bound the set, has the set pruned and read
+    ///      (_exactAmendReserve), and only that reading refuses. The bound never understates the
+    ///      set, so nothing passes here that the reading would refuse.
+    function _requireAmendedSetAffordable(
+        EnumerableSet.UintSet storage orderSet,
+        mapping(uint256 => BazaarTypes.Order) storage orders,
+        BazaarTypes.OrderBook storage book,
+        BazaarTypes.RestingTally storage tally,
+        BazaarTypes.PositionBucket storage bucket,
+        BazaarTypes.MarginRequirements storage marginReqs,
+        BazaarTypes.AmendOrdersParams memory params
+    ) private {
+        (bool bounded, uint256 longExposure, uint256 shortExposure, uint256 fillDebit) =
+            CollateralLib._restingBound(tally, params.currentPrice);
+        if (!bounded) {
+            (longExposure, shortExposure, fillDebit) = _exactAmendReserve(orderSet, orders, book, tally, params);
+        }
+        (bool ok, uint256 collateral, uint256 required) =
+            _restingExposureShortfall(bucket, marginReqs, params, longExposure, shortExposure, fillDebit);
+        if (!ok && bounded) {
+            (longExposure, shortExposure, fillDebit) = _exactAmendReserve(orderSet, orders, book, tally, params);
+            (ok, collateral, required) =
+                _restingExposureShortfall(bucket, marginReqs, params, longExposure, shortExposure, fillDebit);
+        }
+        if (!ok) revert OrderManagementLib__InsufficientMarginAfterOrder(collateral, required);
+    }
+
+    /// @dev The amended set read as it is: expired orders pruned, then every survivor reserved
+    ///      against the mark and the tally rewritten (CollateralLib._sweepRestingReserve).
+    function _exactAmendReserve(
+        EnumerableSet.UintSet storage orderSet,
+        mapping(uint256 => BazaarTypes.Order) storage orders,
+        BazaarTypes.OrderBook storage book,
+        BazaarTypes.RestingTally storage tally,
+        BazaarTypes.AmendOrdersParams memory params
+    ) private returns (uint256 longExposure, uint256 shortExposure, uint256 fillDebit) {
+        _pruneExpired(orderSet, orders, book, params.pairId, params.currentBlock);
+        return CollateralLib._sweepRestingReserve(orderSet, orders, tally, params.currentBlock, params.currentPrice);
+    }
+
+    /// @dev createOrder's margin test for the resting set alone: the position plus its resting
     ///      orders, in whichever direction is worse (CollateralLib._worstCaseNotional, the base the
     ///      withdrawal gate and the lens use), must be covered at initial margin together with the
     ///      fill gate's debit across the set (`fillDebit`, CollateralLib._fillDebitOf) and the
     ///      position's unrealized loss. Judged only when the orders add exposure beyond the
-    ///      position, or when there is no position, as createOrder judges a new order.
-    function _requireRestingExposureAffordable(
+    ///      position, or when there is no position, as createOrder judges a new order. Returns
+    ///      the verdict with the figures a refusal reports rather than reverting, so a caller can
+    ///      judge a bound first and the set itself only when the bound fails.
+    function _restingExposureShortfall(
         BazaarTypes.PositionBucket storage bucket,
         BazaarTypes.MarginRequirements storage marginReqs,
         BazaarTypes.AmendOrdersParams memory params,
         uint256 longExposure,
         uint256 shortExposure,
         uint256 fillDebit
-    ) private view {
+    ) private view returns (bool ok, uint256 collateral, uint256 required) {
         BazaarTypes.BucketState memory state = BucketLib.calculateState(
             bucket, params.currentPrice, params.currentFundingIndex, marginReqs
         );
         bool flat = bucket.size == 0;
         uint256 posNotional = flat ? 0 : state.currentNotional;
         uint256 worst = CollateralLib._worstCaseNotional(bucket.isLong, posNotional, longExposure, shortExposure);
+        collateral = state.effectiveCollateral;
+        ok = true;
         if (worst > posNotional || flat) {
-            uint256 requiredMargin = Math.mulDiv(marginReqs.imrBp, worst, BazaarTypes.BP_SCALE) + fillDebit;
-            if (state.totalPnl < 0) requiredMargin += uint256(-state.totalPnl);
-            if (state.effectiveCollateral < requiredMargin) {
-                revert OrderManagementLib__InsufficientMarginAfterOrder(state.effectiveCollateral, requiredMargin);
-            }
+            required = Math.mulDiv(marginReqs.imrBp, worst, BazaarTypes.BP_SCALE) + fillDebit;
+            if (state.totalPnl < 0) required += uint256(-state.totalPnl);
+            ok = collateral >= required;
+        }
+    }
+
+    /// @dev createOrder's margin gate: the order's own exposure and the resting set's, in
+    ///      whichever direction is worse, at initial margin, plus everything the fill gate debits
+    ///      before its own test (_creationShortfall). The set's tally bounds its reservation
+    ///      first (CollateralLib._restingBound); only a caller the bound does not clear, or one
+    ///      whose tally cannot bound the set, has the set read (CollateralLib._sweepRestingReserve,
+    ///      which also rewrites the tally), and only that reading refuses. The bound never
+    ///      understates the set, so nothing passes here that the reading would refuse. The set
+    ///      is not pruned here: the reading skips dead entries itself, and a full set was pruned
+    ///      ahead of the cap check.
+    function _requireCreationAffordable(
+        EnumerableSet.UintSet storage orderSet,
+        mapping(uint256 => BazaarTypes.Order) storage orders,
+        BazaarTypes.RestingTally storage tally,
+        BazaarTypes.PositionBucket storage bucketStorage,
+        BazaarTypes.BucketState memory currentState,
+        CreationGate memory g
+    ) private {
+        BazaarTypes.PositionBucket memory bucket = bucketStorage;
+        (bool bounded, uint256 longExposure, uint256 shortExposure, uint256 fillDebit) =
+            CollateralLib._restingBound(tally, g.currentPrice);
+        if (!bounded) {
+            (longExposure, shortExposure, fillDebit) =
+                CollateralLib._sweepRestingReserve(orderSet, orders, tally, g.currentBlock, g.currentPrice);
+        }
+        (bool ok, uint256 required) =
+            _creationShortfall(bucket, currentState, g, longExposure, shortExposure, fillDebit);
+        if (!ok && bounded) {
+            (longExposure, shortExposure, fillDebit) =
+                CollateralLib._sweepRestingReserve(orderSet, orders, tally, g.currentBlock, g.currentPrice);
+            (ok, required) = _creationShortfall(bucket, currentState, g, longExposure, shortExposure, fillDebit);
+        }
+        if (!ok) revert OrderManagementLib__InsufficientMarginAfterOrder(currentState.effectiveCollateral, required);
+    }
+
+    /// @dev The creation gate's verdict for one reading of the resting set, with the requirement
+    ///      a refusal reports.
+    ///
+    ///      Fresh exposure is reserved at no less than the current mark: the fill-time margin
+    ///      gate values it at the then-current oracle, never at the fill price, so a bid below
+    ///      the mark margined at its own limit would reserve less than any fill of it will
+    ///      demand — the order would be creatable but only ever auto-cancelable at the gate. A
+    ///      bid is valued at the mark outright: above the mark, its excess over the mark is the
+    ///      loss the fill books, charged in full by the fill debit below, so valuing it at the
+    ///      limit as well would count that excess twice over. The limit leg of the max keeps asks
+    ///      above the mark reserved at their full crossing price. A Market order margins both
+    ///      sides at the upper slippage bound: the fill price is the maker's, so it isn't known
+    ///      here — maxSlippageBp only states how far from the mark the walk may execute — and
+    ///      margining the worst case keeps a wider tolerance strictly more expensive than a tight
+    ///      one. A StopLimit is valued at the largest of its trigger, its limit and the mark.
+    ///
+    ///      The position this order leaves, plus the resting orders in whichever direction is
+    ///      worse (CollateralLib._worstCaseNotional), must be covered at initial margin together
+    ///      with everything the fill gate debits from the same collateral before it tests that
+    ///      margin: for this order and every resting one, the loss a fill at the limit books
+    ///      against the mark and the maker fee (CollateralLib._fillDebitOf), and the held
+    ///      position's unrealized loss. An order that gate would refuse is refused here rather
+    ///      than resting until a fill auto-cancels it. Judged only when the result adds exposure
+    ///      beyond the held position, or when there is none.
+    function _creationShortfall(
+        BazaarTypes.PositionBucket memory bucket,
+        BazaarTypes.BucketState memory currentState,
+        CreationGate memory g,
+        uint256 longExposure,
+        uint256 shortExposure,
+        uint256 fillDebit
+    ) private pure returns (bool ok, uint256 required) {
+        uint256 executionPrice;
+        if (g.orderType == BazaarTypes.OrderType.Limit) {
+            executionPrice = !g.isLong && g.limitPrice > g.currentPrice ? g.limitPrice : g.currentPrice;
+        } else if (g.orderType == BazaarTypes.OrderType.Market) {
+            executionPrice = g.currentPrice * (BazaarTypes.BP_SCALE + g.maxSlippageBp) / BazaarTypes.BP_SCALE;
+        } else {
+            executionPrice = g.triggerPrice > g.limitPrice ? g.triggerPrice : g.limitPrice;
+            if (g.currentPrice > executionPrice) executionPrice = g.currentPrice;
+        }
+        uint256 orderNotional = Math.mulDiv(g.size, executionPrice, BazaarTypes.BAZAAR_SCALE);
+
+        bool flat = bucket.size == 0;
+        uint256 posNotional;
+        if (flat) {
+            posNotional = orderNotional;
+        } else if (bucket.isLong == g.isLong) {
+            posNotional = currentState.currentNotional + orderNotional;
+        } else if (orderNotional > currentState.currentNotional) {
+            posNotional = orderNotional - currentState.currentNotional;
+        } else {
+            posNotional = currentState.currentNotional - orderNotional;
+        }
+        bool posIsLong = flat ? g.isLong : bucket.isLong;
+        if (!flat && bucket.isLong != g.isLong && orderNotional > currentState.currentNotional) posIsLong = g.isLong;
+
+        uint256 worst = CollateralLib._worstCaseNotional(posIsLong, posNotional, longExposure, shortExposure);
+        ok = true;
+        if (worst > currentState.currentNotional || flat) {
+            required = Math.mulDiv(g.imrBp, worst, BazaarTypes.BP_SCALE) + fillDebit
+                + CollateralLib._fillDebitOf(
+                    g.orderType, g.isLong, g.size, g.limitPrice, g.triggerPrice, g.currentPrice, g.integrator
+                );
+            if (currentState.totalPnl < 0) required += uint256(-currentState.totalPnl);
+            ok = currentState.effectiveCollateral >= required;
         }
     }
 
@@ -805,9 +946,10 @@ library OrderManagementLib {
     ///         order that is terminal or expired to its owner's claimable balance. Live,
     ///         non-expired and unknown ids are skipped silently so racing keepers never revert
     ///         each other.
-    /// @dev Expired orders are otherwise removed lazily — by the matching walk on contact or by
-    ///      the owner's sweeps during create/withdraw — so this exists to let anyone clear dead
-    ///      nodes from the book front proactively. Only Limit/StopLimit can expire (TP/SL carry
+    /// @dev Expired orders are otherwise removed lazily — by the matching walk on contact, or by
+    ///      the owner's sweeps at a withdrawal, a creation at the order cap, or an amendment
+    ///      whose gate reads the set in full — so this exists to let anyone clear dead nodes
+    ///      from the book front proactively. It pays its caller nothing. Only Limit/StopLimit can expire (TP/SL carry
     ///      the never-expire sentinel; Market orders are terminal in their creation tx), so the
     ///      set removal below covers every sweepable type. The bounty refund covers the terminal
     ///      writes that bypass the escrow (the walk's auto-cancels, the TP/SL fence, liquidation

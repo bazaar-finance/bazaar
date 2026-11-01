@@ -66,8 +66,9 @@ Notes on the pieces:
 - **Meta-transaction fields** (`nonce`, `deadline`, `relayerFee`, `signature`, `permitData`) are
   zero and empty: the account submits for itself, so nothing is relayed.
 - **Getting money out.** `withdrawCollateral` pays the account, not the owner; put a USDC
-  `transfer` to the owner in the same batch, as the test does. `claimFees` likewise credits the
-  caller, so claim through the account.
+  `transfer` to the owner in the same batch, as the test does. Anything else the pair owes the
+  account (a cancelled trigger order's bounty, say) is credited to the account's address, and
+  `claimFees` pays it only to its caller, so claim through the account.
 
 ## What still holds per order
 
@@ -83,27 +84,31 @@ The pair sees a sequence of ordinary calls, so every rule applies to each one:
   A fill-or-kill that cannot fill, a bad hint, or a margin check at creation reverts the call,
   and with it the batch.
 - **Gas per order is unchanged, and so is the cap.** A crossing order can walk up to 32 resting
-  makers at roughly 130k gas each, so a batch of crossing orders can reach Arbitrum's per-transaction
-  limit. Keep batches of takers short; resting orders are cheap.
+  makers at roughly 90k gas each, about 3.4M for a full walk, so a batch of about nine full walks
+  reaches Arbitrum's 32M per-transaction limit. Keep batches of takers short; resting orders are
+  cheap.
 
 ## What batching saves
 
 Three things, none of them specific to the sample contract:
 
-- **One transaction's overhead** instead of one per order: the base fee and the L1 data posting.
+- **One transaction's overhead** instead of one per order: the 21,000 gas every transaction pays
+  before it runs, and the L1 data charge on its signature and envelope bytes.
 - **Warm storage.** The second and later calls in a transaction read what the first one touched
   at 100 gas instead of 2,100. In the repository's measurement (`TradingAccountTest`, mock oracle
-  and mock USDC) four resting orders cost about 1.90M gas as four separate transactions and about
-  1.26M as one batch through the example account, with the batch also carrying the USDC approval
+  and mock USDC) four resting orders cost about 1.95M gas as four separate transactions and about
+  1.32M as one batch through the example account, with the batch also carrying the USDC approval
   and the deposit. The same four orders as four direct calls inside one transaction cost about
-  1.33M, so nearly all of the saving is the warm storage, not the contract.
+  1.38M, so nearly all of the saving is the warm storage, not the contract.
 - **One price store per transaction**, which the cache-first rule gives every caller in the same
   block anyway.
 
 What it does not save: the work each `createOrder` does on its own — the margin gate, the order
 and position writes, the walk, the health check. A batch entry point in the pair would trim some
 of that; the gain is tens of thousands of gas per order against the figures above, which is why
-the protocol does not carry one.
+the protocol does not carry one. The orders an account already holds do not add to that work:
+the margin gate bounds their reservation from a per-account tally and reads them one by one only
+when the bound does not clear the account (see [initial margin](../protocol/margin.md#the-resting-order-tally)).
 
 ## Relayed users
 

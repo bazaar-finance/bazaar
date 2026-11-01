@@ -364,9 +364,13 @@ library CollateralLib {
     ///      all-or-nothing on coverage: a remainder the balance cannot meet in full is skipped
     ///      rather than trimmed, so the settler earns either the whole tip or only what the
     ///      position itself could pay. Insurance's balance at this point is the nominal one that
-    ///      finalize rewrites from the pot, so it is the escrow credit, shrinking the pot, that
-    ///      actually charges the residual — the right payer for a cost no trader can be charged,
-    ///      since it is junior to every trader.
+    ///      finalize rewrites from the pot, so the top-up's real cost is the escrow credit, which
+    ///      finalize takes off the pot before any trader is paid. A pot that covers every principal
+    ///      and registered claim takes it from the insurers' residual; one that does not takes it
+    ///      from the profit ratio and, with cash short of principal, from the principal ratio, at
+    ///      most TERMINAL_SETTLEMENT_TIP per settled position. That is what it costs to pay keepers
+    ///      to settle bankrupt positions before the ratios freeze, which books their shortfall then
+    ///      rather than leaving it to the holders still in after finalize.
     ///
     ///      Insurance pays any part of the tip only when `fullSize` is set: the settled position
     ///      was worth at least MIN_ORDER_AMOUNT at the settlement price. The maintenance margin on
@@ -374,8 +378,7 @@ library CollateralLib {
     ///      bucket, so emptying it takes a loss at least as large as the tip. A smaller position
     ///      can be left with no collateral at no cost, through margin that rounds to zero or a
     ///      partial close at an off-market price, so it pays only what its own collateral covers:
-    ///      a top-up there would draw a tip from the insurers' residual for every such account
-    ///      an attacker opens.
+    ///      a top-up there would draw a tip from the pot for every such account an attacker opens.
     ///
     ///      After finalize a solvent straggler harms nobody (finalize reserved its equity in
     ///      full), so only a bankrupt one pays, from whatever residual the funding of its own
@@ -511,30 +514,206 @@ library CollateralLib {
         debit = _fillDebitOf(ot, o.isLong, remaining, o.limitPrice, o.triggerPrice, mark, o.integrator);
     }
 
-    /// @dev The live orders of `orderSet` reserved against `mark` (_orderReserve): per side, and
-    ///      the fill debit summed over both sides — a bid above the mark and an ask below it each
-    ///      book their loss when they fill, whatever the position nets to, and the fill gate
-    ///      charges the first fill's loss as the held loss on the second. Canceled, filled and
-    ///      expired entries are skipped, not pruned: the pair sweeps them before it resolves the
-    ///      price this runs at.
-    function _restingReserve(
+    /// @dev Full-width accumulator for the tallies the exact sweep rewrites
+    ///      (BazaarTypes.RestingTally); narrowed, saturating, once the set has been read.
+    struct TallyAcc {
+        uint256 bidSize;
+        uint256 askSize;
+        uint256 bidLimitNotional;
+        uint256 askLimitNotional;
+        uint256 highestBid;
+        uint256 lowestAsk;
+        uint256 stopCount;
+    }
+
+    /// @dev `RestingTally.stopCount` once a subtraction would have taken a field below zero: the
+    ///      tally no longer describes its set, and the gates sweep until a sweep rewrites it.
+    uint32 internal constant TALLY_INVALID = type(uint32).max;
+
+    /// @notice An upper bound, from the tally alone, on what _sweepRestingReserve would find for
+    ///         the set `t` describes at `mark`. `bounded` is false when the tally cannot stand in
+    ///         for the sweep: a waiting StopLimit is counted (its reservation keys off its
+    ///         trigger), a field is pinned at its maximum, or the tally is marked invalid.
+    /// @dev A bid is reserved at the mark, so the bids' exposure is their total size at the mark.
+    ///      An ask is reserved at the larger of its limit and the mark: at or above the mark that
+    ///      is its limit notional, below it the limit notional plus the shortfall to the mark,
+    ///      and `lowestAsk` bounds every ask's shortfall by the lowest one's. The fill debit is
+    ///      the maker fee on each limit notional — at the integrator-carrying rate for every
+    ///      order, since the tally does not record which carry one — plus the loss a bid above
+    ///      the mark or an ask below it books, bounded through `highestBid` and `lowestAsk` the
+    ///      same way. The sweep floors each order's figures on its own while the bound floors
+    ///      whole-side products, and RESTING_BOUND_SLACK covers what that can leave short. A
+    ///      tally of zeros describes an empty set and bounds it exactly, from its first slot.
+    function _restingBound(BazaarTypes.RestingTally storage t, uint256 mark)
+        internal
+        view
+        returns (bool bounded, uint256 longExposure, uint256 shortExposure, uint256 fillDebit)
+    {
+        uint256 bidSize = t.bidSize;
+        uint256 askSize = t.askSize;
+        uint256 stops = t.stopCount;
+        if (bidSize == 0 && askSize == 0 && stops == 0) return (true, 0, 0, 0);
+        if (stops != 0 || bidSize == type(uint96).max || askSize == type(uint96).max) return (false, 0, 0, 0);
+        uint256 bidNotional = t.bidLimitNotional;
+        uint256 askNotional = t.askLimitNotional;
+        if (bidNotional == type(uint128).max || askNotional == type(uint128).max) return (false, 0, 0, 0);
+
+        longExposure = Math.mulDiv(bidSize, mark, BazaarTypes.BAZAAR_SCALE);
+        shortExposure = askNotional + BazaarTypes.RESTING_BOUND_SLACK;
+        fillDebit =
+            Math.mulDiv(
+                    bidNotional + askNotional,
+                    BazaarTypes.MAKER_INSURANCE_FEE_EBP + BazaarTypes.MAKER_INTEGRATOR_FEE_EBP,
+                    BazaarTypes.EBP_SCALE
+                ) + BazaarTypes.RESTING_BOUND_SLACK;
+        uint256 highestBid = t.highestBid;
+        if (highestBid > mark) fillDebit += Math.mulDiv(bidSize, highestBid - mark, BazaarTypes.BAZAAR_SCALE);
+        uint256 lowestAsk = t.lowestAsk;
+        if (askSize != 0 && lowestAsk < mark) {
+            uint256 shortfall = Math.mulDiv(askSize, mark - lowestAsk, BazaarTypes.BAZAAR_SCALE);
+            shortExposure += shortfall;
+            fillDebit += shortfall;
+        }
+        bounded = true;
+    }
+
+    /// @notice The live orders of `orderSet` reserved against `mark` (_orderReserve): per side,
+    ///         and the fill debit summed over both sides — a bid above the mark and an ask below
+    ///         it each book their loss when they fill, whatever the position nets to, and the
+    ///         fill gate charges the first fill's loss as the held loss on the second. Canceled,
+    ///         filled and expired entries are skipped. The set's tally is rewritten from the same
+    ///         read, so every sweep tightens the bound back onto the live set.
+    function _sweepRestingReserve(
         EnumerableSet.UintSet storage orderSet,
         mapping(uint256 => BazaarTypes.Order) storage orders,
+        BazaarTypes.RestingTally storage tally,
         uint64 currentBlock,
         uint256 mark
-    ) internal view returns (uint256 longExposure, uint256 shortExposure, uint256 fillDebit) {
+    ) internal returns (uint256 longExposure, uint256 shortExposure, uint256 fillDebit) {
+        TallyAcc memory acc;
         uint256 len = orderSet.length();
         for (uint256 i; i < len; ++i) {
             BazaarTypes.Order storage o = orders[orderSet.at(i)];
             if (o.canceledBlock != 0 || o.filledBlock != 0 || currentBlock > o.expiryBlock) continue;
-            (uint256 notional, uint256 debit) = _orderReserve(o, o.size - o.filledSize, mark);
+            uint256 remaining = o.size - o.filledSize;
+            (uint256 notional, uint256 debit) = _orderReserve(o, remaining, mark);
+            fillDebit += debit;
+            uint256 limit = o.limitPrice;
+            uint256 limitNotional = Math.mulDiv(remaining, limit, BazaarTypes.BAZAAR_SCALE);
             if (o.isLong) {
                 longExposure += notional;
+                acc.bidSize += remaining;
+                acc.bidLimitNotional += limitNotional;
+                if (limit > acc.highestBid) acc.highestBid = limit;
             } else {
                 shortExposure += notional;
+                acc.askSize += remaining;
+                acc.askLimitNotional += limitNotional;
+                if (acc.lowestAsk == 0 || limit < acc.lowestAsk) acc.lowestAsk = limit;
             }
-            fillDebit += debit;
+            if (!o.inBook && o.orderType == BazaarTypes.OrderType.StopLimit) ++acc.stopCount;
         }
+        tally.bidSize = _sat96(acc.bidSize);
+        tally.askSize = _sat96(acc.askSize);
+        // At most the set's size, which the creation cap holds under 2^32.
+        tally.stopCount = uint32(acc.stopCount);
+        tally.bidLimitNotional = _sat128(acc.bidLimitNotional);
+        tally.askLimitNotional = _sat128(acc.askLimitNotional);
+        // Limits are stored as uint128 (BazaarTypes.Order).
+        tally.highestBid = uint128(acc.highestBid);
+        tally.lowestAsk = uint128(acc.lowestAsk);
+    }
+
+    /// @notice Record a leg joining the set `t` describes — a created order's whole size, or the
+    ///         remaining leg an amendment leaves — at `limit` on its side, and one more waiting
+    ///         StopLimit when it is one. `limit` fits uint128: callers pass a stored limit.
+    function _tallyAdd(BazaarTypes.RestingTally storage t, bool isLong, bool waitingStop, uint256 size, uint256 limit)
+        internal
+    {
+        uint256 limitNotional = Math.mulDiv(size, limit, BazaarTypes.BAZAAR_SCALE);
+        if (isLong) {
+            t.bidSize = _sat96(uint256(t.bidSize) + size);
+            t.bidLimitNotional = _sat128(uint256(t.bidLimitNotional) + limitNotional);
+            if (limit > t.highestBid) t.highestBid = uint128(limit);
+        } else {
+            t.askSize = _sat96(uint256(t.askSize) + size);
+            t.askLimitNotional = _sat128(uint256(t.askLimitNotional) + limitNotional);
+            uint256 lowest = t.lowestAsk;
+            if (lowest == 0 || limit < lowest) t.lowestAsk = uint128(limit);
+        }
+        if (waitingStop) {
+            uint32 stops = t.stopCount;
+            if (stops != TALLY_INVALID) t.stopCount = stops + 1;
+        }
+    }
+
+    /// @notice Record a leg leaving the set `t` describes — a canceled order's remaining leg, or
+    ///         the old leg of an amendment — at `limit` on its side, and one waiting StopLimit
+    ///         fewer when it was one. A field at its maximum stays there, since how far above
+    ///         the set it sits is unknown; a subtraction that would take a field below zero marks
+    ///         the tally invalid instead of writing it.
+    function _tallySub(
+        BazaarTypes.RestingTally storage t,
+        bool isLong,
+        bool waitingStop,
+        uint256 remaining,
+        uint256 limit
+    ) internal {
+        uint256 limitNotional = Math.mulDiv(remaining, limit, BazaarTypes.BAZAAR_SCALE);
+        bool ok;
+        if (isLong) {
+            (ok, t.bidSize, t.bidLimitNotional) = _subLeg(t.bidSize, t.bidLimitNotional, remaining, limitNotional);
+        } else {
+            (ok, t.askSize, t.askLimitNotional) = _subLeg(t.askSize, t.askLimitNotional, remaining, limitNotional);
+        }
+        if (ok && waitingStop) {
+            uint32 stops = t.stopCount;
+            if (stops == 0) ok = false;
+            else if (stops != TALLY_INVALID) t.stopCount = stops - 1;
+        }
+        if (!ok) t.stopCount = TALLY_INVALID;
+    }
+
+    /// @dev One side's size and limit notional less a leg, each left alone at its maximum; `ok`
+    ///      is false, and nothing changes, when either would go below zero.
+    function _subLeg(uint96 size, uint128 notional, uint256 dSize, uint256 dNotional)
+        private
+        pure
+        returns (bool ok, uint96 newSize, uint128 newNotional)
+    {
+        newSize = size;
+        newNotional = notional;
+        if (size != type(uint96).max) {
+            if (size < dSize) return (false, size, notional);
+            newSize = uint96(size - dSize);
+        }
+        if (notional != type(uint128).max) {
+            if (notional < dNotional) return (false, size, notional);
+            newNotional = uint128(notional - dNotional);
+        }
+        ok = true;
+    }
+
+    function _sat96(uint256 v) private pure returns (uint96) {
+        return v > type(uint96).max ? type(uint96).max : uint96(v);
+    }
+
+    function _sat128(uint256 v) private pure returns (uint128) {
+        return v > type(uint128).max ? type(uint128).max : uint128(v);
+    }
+
+    /// @dev Initial margin on the worst-case notional (_worstCaseNotional) plus the fill gate's
+    ///      debit across the resting set: what the position-aware gates require of the orders.
+    function _orderImrRequirement(
+        uint256 imrBp,
+        bool posIsLong,
+        uint256 posNotional,
+        uint256 longExposure,
+        uint256 shortExposure,
+        uint256 fillDebit
+    ) internal pure returns (uint256) {
+        uint256 worst = _worstCaseNotional(posIsLong, posNotional, longExposure, shortExposure);
+        return Math.mulDiv(imrBp, worst, BazaarTypes.BP_SCALE) + fillDebit;
     }
 
     /// @dev Soft-fail USDC transfer (BAZAAR precision in, 6dp out).
@@ -566,6 +745,7 @@ library CollateralLib {
         BazaarTypes.TerminalSettlement storage ts,
         EnumerableSet.UintSet storage orderSet,
         mapping(uint256 => BazaarTypes.Order) storage orders,
+        mapping(address => BazaarTypes.RestingTally) storage restingTallies,
         BazaarTypes.CollateralWithdrawParams memory params,
         address caller
     ) external returns (uint256 withdrawAmount) {
@@ -649,11 +829,16 @@ library CollateralLib {
 
         // The resting set's reservation, as createOrder reserves it (_orderReserve): per side at
         // the price each order is valued at, plus the fill gate's debit summed over both sides.
-        // Tallied here against the spot of the price the pair resolved, not in the pair's sweep:
+        // Taken here against the spot of the price the pair resolved, not in the pair's sweep:
         // the sweep runs before any price is read, since what it leaves decides whether a price
-        // is needed at all.
-        (uint256 longOrderExposure, uint256 shortOrderExposure, uint256 fillDebit) =
-            _restingReserve(orderSet, orders, params.currentBlock, params.spotPrice);
+        // is needed at all. The tally's bound stands in for the set first; the gates below read
+        // the set itself only when the bound fails them, or cannot be taken.
+        (bool bounded, uint256 longOrderExposure, uint256 shortOrderExposure, uint256 fillDebit) =
+            _restingBound(restingTallies[caller], params.spotPrice);
+        if (!bounded) {
+            (longOrderExposure, shortOrderExposure, fillDebit) =
+                _sweepRestingReserve(orderSet, orders, restingTallies[caller], params.currentBlock, params.spotPrice);
+        }
 
         // An unhealthy verdict other than the ADL latch (reasons 2, 3 and 4) fixes the settlement
         // price in this same transaction, which schedules the cutoff the pendingTermination check
@@ -759,9 +944,28 @@ library CollateralLib {
             // Initial margin on the worst-case notional, plus what the fill gate debits across
             // the resting orders ahead of its own margin test (_fillDebitOf): a withdrawal that
             // left less would walk the owner into an order that can only ever be auto-canceled.
-            uint256 worst =
-                _worstCaseNotional(bucket.isLong, currentState.currentNotional, longOrderExposure, shortOrderExposure);
-            uint256 imrRequirement = Math.mulDiv(params.marginReqs.imrBp, worst, BazaarTypes.BP_SCALE) + fillDebit;
+            // A bound that refuses is not a verdict: the set is then read and judged as it is.
+            uint256 imrRequirement = _orderImrRequirement(
+                params.marginReqs.imrBp,
+                bucket.isLong,
+                currentState.currentNotional,
+                longOrderExposure,
+                shortOrderExposure,
+                fillDebit
+            );
+            if (bounded && currentState.availableEquity < imrRequirement + params.amount) {
+                (longOrderExposure, shortOrderExposure, fillDebit) = _sweepRestingReserve(
+                    orderSet, orders, restingTallies[caller], params.currentBlock, params.spotPrice
+                );
+                imrRequirement = _orderImrRequirement(
+                    params.marginReqs.imrBp,
+                    bucket.isLong,
+                    currentState.currentNotional,
+                    longOrderExposure,
+                    shortOrderExposure,
+                    fillDebit
+                );
+            }
             if (currentState.availableEquity < imrRequirement + params.amount) {
                 revert CollateralLib__InsufficientMarginAfterWithdrawal(params.amount, imrRequirement);
             }
@@ -791,15 +995,23 @@ library CollateralLib {
 
         // If user has outstanding limit orders, ensure enough margin remains: initial margin on
         // the larger side (no position, so the worst case is max(longOrders, shortOrders)) plus
-        // the fill gate's debit across the set (_fillDebitOf).
+        // the fill gate's debit across the set (_fillDebitOf). With no position the worst case
+        // of _worstCaseNotional is that larger side, and an empty set requires nothing. A bound
+        // that refuses is not a verdict: the set is then read and judged as it is.
         {
-            uint256 maxOrderExposure = longOrderExposure > shortOrderExposure ? longOrderExposure : shortOrderExposure;
-            if (maxOrderExposure > 0) {
-                uint256 orderImrReq =
-                    Math.mulDiv(params.marginReqs.imrBp, maxOrderExposure, BazaarTypes.BP_SCALE) + fillDebit;
-                if (bucket.collateral - params.amount < orderImrReq) {
-                    revert CollateralLib__InsufficientMarginAfterWithdrawal(params.amount, orderImrReq);
-                }
+            uint256 orderImrReq = _orderImrRequirement(
+                params.marginReqs.imrBp, false, 0, longOrderExposure, shortOrderExposure, fillDebit
+            );
+            if (bounded && bucket.collateral - params.amount < orderImrReq) {
+                (longOrderExposure, shortOrderExposure, fillDebit) = _sweepRestingReserve(
+                    orderSet, orders, restingTallies[caller], params.currentBlock, params.spotPrice
+                );
+                orderImrReq = _orderImrRequirement(
+                    params.marginReqs.imrBp, false, 0, longOrderExposure, shortOrderExposure, fillDebit
+                );
+            }
+            if (bucket.collateral - params.amount < orderImrReq) {
+                revert CollateralLib__InsufficientMarginAfterWithdrawal(params.amount, orderImrReq);
             }
         }
 

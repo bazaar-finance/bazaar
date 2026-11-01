@@ -185,9 +185,8 @@ amendment that fails reverts the whole batch.
   and the new size must exceed the filled size — at or below it the order would be complete, which is
   a cancel. Only resting good-till-cancelled `Limit` orders qualify: stops wait outside the book with
   a bounty and position links of their own, and IOC/FOK orders never rest.
-- **Margin once, on the result.** After the batch the owner's expired orders are pruned and the
-  surviving orders are reserved exactly as a new order is reserved (see
-  [initial margin](margin.md)): a bid at the oracle price, an ask at the larger of its limit and the
+- **Margin once, on the result.** After the batch the owner's orders are reserved exactly as a new
+  order is reserved (see [initial margin](margin.md)): a bid at the oracle price, an ask at the larger of its limit and the
   oracle price (a StopLimit still waiting for its trigger at the largest of its trigger, its limit
   and the oracle price), with the fill gate's debit on top — the maker fee, and the loss a limit on the wrong
   side of the oracle price books when it fills; the position plus that exposure has to clear initial margin together
@@ -195,8 +194,11 @@ amendment that fails reverts the whole batch.
   requirement, but the gate judges the whole set left after the batch, so a set that a later price
   move or margin-rate rise has left short of it must still come back under it: a shrink that leaves
   it short reverts (`cancelOrders` has no margin gate), and repricing an order onto the wrong side of the oracle price costs
-  the loss it would then book.
-- **Why it is cheaper.** Every write lands in slots the order already occupies, and the fixed cost of
+  the loss it would then book. The gate does not read every resting order to reach that verdict:
+  it first takes an upper bound on the set's reservation from a running per-account tally (see
+  [initial margin](margin.md#the-resting-order-tally)), and reads the orders one by one, pruning
+  expired ones as it goes, only when the bound does not clear the owner.
+- **Why it is cheaper.** Every write lands in slots already in use, the owner's tally included, and the fixed cost of
   a call — the price, the margin curve, the signature — is paid once for the batch. No fill can
   happen, so no health check runs.
 - **Hints.** Insertion hints are optional and ride inside the id word: bits 64–127 and 128–191 each
@@ -211,16 +213,20 @@ amendment that fails reverts the whole batch.
   candidate; a slot further than that from it is refused (`OrderBookLib__HintRepairExhausted`),
   which is then a cancel and a new order. The hints are part of the signed words, so a relayer cannot refresh them; a hinted
   amendment that fails reverts whole without consuming the nonce.
-- Each amendment that changes the order emits `OrderUpdated` with action `Amended`, carrying the new price, size and
-  `prioritySeq`, so an indexer can re-sort its book from events alone.
+- Each amendment that changes the order emits `OrderAmended` with the new price, the new total size
+  (filled part included, as `OrderUpdated` reports it) and `prioritySeq`; everything else about the
+  order is as its `OrderUpdated` (`Created`) left it, its fills aside, so an indexer can re-sort its
+  book from events alone. A `prioritySeq` above the last one reported means
+  the order was queued anew behind its price level; an unchanged one, that it shrank where it stood.
 
 ## Cancellation & cleanup
 
 - `cancelOrders(orderIds[], …)` — creator-only, up to 200 per call. Canceling unlinks the order
   from the book in the same write, so no walk can ever fill it afterwards.
 - Expired orders are removed by whoever touches them first: the matching walk cancels-and-unlinks
-  an expired maker on contact, the owner's lazy sweeps run during creation, amendment and
-  withdrawal, and anyone may call the permissionless `sweepExpired(orderIds[])` janitor. Until then an expired order sits inert — still linked, but
+  an expired maker on contact, a withdrawal sweeps the owner's set, as do a creation that finds the
+  set at its cap and an amendment whose margin gate has to read the set (see
+  [the resting-order tally](margin.md#the-resting-order-tally)), and anyone may call the permissionless `sweepExpired(orderIds[])` janitor. Until then an expired order sits inert — still linked, but
   unable to fill.
 - The matching engine **auto-cancels** orders in these situations: a fill that would fail the
   owner's margin check, a self-match (the incoming order cancels), a post-only order that would

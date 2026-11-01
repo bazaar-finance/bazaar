@@ -58,8 +58,8 @@ contract InsuranceIntegrationTest is IntegrationBase {
         );
     }
 
-    /// @notice Waiting past the execution window (cooldown + window) makes the request expire —
-    ///         `executeInsuranceWithdrawal` reverts and the shares remain.
+    /// @notice Waiting past the execution window (cooldown + the BTC pair's 24/7 window) makes
+    ///         the request expire — `executeInsuranceWithdrawal` reverts and the shares remain.
     function test_e2e_Insurance_WithdrawalWindowExpires() public {
         _depositInsurance(carol, 1_000 * BAZAAR_SCALE);
         uint256 shares = pair.insuranceShares(carol);
@@ -70,13 +70,13 @@ contract InsuranceIntegrationTest is IntegrationBase {
         // Cooldown + window + slack → the request is stale.
         vm.warp(
             vm.getBlockTimestamp() + InsuranceVaultLib.INSURANCE_WITHDRAWAL_COOLDOWN
-                + InsuranceVaultLib.INSURANCE_WITHDRAWAL_WINDOW + 1
+                + InsuranceVaultLib.INSURANCE_WITHDRAWAL_WINDOW_CONTINUOUS + 1
         );
         bytes[] memory pu = _freshPrice();
         uint256 fee = oracle.getUpdateFee(pu);
         vm.deal(carol, fee);
         vm.prank(carol);
-        vm.expectRevert();
+        vm.expectRevert(InsuranceVaultLib.InsuranceVaultLib__WithdrawalWindowExpired.selector);
         pair.executeInsuranceWithdrawal{value: fee}(pu, 0, 0, 0, "", "");
 
         assertEq(pair.insuranceShares(carol), shares, "shares retained after expiry");

@@ -119,18 +119,30 @@ contract OrderLifecycleTest is IntegrationBase {
         pair.sweepExpired(_ids(id));
     }
 
-    /// @notice The owner's lazy sweep (run on every creation) unlinks their expired orders too —
-    ///         the janitor is an accelerant, not the only path.
-    function test_lazySweep_onCreate_unlinksExpiredFromBook() public {
+    /// @notice Creating an order below the cap does not sweep the owner's expired orders: the
+    ///         creation gate bounds the set from its tally and reads it only when the bound does
+    ///         not clear the order. The expired order stays linked until something reads it —
+    ///         here the owner's withdrawal, which sweeps the set ahead of its own gate.
+    function test_create_belowCap_leavesExpiredLinked_withdrawalSweeps() public {
         _deposit(alice, 60_000 * BAZAAR_SCALE);
         uint256 stale = _placeShortLived(alice, true, BTC / 10, 49_000 * BAZAAR_SCALE);
         _roll(BazaarTypes.MIN_ORDER_LIFETIME_BLOCKS + 1);
 
-        _placeLimit(alice, true, BTC / 10, 48_000 * BAZAAR_SCALE); // triggers the sweep
+        _placeLimit(alice, true, BTC / 10, 48_000 * BAZAAR_SCALE);
 
-        assertGt(_canceledBlock(stale), 0, "expired order canceled by the lazy sweep");
-        assertFalse(_inBook(stale), "and unlinked from the book");
+        assertEq(_canceledBlock(stale), 0, "the creation did not cancel the expired order");
+        assertTrue(_inBook(stale), "still linked");
         (uint64 bids,) = _bookCounts();
+        assertEq(bids, 2, "both linked");
+
+        vm.warp(vm.getBlockTimestamp() + 4);
+        bytes[] memory pu = _priceUpdate(50_000, uint64(vm.getBlockTimestamp()));
+        vm.prank(alice);
+        pair.withdrawCollateral(BAZAAR_SCALE, pu, 0, 0, 0, "");
+
+        assertGt(_canceledBlock(stale), 0, "the withdrawal's sweep canceled it");
+        assertFalse(_inBook(stale), "and unlinked it from the book");
+        (bids,) = _bookCounts();
         assertEq(bids, 1, "only the fresh order remains linked");
     }
 

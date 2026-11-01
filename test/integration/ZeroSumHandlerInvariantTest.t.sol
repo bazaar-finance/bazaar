@@ -77,6 +77,8 @@ contract ZeroSumHandler is Test {
     /// @dev Counts successful order placements. Each placement runs at most one matching walk,
     ///      so payout-truncation dust is bounded by a small multiple of this count.
     uint256 public ghostTrades;
+    uint256 public ghostCancels;
+    uint256 public ghostAmends;
     /// @dev Placements that actually moved the arriving taker's bucket. A placement that merely
     ///      rests proves nothing about settlement, so the walk itself needs its own counter.
     uint256 public ghostFills;
@@ -601,6 +603,40 @@ contract ZeroSumHandler is Test {
         if (_fingerprint(a) != before) ghostFills++;
     }
 
+    /// @dev Cancel one of an actor's live resting orders: the leg leaves the resting tally.
+    function cancelResting(uint256 actorSeed, uint256 pickSeed) public {
+        address a = traders[bound(actorSeed, 0, traders.length - 2)];
+        (uint256[] memory ids, uint256 count,,) = lens.getUserActiveLimitOrders(address(pair), a);
+        if (count == 0) return;
+        uint256[] memory one = new uint256[](1);
+        one[0] = ids[bound(pickSeed, 0, count - 1)];
+        vm.prank(a);
+        try pair.cancelOrders(one, 0, 0, 0, "", "") {
+            ghostCancels++;
+        } catch {}
+    }
+
+    /// @dev Reprice one of an actor's live resting orders by up to $40 either way at its size,
+    ///      the amendment's leg moving in the resting tally; a move that would cross is refused by
+    ///      the pair and counted as nothing.
+    function amendResting(uint256 actorSeed, uint256 pickSeed, uint256 deltaSeed) public {
+        address a = traders[bound(actorSeed, 0, traders.length - 2)];
+        (uint256[] memory ids, uint256 count,,) = lens.getUserActiveLimitOrders(address(pair), a);
+        if (count == 0) return;
+        uint256 id = ids[bound(pickSeed, 0, count - 1)];
+        BazaarTypes.Order memory o = OrderView.order(pair, id);
+        uint256 delta = bound(deltaSeed, 0, 400) * SCALE / 10;
+        uint256 px = deltaSeed & 1 == 0 ? o.limitPrice + delta : o.limitPrice - delta;
+        uint256[] memory w = new uint256[](3);
+        (w[0], w[1], w[2]) = (id, px, o.size);
+        bytes[] memory pu = _pu(markUsd);
+        vm.warp(vm.getBlockTimestamp() + 4);
+        vm.prank(a);
+        try pair.amendOrders(w, pu, 0, 0, 0, "", "") {
+            ghostAmends++;
+        } catch {}
+    }
+
     /// @dev Close profitable counterparties against the vault's inventory once the fund can no
     ///      longer absorb it. The latch freezes matching and position-holder withdrawals, so a
     ///      sequence that opens a window and never resolves it spends its remaining calls on
@@ -749,6 +785,76 @@ contract ZeroSumHandlerInvariantTest is IntegrationBase {
     function _markPrice() internal view returns (uint256 p) {
         (p,,,,) = pair.lastPairPrice();
         if (p == 0) p = 50_000 * BAZAAR_SCALE;
+    }
+
+    struct RestingSums {
+        uint256 bidSize;
+        uint256 askSize;
+        uint256 bidLimitNotional;
+        uint256 askLimitNotional;
+        uint256 highestBid;
+        uint256 lowestAsk;
+        uint256 stops;
+        uint256 liveBids;
+        uint256 liveAsks;
+    }
+
+    /// @dev Every id in `user`'s active-order set, dead entries included, read the way the lens
+    ///      reads it: the set's values array has its length at the mapping entry's slot.
+    function _rawActiveIds(address user) internal view returns (uint256[] memory ids) {
+        bytes32 base = keccak256(abi.encode(user, uint256(2)));
+        uint256 len = uint256(pair.extsload(base));
+        ids = new uint256[](len);
+        uint256 data = uint256(keccak256(abi.encode(base)));
+        for (uint256 i; i < len; ++i) {
+            ids[i] = uint256(pair.extsload(bytes32(data + i)));
+        }
+    }
+
+    /// @notice The resting-order tally never understates the live set: every size and limit
+    ///         notional at or above the live sum unless pinned at its maximum, the highest bid at
+    ///         or above every live bid, the lowest ask at or below every live ask, and the stop
+    ///         count at or above the waiting stops unless marked invalid. That is what lets the
+    ///         gates pass an account on the tally's bound without reading its orders.
+    function invariant_restingTallyNeverUnderstates() public view {
+        uint64 currentBlock = uint64(block.number);
+        for (uint256 k; k < actors.length; ++k) {
+            address u = actors[k];
+            RestingSums memory s;
+            uint256[] memory ids = _rawActiveIds(u);
+            for (uint256 i; i < ids.length; ++i) {
+                BazaarTypes.Order memory o = OrderView.order(pair, ids[i]);
+                if (o.canceledBlock != 0 || o.filledBlock != 0 || currentBlock > o.expiryBlock) continue;
+                uint256 remaining = o.size - o.filledSize;
+                uint256 limitNotional = remaining * o.limitPrice / BAZAAR_SCALE;
+                if (o.isLong) {
+                    s.bidSize += remaining;
+                    s.bidLimitNotional += limitNotional;
+                    if (o.limitPrice > s.highestBid) s.highestBid = o.limitPrice;
+                    ++s.liveBids;
+                } else {
+                    s.askSize += remaining;
+                    s.askLimitNotional += limitNotional;
+                    if (s.lowestAsk == 0 || o.limitPrice < s.lowestAsk) s.lowestAsk = o.limitPrice;
+                    ++s.liveAsks;
+                }
+                if (!o.inBook && o.orderType == BazaarTypes.OrderType.StopLimit) ++s.stops;
+            }
+            BazaarTypes.RestingTally memory t = lens.restingTally(address(pair), u);
+            assertTrue(t.bidSize == type(uint96).max || t.bidSize >= s.bidSize, "tally: bid size understated");
+            assertTrue(t.askSize == type(uint96).max || t.askSize >= s.askSize, "tally: ask size understated");
+            assertTrue(
+                t.bidLimitNotional == type(uint128).max || t.bidLimitNotional >= s.bidLimitNotional,
+                "tally: bid notional understated"
+            );
+            assertTrue(
+                t.askLimitNotional == type(uint128).max || t.askLimitNotional >= s.askLimitNotional,
+                "tally: ask notional understated"
+            );
+            if (s.liveBids > 0) assertGe(t.highestBid, s.highestBid, "tally: a live bid above the recorded highest");
+            if (s.liveAsks > 0) assertLe(t.lowestAsk, s.lowestAsk, "tally: a live ask below the recorded lowest");
+            if (t.stopCount != type(uint32).max) assertGe(t.stopCount, s.stops, "tally: waiting stops understated");
+        }
     }
 
     /// @notice Check-3 solvency: the contract always holds at least I + D of USDC (minus rounding),
